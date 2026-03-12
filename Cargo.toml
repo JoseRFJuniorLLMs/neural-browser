@@ -1,0 +1,36 @@
+[package]
+name = "neural-browser"
+version = "0.1.0"
+edition = "2024"
+description = "Neural Browser — CPU + NPU + GPU working together"
+license = "MIT"
+
+[dependencies]
+# ── CPU: Networking & Parsing ──
+ureq = "3"  # default: rustls + webpki-roots + gzip
+html5ever = "0.29"
+markup5ever = "0.14"
+url = "2"
+
+# ── NPU: AI Inference via ONNX Runtime + DirectML ──
+ort = { version = "2.0.0-rc.12", features = ["directml"] }
+ndarray = "0.16"
+
+# ── GPU: Rendering via wgpu ──
+wgpu = "24"
+winit = "0.30"
+glyphon = "0.8"              # GPU text rasterization
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+
+# ── Shared ──
+pollster = "0.4"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

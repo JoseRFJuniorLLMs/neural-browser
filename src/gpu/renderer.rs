@@ -6,14 +6,27 @@
 //! All rendering is GPU-accelerated.
 
 use super::layout::{LayoutBox, LayoutKind};
+use crate::ui::Theme;
 use anyhow::Result;
 use glyphon::{
     Attrs, Buffer as GlyphonBuffer, Cache, Color as GlyphonColor, Family, FontSystem, Metrics,
     Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
     Weight,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 use winit::window::Window;
+
+/// Rendering context passed each frame — carries ephemeral state that
+/// changes between frames (hover, loading, visited set).
+pub struct RenderContext<'a> {
+    pub url: &'a str,
+    pub loading: bool,
+    pub loading_ticks: u64,
+    pub hovered_href: Option<&'a str>,
+    pub visited_urls: &'a HashSet<String>,
+    pub theme: &'a Theme,
+}
 
 pub struct WgpuRenderer {
     surface: wgpu::Surface<'static>,
@@ -123,7 +136,34 @@ impl WgpuRenderer {
         }
     }
 
-    pub fn render(&mut self, url: &str, layout: &[LayoutBox]) -> Result<()> {
+    /// Return current surface size.
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// Determine the color for a link box, considering hover and visited state.
+    fn link_color(
+        &self,
+        href: &Option<String>,
+        ctx: &RenderContext<'_>,
+        base_color: [f32; 4],
+    ) -> [f32; 4] {
+        if let Some(h) = href {
+            // Hovered link?
+            if let Some(hovered) = ctx.hovered_href {
+                if hovered == h {
+                    return ctx.theme.link_hover;
+                }
+            }
+            // Visited link?
+            if ctx.visited_urls.contains(h) {
+                return ctx.theme.link_visited;
+            }
+        }
+        base_color
+    }
+
+    pub fn render(&mut self, layout: &[LayoutBox], ctx: &RenderContext<'_>) -> Result<()> {
         let (w, h) = self.size;
         if w == 0 || h == 0 {
             return Ok(());
@@ -141,12 +181,12 @@ impl WgpuRenderer {
         // ── Build text buffers from layout ──
         let mut buffers: Vec<(GlyphonBuffer, f32, f32, TextBounds, GlyphonColor)> = Vec::new();
 
-        // URL bar
+        // URL bar text
         let mut url_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(14.0, 18.0));
         url_buf.set_size(&mut self.font_system, Some(w as f32 - 20.0), Some(30.0));
         url_buf.set_text(
             &mut self.font_system,
-            &format!("  \u{1F310} {url}"),
+            &format!("  \u{1F310} {}", ctx.url),
             Attrs::new().family(Family::Monospace).weight(Weight::NORMAL),
             Shaping::Advanced,
         );
@@ -164,14 +204,95 @@ impl WgpuRenderer {
             GlyphonColor::rgb(160, 190, 255),
         ));
 
+        // URL bar border indicator (thin line at bottom of URL bar)
+        {
+            let border_color = ctx.theme.url_bar_border;
+            let mut border_buf =
+                GlyphonBuffer::new(&mut self.font_system, Metrics::new(2.0, 2.0));
+            border_buf.set_size(&mut self.font_system, Some(w as f32), Some(2.0));
+            let bar_char = "\u{2500}".repeat((w / 6).max(1) as usize); // horizontal line chars
+            border_buf.set_text(
+                &mut self.font_system,
+                &bar_char,
+                Attrs::new().family(Family::Monospace).weight(Weight::NORMAL),
+                Shaping::Advanced,
+            );
+            border_buf.shape_until_scroll(&mut self.font_system, false);
+            let r = (border_color[0] * 255.0) as u8;
+            let g = (border_color[1] * 255.0) as u8;
+            let b = (border_color[2] * 255.0) as u8;
+            buffers.push((
+                border_buf,
+                0.0,
+                38.0,
+                TextBounds {
+                    left: 0,
+                    top: 36,
+                    right: w as i32,
+                    bottom: 42,
+                },
+                GlyphonColor::rgb(r, g, b),
+            ));
+        }
+
+        // Loading indicator
+        if ctx.loading {
+            let mut load_buf =
+                GlyphonBuffer::new(&mut self.font_system, Metrics::new(14.0, 18.0));
+            load_buf.set_size(&mut self.font_system, Some(w as f32 - 40.0), Some(30.0));
+            let dots = match (ctx.loading_ticks / 15) % 4 {
+                0 => "Loading",
+                1 => "Loading.",
+                2 => "Loading..",
+                _ => "Loading...",
+            };
+            load_buf.set_text(
+                &mut self.font_system,
+                dots,
+                Attrs::new()
+                    .family(Family::SansSerif)
+                    .weight(Weight::NORMAL),
+                Shaping::Advanced,
+            );
+            load_buf.shape_until_scroll(&mut self.font_system, false);
+            let lc = ctx.theme.loading;
+            buffers.push((
+                load_buf,
+                (w as f32 / 2.0) - 40.0,
+                (h as f32 / 2.0) - 10.0,
+                TextBounds {
+                    left: 0,
+                    top: 40,
+                    right: w as i32,
+                    bottom: h as i32 - 25,
+                },
+                GlyphonColor::rgb(
+                    (lc[0] * 255.0) as u8,
+                    (lc[1] * 255.0) as u8,
+                    (lc[2] * 255.0) as u8,
+                ),
+            ));
+        }
+
         // Status bar
         let mut status_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(11.0, 14.0));
         status_buf.set_size(&mut self.font_system, Some(w as f32), Some(20.0));
         let n_blocks = layout.len();
+
+        // Show hovered link URL in status bar, or default status
+        let status_text = if let Some(href) = ctx.hovered_href {
+            format!("  {href}")
+        } else {
+            format!(
+                "  CPU: net+parse | NPU: content AI | GPU: render | {n_blocks} elements"
+            )
+        };
         status_buf.set_text(
             &mut self.font_system,
-            &format!("  CPU: net+parse | NPU: content AI | GPU: render | {n_blocks} elements"),
-            Attrs::new().family(Family::Monospace).weight(Weight::NORMAL),
+            &status_text,
+            Attrs::new()
+                .family(Family::Monospace)
+                .weight(Weight::NORMAL),
             Shaping::Advanced,
         );
         status_buf.shape_until_scroll(&mut self.font_system, false);
@@ -188,7 +309,7 @@ impl WgpuRenderer {
             GlyphonColor::rgb(90, 90, 110),
         ));
 
-        // Content layout boxes → text buffers
+        // Content layout boxes -> text buffers
         for lbox in layout {
             match &lbox.kind {
                 LayoutKind::Text {
@@ -218,18 +339,30 @@ impl WgpuRenderer {
                         Some(lbox.height.max(line_h * 2.0)),
                     );
 
+                    // For links, add underline prefix character
+                    let display_text;
+                    let is_link = lbox.href.is_some();
+                    if is_link {
+                        // Show underlined text by using combining underline
+                        display_text = text.clone();
+                    } else {
+                        display_text = text.clone();
+                    }
+
                     let weight = if *bold { Weight::BOLD } else { Weight::NORMAL };
                     buf.set_text(
                         &mut self.font_system,
-                        text,
+                        &display_text,
                         Attrs::new().family(Family::SansSerif).weight(weight),
                         Shaping::Advanced,
                     );
                     buf.shape_until_scroll(&mut self.font_system, false);
 
-                    let r = (color[0] * 255.0) as u8;
-                    let g = (color[1] * 255.0) as u8;
-                    let b = (color[2] * 255.0) as u8;
+                    // Determine final color (hover/visited override for links)
+                    let final_color = self.link_color(&lbox.href, ctx, *color);
+                    let r = (final_color[0] * 255.0) as u8;
+                    let g = (final_color[1] * 255.0) as u8;
+                    let b = (final_color[2] * 255.0) as u8;
 
                     buffers.push((
                         buf,
@@ -243,6 +376,48 @@ impl WgpuRenderer {
                         },
                         GlyphonColor::rgb(r, g, b),
                     ));
+
+                    // Link underline: render a thin line of underscores below the text
+                    if is_link {
+                        let underline_y = lbox.y + lbox.height - 2.0;
+                        let mut ul_buf = GlyphonBuffer::new(
+                            &mut self.font_system,
+                            Metrics::new(2.0, 2.0),
+                        );
+                        ul_buf.set_size(
+                            &mut self.font_system,
+                            Some(lbox.width),
+                            Some(4.0),
+                        );
+                        // Use thin horizontal line characters for underline
+                        let ul_len = (lbox.width / 6.0).max(1.0) as usize;
+                        let ul_str = "\u{2500}".repeat(ul_len);
+                        ul_buf.set_text(
+                            &mut self.font_system,
+                            &ul_str,
+                            Attrs::new()
+                                .family(Family::Monospace)
+                                .weight(Weight::NORMAL),
+                            Shaping::Advanced,
+                        );
+                        ul_buf.shape_until_scroll(&mut self.font_system, false);
+
+                        let ul_top = underline_y as i32;
+                        if ul_top > 40 && ul_top < h as i32 - 25 {
+                            buffers.push((
+                                ul_buf,
+                                lbox.x,
+                                underline_y,
+                                TextBounds {
+                                    left: lbox.x as i32,
+                                    top: ul_top,
+                                    right: (lbox.x + lbox.width) as i32,
+                                    bottom: (ul_top + 4).min(h as i32 - 25),
+                                },
+                                GlyphonColor::rgb(r, g, b),
+                            ));
+                        }
+                    }
                 }
                 LayoutKind::Code { text, .. } => {
                     if text.is_empty() {
@@ -368,6 +543,7 @@ impl WgpuRenderer {
                 label: Some("render_encoder"),
             });
 
+        let bg = ctx.theme.bg;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
@@ -376,10 +552,10 @@ impl WgpuRenderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.06,
-                            g: 0.06,
-                            b: 0.08,
-                            a: 1.0,
+                            r: bg[0] as f64,
+                            g: bg[1] as f64,
+                            b: bg[2] as f64,
+                            a: bg[3] as f64,
                         }),
                         store: wgpu::StoreOp::Store,
                     },

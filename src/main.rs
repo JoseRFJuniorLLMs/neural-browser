@@ -1,14 +1,14 @@
-//! Neural Browser — CPU + NPU + GPU working together
+//! Neural Browser -- CPU + NPU + GPU working together
 //!
 //! Architecture:
-//!   CPU  → networking, HTML parsing, DOM tree, event loop
-//!   NPU  → content understanding, ad blocking, summarization (ONNX + DirectML)
-//!   GPU  → layout rendering, text rasterization, compositing (wgpu)
+//!   CPU  -> networking, HTML parsing, DOM tree, event loop, browser history
+//!   NPU  -> content understanding, ad blocking, summarization (ONNX + DirectML)
+//!   GPU  -> layout rendering, text rasterization, compositing (wgpu)
 //!
 //! Pipeline:
-//!   URL → [CPU] fetch+parse → DOM
-//!       → [NPU] understand + extract + classify
-//!       → [GPU] layout + paint + composite → display
+//!   URL -> [CPU] fetch+parse -> DOM
+//!       -> [NPU] understand + extract + classify
+//!       -> [GPU] layout + paint + composite -> display
 
 mod cpu;
 mod npu;
@@ -17,32 +17,38 @@ mod ui;
 
 use anyhow::Result;
 use crossbeam_channel as channel;
-use log::{info, error};
+use log::{info, error, warn};
 
 /// Messages flowing between the three processors
 #[derive(Debug, Clone)]
 pub enum PipelineMsg {
-    // CPU → NPU: raw content ready for AI processing
+    // CPU -> NPU: raw content ready for AI processing
     HtmlReady {
         url: String,
         html: String,
         dom: cpu::dom::DomTree,
     },
 
-    // NPU → GPU: AI-processed content ready for rendering
+    // NPU -> GPU: AI-processed content ready for rendering
     ContentReady {
         url: String,
         blocks: Vec<npu::ContentBlock>,
         ads_blocked: usize,
     },
 
-    // GPU → UI: frame rendered
+    // GPU -> UI: frame rendered
     FrameReady,
 
-    // UI → CPU: user navigation
+    // UI -> CPU: user navigation
     Navigate(String),
 
-    // NPU → CPU: prefetch suggestion
+    // UI -> CPU: go back in history
+    Back,
+
+    // UI -> CPU: go forward in history
+    Forward,
+
+    // NPU -> CPU: prefetch suggestion
     Prefetch(String),
 }
 
@@ -66,7 +72,7 @@ fn main() -> Result<()> {
     let npu_handle = std::thread::Builder::new()
         .name("npu-engine".into())
         .spawn(move || {
-            info!("[NPU] Thread started — DirectML inference engine");
+            info!("[NPU] Thread started -- DirectML inference engine");
             let mut engine = match npu::NpuEngine::new() {
                 Ok(e) => e,
                 Err(e) => {
@@ -100,25 +106,90 @@ fn main() -> Result<()> {
     let cpu_handle = std::thread::Builder::new()
         .name("cpu-network".into())
         .spawn(move || {
-            info!("[CPU] Thread started — networking + parsing");
+            info!("[CPU] Thread started -- networking + parsing + history");
             let net = cpu::network::NetworkEngine::new();
 
-            // Navigate to start page
-            let start_url = std::env::args()
-                .nth(1)
-                .unwrap_or_else(|| "https://example.com".into());
-
-            if let Err(e) = process_url(&net, &start_url, &cpu_to_npu_tx) {
-                error!("[CPU] Failed to load {start_url}: {e}");
-            }
+            // ── Browser history stacks ──
+            let mut back_stack: Vec<String> = Vec::new();
+            let mut forward_stack: Vec<String> = Vec::new();
+            // Navigate to start page or CLI-provided URL
+            let mut current_url: Option<String> = match std::env::args().nth(1) {
+                Some(url) => {
+                    process_url(&net, &url, &cpu_to_npu_tx);
+                    Some(url)
+                }
+                None => {
+                    // Show built-in start page
+                    let url = cpu::start_page::START_PAGE_URL;
+                    let html = cpu::start_page::start_page_html().to_string();
+                    let dom = cpu::dom::parse_html(&html);
+                    info!("[CPU] Loaded start page ({} nodes)", dom.nodes.len());
+                    let _ = cpu_to_npu_tx.send(PipelineMsg::HtmlReady {
+                        url: url.to_string(),
+                        html,
+                        dom,
+                    });
+                    Some(url.to_string())
+                }
+            };
 
             // Listen for navigation events
             for msg in cpu_ui_rx {
                 match msg {
                     PipelineMsg::Navigate(url) => {
                         info!("[CPU] Navigating to: {url}");
-                        if let Err(e) = process_url(&net, &url, &cpu_to_npu_tx) {
-                            error!("[CPU] Failed to load {url}: {e}");
+                        // Push current URL to back stack before navigating
+                        if let Some(cur) = current_url.take() {
+                            back_stack.push(cur);
+                        }
+                        // Clear forward stack on new navigation
+                        forward_stack.clear();
+                        current_url = Some(url.clone());
+                        process_url(&net, &url, &cpu_to_npu_tx);
+                    }
+                    PipelineMsg::Back => {
+                        if let Some(prev_url) = back_stack.pop() {
+                            info!("[CPU] Going back to: {prev_url}");
+                            if let Some(cur) = current_url.take() {
+                                forward_stack.push(cur);
+                            }
+                            current_url = Some(prev_url.clone());
+                            if prev_url == cpu::start_page::START_PAGE_URL {
+                                // Reload start page from memory
+                                let html = cpu::start_page::start_page_html().to_string();
+                                let dom = cpu::dom::parse_html(&html);
+                                let _ = cpu_to_npu_tx.send(PipelineMsg::HtmlReady {
+                                    url: prev_url,
+                                    html,
+                                    dom,
+                                });
+                            } else {
+                                process_url(&net, &prev_url, &cpu_to_npu_tx);
+                            }
+                        } else {
+                            warn!("[CPU] No back history available");
+                        }
+                    }
+                    PipelineMsg::Forward => {
+                        if let Some(next_url) = forward_stack.pop() {
+                            info!("[CPU] Going forward to: {next_url}");
+                            if let Some(cur) = current_url.take() {
+                                back_stack.push(cur);
+                            }
+                            current_url = Some(next_url.clone());
+                            if next_url == cpu::start_page::START_PAGE_URL {
+                                let html = cpu::start_page::start_page_html().to_string();
+                                let dom = cpu::dom::parse_html(&html);
+                                let _ = cpu_to_npu_tx.send(PipelineMsg::HtmlReady {
+                                    url: next_url,
+                                    html,
+                                    dom,
+                                });
+                            } else {
+                                process_url(&net, &next_url, &cpu_to_npu_tx);
+                            }
+                        } else {
+                            warn!("[CPU] No forward history available");
                         }
                     }
                     PipelineMsg::Prefetch(url) => {
@@ -140,21 +211,29 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Fetch and parse a URL, sending the result to the NPU.
+/// On failure, generates an error page instead of propagating the error.
 fn process_url(
     net: &cpu::network::NetworkEngine,
     url: &str,
     tx: &channel::Sender<PipelineMsg>,
-) -> Result<()> {
-    let html = net.fetch(url)?;
-    let dom = cpu::dom::parse_html(&html);
+) {
+    let html = match net.fetch(url) {
+        Ok(h) => h,
+        Err(e) => {
+            error!("[CPU] Fetch failed for {url}: {e}");
+            cpu::network::generate_error_page(url, &format!("Failed to load page: {e}"))
+        }
+    };
 
+    let dom = cpu::dom::parse_html(&html);
     info!("[CPU] Parsed {} nodes from {url}", dom.nodes.len());
 
-    tx.send(PipelineMsg::HtmlReady {
+    if let Err(e) = tx.send(PipelineMsg::HtmlReady {
         url: url.to_string(),
         html,
         dom,
-    })?;
-
-    Ok(())
+    }) {
+        error!("[CPU] Failed to send to NPU: {e}");
+    }
 }

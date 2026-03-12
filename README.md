@@ -78,8 +78,11 @@ cargo build --release
 | **Enter** | Navigate to typed URL |
 | **Escape** | Cancel URL editing |
 | **F5** | Refresh current page |
+| **Alt+Left** | Back in history |
+| **Alt+Right** | Forward in history |
 | **Scroll** | Mouse wheel or PageUp/PageDown |
 | **Home** | Scroll to top |
+| **Click** | Follow links |
 
 ## Architecture
 
@@ -89,15 +92,16 @@ neural-browser/
 │   ├── main.rs              # 3-thread orchestrator + channels
 │   ├── cpu/
 │   │   ├── network.rs       # HTTP fetch + prefetch cache
-│   │   └── dom.rs           # HTML → flat DomTree (with tests)
+│   │   ├── dom.rs           # HTML → flat DomTree (with tests)
+│   │   └── start_page.rs    # Built-in neural://start welcome page
 │   ├── npu/
-│   │   ├── mod.rs           # NPU pipeline: extract → classify → prefetch
+│   │   ├── mod.rs           # NPU pipeline: extract → classify → summarize → prefetch
 │   │   ├── content.rs       # DOM → semantic ContentBlocks
-│   │   └── classifier.rs    # ML-based ad/tracker detection
+│   │   └── classifier.rs    # ML-based ad/tracker detection + classification
 │   ├── gpu/
-│   │   ├── mod.rs           # winit event loop + window management
+│   │   ├── mod.rs           # winit event loop + window/input management
 │   │   ├── renderer.rs      # wgpu + glyphon text rendering
-│   │   └── layout.rs        # ContentBlocks → positioned LayoutBoxes
+│   │   └── layout.rs        # ContentBlocks → positioned LayoutBoxes + hit testing
 │   └── ui/
 │       └── mod.rs           # Theme + navigation types
 └── models/                   # ONNX models (NPU inference)
@@ -151,20 +155,27 @@ Working:
 - [x] HTTP/HTTPS fetch with TLS
 - [x] HTML parsing → DOM tree
 - [x] NPU content extraction pipeline
-- [x] Ad/tracker blocking (heuristic)
-- [x] Smart link prefetch
+- [x] Ad/tracker blocking (heuristic + ML classifier)
+- [x] Smart link prefetch (top 3 by click probability)
 - [x] GPU text rendering (glyphon + wgpu)
 - [x] Dark theme layout engine
 - [x] URL bar with keyboard navigation
 - [x] Scroll (mouse wheel + keyboard)
 - [x] 3-thread pipeline (CPU→NPU→GPU)
+- [x] Click on links (hit testing + navigation)
+- [x] Navigation history (back/forward)
+- [x] Language detection
+- [x] Page summarization
+- [x] Built-in start page (`neural://start`)
+- [x] Mouse hover link preview
+- [x] Layout caching (recompute on change only)
+- [x] Image support (PNG, JPEG, WebP)
+- [x] Visited URL tracking
 
 Planned:
-- [ ] Click on links (hit testing)
 - [ ] ONNX models for NPU (MarkupLM, ad classifier)
 - [ ] Image decode → GPU textures
 - [ ] Redirect handling (301/302)
-- [ ] History back/forward
 - [ ] Tabs
 - [ ] Rectangle shader (colored backgrounds)
 - [ ] CSS color extraction

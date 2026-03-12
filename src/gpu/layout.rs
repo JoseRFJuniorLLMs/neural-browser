@@ -5,6 +5,7 @@
 //! so layout is just: "put headings big, paragraphs normal, images centered."
 
 use crate::npu::{ContentBlock, BlockKind};
+use crate::ui::Theme;
 
 /// A positioned element ready for GPU rendering.
 #[derive(Debug, Clone)]
@@ -14,9 +15,12 @@ pub struct LayoutBox {
     pub width: f32,
     pub height: f32,
     pub kind: LayoutKind,
+    /// Link destination URL (for hit testing on click).
+    pub href: Option<String>,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields used by future GPU pipeline stages
 pub enum LayoutKind {
     /// URL bar at top
     UrlBar { text: String },
@@ -38,28 +42,50 @@ pub enum LayoutKind {
     Background { color: [f32; 4] },
 }
 
+/// Estimate the number of wrapped lines for a text given a width and font size.
+/// Uses average character width heuristic (0.55 * font_size for sans-serif).
+fn estimate_lines(text: &str, width: f32, font_size: f32) -> f32 {
+    if text.is_empty() || width <= 0.0 {
+        return 1.0;
+    }
+    let avg_char_width = font_size * 0.55;
+    let chars_per_line = (width / avg_char_width).max(1.0);
+
+    let mut total_lines: f32 = 0.0;
+    for line in text.split('\n') {
+        let line_len = line.len() as f32;
+        total_lines += (line_len / chars_per_line).ceil().max(1.0);
+    }
+    total_lines.max(1.0)
+}
+
 /// Compute layout for all content blocks.
 /// Returns a list of positioned LayoutBoxes ready for GPU rendering.
-pub fn compute_layout(blocks: &[ContentBlock], scroll_y: f32) -> Vec<LayoutBox> {
+pub fn compute_layout(
+    blocks: &[ContentBlock],
+    scroll_y: f32,
+    viewport_width: f32,
+    theme: &Theme,
+) -> Vec<LayoutBox> {
     let mut layout = Vec::new();
-    let mut cursor_y: f32 = 0.0;
 
     let margin_x: f32 = 40.0;
-    let content_width: f32 = 800.0;
+    let content_width: f32 = (viewport_width - margin_x * 2.0).max(200.0).min(900.0);
 
-    // ── URL bar (fixed at top) ──
+    // ── URL bar background (fixed at top) ──
     layout.push(LayoutBox {
         x: 0.0,
         y: 0.0,
-        width: content_width + margin_x * 2.0,
+        width: viewport_width,
         height: 40.0,
         kind: LayoutKind::Background {
-            color: [0.15, 0.15, 0.18, 1.0],
+            color: theme.url_bar_bg,
         },
+        href: None,
     });
 
-    // URL text will be set by caller
-    cursor_y = 50.0;
+    // URL text is set by caller
+    let mut cursor_y: f32 = 50.0;
 
     // Apply scroll offset
     cursor_y -= scroll_y;
@@ -82,24 +108,29 @@ pub fn compute_layout(blocks: &[ContentBlock], scroll_y: f32) -> Vec<LayoutBox> 
                     4 => 18.0,
                     _ => 16.0,
                 };
-                let spacing_before = font_size * 0.8;
+                // More spacing before headings
+                let spacing_before = if *level <= 2 { font_size * 1.0 } else { font_size * 0.8 };
                 cursor_y += spacing_before;
+
+                let lines = estimate_lines(&block.text, content_width, font_size);
+                let block_height = lines * font_size * 1.4;
 
                 layout.push(LayoutBox {
                     x: margin_x,
                     y: cursor_y,
                     width: content_width,
-                    height: font_size * 1.4,
+                    height: block_height,
                     kind: LayoutKind::Text {
                         text: block.text.clone(),
                         font_size,
-                        color: [0.95, 0.95, 0.97, 1.0],
+                        color: theme.heading,
                         bold: true,
                         italic: false,
                     },
+                    href: None,
                 });
 
-                cursor_y += font_size * 1.6;
+                cursor_y += block_height + font_size * 0.4;
             }
             BlockKind::Paragraph => {
                 if block.text.is_empty() {
@@ -107,23 +138,24 @@ pub fn compute_layout(blocks: &[ContentBlock], scroll_y: f32) -> Vec<LayoutBox> 
                 }
                 let font_size = 16.0;
                 let line_height = font_size * 1.6;
-                let estimated_lines = (block.text.len() as f32 / 80.0).ceil().max(1.0);
+                let lines = estimate_lines(&block.text, content_width, font_size);
 
                 layout.push(LayoutBox {
                     x: margin_x,
                     y: cursor_y,
                     width: content_width,
-                    height: estimated_lines * line_height,
+                    height: lines * line_height,
                     kind: LayoutKind::Text {
                         text: block.text.clone(),
                         font_size,
-                        color: [0.85, 0.85, 0.88, 1.0],
+                        color: theme.text,
                         bold: false,
                         italic: false,
                     },
+                    href: None,
                 });
 
-                cursor_y += estimated_lines * line_height + 12.0;
+                cursor_y += lines * line_height + 14.0;
             }
             BlockKind::Code { language } => {
                 let font_size = 14.0;
@@ -138,8 +170,9 @@ pub fn compute_layout(blocks: &[ContentBlock], scroll_y: f32) -> Vec<LayoutBox> 
                     width: content_width + 24.0,
                     height: block_height,
                     kind: LayoutKind::Background {
-                        color: [0.1, 0.1, 0.12, 1.0],
+                        color: theme.code_bg,
                     },
+                    href: None,
                 });
 
                 layout.push(LayoutBox {
@@ -151,15 +184,16 @@ pub fn compute_layout(blocks: &[ContentBlock], scroll_y: f32) -> Vec<LayoutBox> 
                         text: block.text.clone(),
                         language: language.clone(),
                     },
+                    href: None,
                 });
 
-                cursor_y += block_height + 16.0;
+                cursor_y += block_height + 18.0;
             }
             BlockKind::Quote => {
                 let font_size = 15.0;
                 let line_height = font_size * 1.6;
-                let estimated_lines = (block.text.len() as f32 / 70.0).ceil().max(1.0);
-                let block_height = estimated_lines * line_height + 16.0;
+                let lines = estimate_lines(&block.text, content_width - 40.0, font_size);
+                let block_height = lines * line_height + 16.0;
 
                 // Left border + background
                 layout.push(LayoutBox {
@@ -168,8 +202,9 @@ pub fn compute_layout(blocks: &[ContentBlock], scroll_y: f32) -> Vec<LayoutBox> 
                     width: content_width,
                     height: block_height,
                     kind: LayoutKind::Background {
-                        color: [0.12, 0.12, 0.15, 1.0],
+                        color: theme.quote_bg,
                     },
+                    href: None,
                 });
 
                 layout.push(LayoutBox {
@@ -184,9 +219,10 @@ pub fn compute_layout(blocks: &[ContentBlock], scroll_y: f32) -> Vec<LayoutBox> 
                         bold: false,
                         italic: true,
                     },
+                    href: None,
                 });
 
-                cursor_y += block_height + 12.0;
+                cursor_y += block_height + 14.0;
             }
             BlockKind::Image { src, alt } => {
                 let img_height = 300.0; // Placeholder height
@@ -200,6 +236,7 @@ pub fn compute_layout(blocks: &[ContentBlock], scroll_y: f32) -> Vec<LayoutBox> 
                         src: src.clone(),
                         alt: alt.clone(),
                     },
+                    href: None,
                 });
 
                 if !alt.is_empty() {
@@ -211,63 +248,76 @@ pub fn compute_layout(blocks: &[ContentBlock], scroll_y: f32) -> Vec<LayoutBox> 
                         kind: LayoutKind::Text {
                             text: alt.clone(),
                             font_size: 12.0,
-                            color: [0.5, 0.5, 0.55, 1.0],
+                            color: theme.text_dim,
                             bold: false,
                             italic: true,
                         },
+                        href: None,
                     });
                     cursor_y += img_height + 28.0;
                 } else {
                     cursor_y += img_height + 12.0;
                 }
             }
+            BlockKind::List { .. } => {
+                // List container — children (ListItem) handle rendering
+            }
             BlockKind::ListItem => {
                 let font_size = 15.0;
+                let prefix = format!("\u{2022}  {}", block.text);
+                let lines = estimate_lines(&prefix, content_width - 24.0, font_size);
+
                 layout.push(LayoutBox {
                     x: margin_x + 24.0,
                     y: cursor_y,
                     width: content_width - 24.0,
-                    height: font_size * 1.5,
+                    height: lines * font_size * 1.5,
                     kind: LayoutKind::Text {
-                        text: format!("• {}", block.text),
+                        text: prefix,
                         font_size,
-                        color: [0.85, 0.85, 0.88, 1.0],
+                        color: theme.text,
                         bold: false,
                         italic: false,
                     },
+                    href: None,
                 });
-                cursor_y += font_size * 1.8;
+                cursor_y += lines * font_size * 1.5 + 4.0;
             }
-            BlockKind::Link { href: _ } => {
+            BlockKind::Link { href } => {
                 if block.text.is_empty() {
                     continue;
                 }
                 let font_size = 15.0;
+                let lines = estimate_lines(&block.text, content_width, font_size);
+                let line_height = font_size * 1.5;
+
                 layout.push(LayoutBox {
                     x: margin_x,
                     y: cursor_y,
                     width: content_width,
-                    height: font_size * 1.5,
+                    height: lines * line_height,
                     kind: LayoutKind::Text {
                         text: block.text.clone(),
                         font_size,
-                        color: [0.4, 0.6, 1.0, 1.0], // Blue for links
+                        color: theme.link,
                         bold: false,
                         italic: false,
                     },
+                    href: Some(href.clone()),
                 });
-                cursor_y += font_size * 1.8;
+                cursor_y += lines * line_height + 6.0;
             }
             BlockKind::Separator => {
-                cursor_y += 8.0;
+                cursor_y += 10.0;
                 layout.push(LayoutBox {
                     x: margin_x,
                     y: cursor_y,
                     width: content_width,
                     height: 1.0,
                     kind: LayoutKind::Separator,
+                    href: None,
                 });
-                cursor_y += 16.0;
+                cursor_y += 18.0;
             }
             _ => {}
         }

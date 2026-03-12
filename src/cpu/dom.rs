@@ -80,6 +80,12 @@ const VOID_ELEMENTS: &[&str] = &[
     "input", "link", "meta", "param", "source", "track", "wbr",
 ];
 
+/// Maximum nesting depth to prevent stack-like overflow with deeply nested HTML.
+const MAX_NESTING_DEPTH: usize = 256;
+
+/// Maximum number of DOM nodes to prevent memory exhaustion on huge pages.
+const MAX_DOM_NODES: usize = 100_000;
+
 /// Parse raw HTML into a flat DomTree.
 pub fn parse_html(html: &str) -> DomTree {
     let mut nodes = Vec::new();
@@ -114,24 +120,28 @@ pub fn parse_html(html: &str) -> DomTree {
                 continue;
             }
 
-            // ── Read the tag content up to '>' ──
+            // ── Read the tag content up to '>' (UTF-8 safe) ──
             let mut tag_content = String::new();
             let mut in_quote = false;
-            let mut quote_char = b'"';
+            let mut quote_char = '"';
             while pos < len {
-                let b = bytes[pos];
-                if !in_quote && b == b'>' {
-                    pos += 1;
+                // Decode the next UTF-8 character from the slice
+                let ch = match html[pos..].chars().next() {
+                    Some(c) => c,
+                    None => break,
+                };
+                if !in_quote && ch == '>' {
+                    pos += ch.len_utf8();
                     break;
                 }
-                if !in_quote && (b == b'"' || b == b'\'') {
+                if !in_quote && (ch == '"' || ch == '\'') {
                     in_quote = true;
-                    quote_char = b;
-                } else if in_quote && b == quote_char {
+                    quote_char = ch;
+                } else if in_quote && ch == quote_char {
                     in_quote = false;
                 }
-                tag_content.push(b as char);
-                pos += 1;
+                tag_content.push(ch);
+                pos += ch.len_utf8();
             }
 
             let tag_content = tag_content.trim().to_string();
@@ -213,8 +223,12 @@ pub fn parse_html(html: &str) -> DomTree {
                     continue;
                 }
 
-                if !self_closing && !is_void {
+                if !self_closing && !is_void && stack.len() < MAX_NESTING_DEPTH {
                     stack.push(id);
+                }
+
+                if nodes.len() >= MAX_DOM_NODES {
+                    break;
                 }
             }
         } else {

@@ -259,10 +259,69 @@ pub fn compute_layout(
                     cursor_y += img_height + 12.0;
                 }
             }
-            BlockKind::List { .. } => {
-                // List container — children (ListItem) handle rendering
+            BlockKind::List { ordered } => {
+                // Render children (ListItems) with proper numbering
+                for (idx, child) in block.children.iter().enumerate() {
+                    if child.relevance < 0.15 {
+                        continue;
+                    }
+                    let font_size = 15.0;
+                    let prefix = if *ordered {
+                        format!("{}. {}", idx + 1, child.text)
+                    } else {
+                        format!("\u{2022}  {}", child.text)
+                    };
+                    let lines = estimate_lines(&prefix, content_width - 24.0, font_size);
+
+                    layout.push(LayoutBox {
+                        x: margin_x + 24.0,
+                        y: cursor_y,
+                        width: content_width - 24.0,
+                        height: lines * font_size * 1.5,
+                        kind: LayoutKind::Text {
+                            text: prefix,
+                            font_size,
+                            color: theme.text,
+                            bold: false,
+                            italic: false,
+                        },
+                        href: None,
+                    });
+                    cursor_y += lines * font_size * 1.5 + 4.0;
+
+                    // Render nested lists
+                    for nested in &child.children {
+                        if let BlockKind::List { ordered: nested_ord } = &nested.kind {
+                            for (ni, nc) in nested.children.iter().enumerate() {
+                                let np = if *nested_ord {
+                                    format!("  {}. {}", ni + 1, nc.text)
+                                } else {
+                                    format!("  \u{25E6}  {}", nc.text)
+                                };
+                                let nl = estimate_lines(&np, content_width - 48.0, font_size);
+                                layout.push(LayoutBox {
+                                    x: margin_x + 48.0,
+                                    y: cursor_y,
+                                    width: content_width - 48.0,
+                                    height: nl * font_size * 1.5,
+                                    kind: LayoutKind::Text {
+                                        text: np,
+                                        font_size,
+                                        color: theme.text,
+                                        bold: false,
+                                        italic: false,
+                                    },
+                                    href: None,
+                                });
+                                cursor_y += nl * font_size * 1.5 + 3.0;
+                            }
+                        }
+                    }
+                }
+                cursor_y += 6.0;
             }
             BlockKind::ListItem => {
+                // Standalone list items (outside a List container)
                 let font_size = 15.0;
                 let prefix = format!("\u{2022}  {}", block.text);
                 let lines = estimate_lines(&prefix, content_width - 24.0, font_size);
@@ -318,6 +377,228 @@ pub fn compute_layout(
                     href: None,
                 });
                 cursor_y += 18.0;
+            }
+            BlockKind::Table => {
+                // Render table rows as pipe-separated text (children are TableRow)
+                if !block.children.is_empty() {
+                    let font_size = 14.0;
+                    let line_h = font_size * 1.5;
+                    for child in &block.children {
+                        if let BlockKind::TableRow = &child.kind {
+                            let lines = estimate_lines(&child.text, content_width, font_size);
+                            layout.push(LayoutBox {
+                                x: margin_x,
+                                y: cursor_y,
+                                width: content_width,
+                                height: lines * line_h,
+                                kind: LayoutKind::Code {
+                                    text: child.text.clone(),
+                                    language: None,
+                                },
+                                href: None,
+                            });
+                            cursor_y += lines * line_h + 2.0;
+                        }
+                    }
+                    cursor_y += 8.0;
+                } else if !block.text.is_empty() {
+                    // Fallback: render table text as code block
+                    let font_size = 14.0;
+                    let lines = block.text.lines().count().max(1) as f32;
+                    let block_height = lines * font_size * 1.5 + 16.0;
+                    layout.push(LayoutBox {
+                        x: margin_x,
+                        y: cursor_y,
+                        width: content_width,
+                        height: block_height,
+                        kind: LayoutKind::Code {
+                            text: block.text.clone(),
+                            language: None,
+                        },
+                        href: None,
+                    });
+                    cursor_y += block_height + 12.0;
+                }
+            }
+            BlockKind::TableRow => {
+                // Standalone table row (outside Table)
+                if !block.text.is_empty() {
+                    let font_size = 14.0;
+                    let lines = estimate_lines(&block.text, content_width, font_size);
+                    layout.push(LayoutBox {
+                        x: margin_x,
+                        y: cursor_y,
+                        width: content_width,
+                        height: lines * font_size * 1.5,
+                        kind: LayoutKind::Code {
+                            text: block.text.clone(),
+                            language: None,
+                        },
+                        href: None,
+                    });
+                    cursor_y += lines * font_size * 1.5 + 4.0;
+                }
+            }
+            BlockKind::DefinitionList => {
+                // Render dt/dd children
+                for child in &block.children {
+                    match &child.kind {
+                        BlockKind::DefinitionTerm => {
+                            let font_size = 15.0;
+                            let lines = estimate_lines(&child.text, content_width, font_size);
+                            layout.push(LayoutBox {
+                                x: margin_x,
+                                y: cursor_y,
+                                width: content_width,
+                                height: lines * font_size * 1.5,
+                                kind: LayoutKind::Text {
+                                    text: child.text.clone(),
+                                    font_size,
+                                    color: theme.heading,
+                                    bold: true,
+                                    italic: false,
+                                },
+                                href: None,
+                            });
+                            cursor_y += lines * font_size * 1.5 + 4.0;
+                        }
+                        BlockKind::DefinitionDesc => {
+                            let font_size = 14.0;
+                            let lines = estimate_lines(&child.text, content_width - 24.0, font_size);
+                            layout.push(LayoutBox {
+                                x: margin_x + 24.0,
+                                y: cursor_y,
+                                width: content_width - 24.0,
+                                height: lines * font_size * 1.5,
+                                kind: LayoutKind::Text {
+                                    text: child.text.clone(),
+                                    font_size,
+                                    color: theme.text,
+                                    bold: false,
+                                    italic: false,
+                                },
+                                href: None,
+                            });
+                            cursor_y += lines * font_size * 1.5 + 4.0;
+                        }
+                        _ => {}
+                    }
+                }
+                cursor_y += 8.0;
+            }
+            BlockKind::Details { .. } => {
+                // Render summary and content children
+                for child in &block.children {
+                    match &child.kind {
+                        BlockKind::Summary => {
+                            let font_size = 15.0;
+                            let text = format!("\u{25B6} {}", child.text);
+                            let lines = estimate_lines(&text, content_width, font_size);
+                            layout.push(LayoutBox {
+                                x: margin_x,
+                                y: cursor_y,
+                                width: content_width,
+                                height: lines * font_size * 1.5,
+                                kind: LayoutKind::Text {
+                                    text,
+                                    font_size,
+                                    color: theme.link,
+                                    bold: true,
+                                    italic: false,
+                                },
+                                href: None,
+                            });
+                            cursor_y += lines * font_size * 1.5 + 4.0;
+                        }
+                        _ => {
+                            // Render other children as paragraphs
+                            if !child.text.is_empty() {
+                                let font_size = 15.0;
+                                let lines = estimate_lines(&child.text, content_width - 16.0, font_size);
+                                layout.push(LayoutBox {
+                                    x: margin_x + 16.0,
+                                    y: cursor_y,
+                                    width: content_width - 16.0,
+                                    height: lines * font_size * 1.5,
+                                    kind: LayoutKind::Text {
+                                        text: child.text.clone(),
+                                        font_size,
+                                        color: theme.text,
+                                        bold: false,
+                                        italic: false,
+                                    },
+                                    href: None,
+                                });
+                                cursor_y += lines * font_size * 1.5 + 4.0;
+                            }
+                        }
+                    }
+                }
+                cursor_y += 6.0;
+            }
+            BlockKind::Form => {
+                // Render form description
+                if !block.text.is_empty() {
+                    let font_size = 14.0;
+                    let lines = estimate_lines(&block.text, content_width, font_size);
+                    layout.push(LayoutBox {
+                        x: margin_x,
+                        y: cursor_y,
+                        width: content_width,
+                        height: lines * font_size * 1.5,
+                        kind: LayoutKind::Text {
+                            text: block.text.clone(),
+                            font_size,
+                            color: theme.text_dim,
+                            bold: false,
+                            italic: true,
+                        },
+                        href: None,
+                    });
+                    cursor_y += lines * font_size * 1.5 + 8.0;
+                }
+            }
+            BlockKind::Figure => {
+                // Render figure children (images + captions)
+                for child in &block.children {
+                    match &child.kind {
+                        BlockKind::Image { src, alt } => {
+                            layout.push(LayoutBox {
+                                x: margin_x,
+                                y: cursor_y,
+                                width: content_width,
+                                height: 200.0,
+                                kind: LayoutKind::Image {
+                                    src: src.clone(),
+                                    alt: alt.clone(),
+                                },
+                                href: None,
+                            });
+                            cursor_y += 208.0;
+                        }
+                        BlockKind::FigCaption => {
+                            let font_size = 12.0;
+                            let lines = estimate_lines(&child.text, content_width, font_size);
+                            layout.push(LayoutBox {
+                                x: margin_x,
+                                y: cursor_y,
+                                width: content_width,
+                                height: lines * font_size * 1.5,
+                                kind: LayoutKind::Text {
+                                    text: child.text.clone(),
+                                    font_size,
+                                    color: theme.text_dim,
+                                    bold: false,
+                                    italic: true,
+                                },
+                                href: None,
+                            });
+                            cursor_y += lines * font_size * 1.5 + 4.0;
+                        }
+                        _ => {}
+                    }
+                }
+                cursor_y += 8.0;
             }
             _ => {}
         }

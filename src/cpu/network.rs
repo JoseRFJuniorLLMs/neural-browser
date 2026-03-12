@@ -10,7 +10,7 @@
 //!
 //! Everything else (understanding the response) goes to NPU.
 
-use anyhow::{Result, Context};
+use anyhow::Result;
 use log::{info, warn};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -92,17 +92,55 @@ impl NetworkEngine {
             ));
         }
 
-        let body = resp.into_body()
-            .read_to_string()
-            .context("Failed to read response body")?;
+        // Limit body size to prevent memory exhaustion from huge pages
+        let mut body = String::new();
+        let mut binding = resp.into_body();
+        let mut reader = binding.as_reader();
+        let mut buf = [0u8; 8192];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    // Validate UTF-8 and append
+                    match std::str::from_utf8(&buf[..n]) {
+                        Ok(chunk) => body.push_str(chunk),
+                        Err(_) => {
+                            // Lossy conversion for non-UTF-8 pages
+                            body.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        }
+                    }
+                    if body.len() > MAX_BODY_SIZE {
+                        warn!("[CPU:NET] Body exceeds {} bytes, truncating", MAX_BODY_SIZE);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if body.is_empty() {
+                        return Err(anyhow::anyhow!("Failed to read response body: {e}"));
+                    }
+                    warn!("[CPU:NET] Body read error after {} bytes: {e}", body.len());
+                    break;
+                }
+            }
+        }
 
         Ok(body)
     }
 
+    /// Maximum prefetch cache entries to prevent unbounded memory growth.
+    const MAX_PREFETCH_ENTRIES: usize = 10;
+
     /// Prefetch a URL into cache (NPU predicted the user will click it).
     pub fn prefetch(&self, url: &str) -> Result<()> {
         let html = self.fetch(url)?;
-        self.prefetch_cache.lock().insert(url.to_string(), html);
+        let mut cache = self.prefetch_cache.lock();
+        // Evict oldest entries if cache is full
+        if cache.len() >= Self::MAX_PREFETCH_ENTRIES {
+            if let Some(first_key) = cache.keys().next().cloned() {
+                cache.remove(&first_key);
+            }
+        }
+        cache.insert(url.to_string(), html);
         Ok(())
     }
 }
@@ -150,20 +188,42 @@ fn http_status_text(status: u16) -> &'static str {
     }
 }
 
+/// Maximum response body size (10 MB) to prevent memory exhaustion.
+const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+
 /// Generate a simple HTML error page that the parser and NPU can process.
+/// URL and message are HTML-escaped to prevent XSS.
 pub fn generate_error_page(url: &str, message: &str) -> String {
+    let safe_url = html_escape(url);
+    let safe_msg = html_escape(message);
     format!(
         r#"<html>
 <head><title>Error - Neural Browser</title></head>
 <body>
 <main>
 <h1>Page could not be loaded</h1>
-<p>{message}</p>
-<p>URL: {url}</p>
+<p>{safe_msg}</p>
+<p>URL: {safe_url}</p>
 <hr>
 <p>Press F5 to retry, or F6 to navigate to a different page.</p>
 </main>
 </body>
 </html>"#
     )
+}
+
+/// Escape HTML special characters to prevent XSS in error pages.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }

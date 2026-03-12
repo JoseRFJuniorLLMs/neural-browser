@@ -14,6 +14,8 @@ mod cpu;
 mod npu;
 mod gpu;
 mod ui;
+#[allow(dead_code)] // EVA integration is WIP
+mod eva;
 
 use anyhow::Result;
 use crossbeam_channel as channel;
@@ -50,6 +52,24 @@ pub enum PipelineMsg {
 
     // NPU -> CPU: prefetch suggestion
     Prefetch(String),
+
+    // ── EVA messages ──
+
+    // GPU -> CPU: user asks EVA a question
+    EvaQuery {
+        message: String,
+        page_context: String,
+    },
+
+    // CPU -> GPU: EVA response
+    EvaResponse {
+        text: String,
+    },
+
+    // GPU -> CPU: ask EVA to summarize current page
+    EvaSummarize {
+        content: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -66,6 +86,10 @@ fn main() -> Result<()> {
     let (cpu_to_npu_tx, cpu_to_npu_rx) = channel::bounded::<PipelineMsg>(8);
     let (npu_to_gpu_tx, npu_to_gpu_rx) = channel::bounded::<PipelineMsg>(8);
     let (ui_tx, ui_rx) = channel::bounded::<PipelineMsg>(16);
+
+    // EVA channel: GPU -> CPU (queries) and CPU -> GPU (responses)
+    let (eva_tx, eva_rx) = channel::bounded::<PipelineMsg>(8);
+    let (eva_resp_tx, eva_resp_rx) = channel::bounded::<PipelineMsg>(8);
 
     // ── NPU engine (spawn on dedicated thread) ──
     let _npu_ui_tx = ui_tx.clone();
@@ -93,7 +117,21 @@ fn main() -> Result<()> {
                                     ads_blocked: result.ads_blocked,
                                 });
                             }
-                            Err(e) => error!("[NPU] Processing failed: {e}"),
+                            Err(e) => {
+                                error!("[NPU] Processing failed: {e}");
+                                // Send error content so GPU stops loading spinner
+                                let _ = npu_to_gpu_tx.send(PipelineMsg::ContentReady {
+                                    url,
+                                    blocks: vec![npu::ContentBlock {
+                                        kind: npu::BlockKind::Paragraph,
+                                        text: format!("NPU processing error: {e}"),
+                                        depth: 0,
+                                        relevance: 1.0,
+                                        children: Vec::new(),
+                                    }],
+                                    ads_blocked: 0,
+                                });
+                            }
                         }
                     }
                     _ => {}
@@ -103,11 +141,14 @@ fn main() -> Result<()> {
 
     // ── CPU networking (spawn on dedicated thread) ──
     let cpu_ui_rx = ui_rx;
+    let cpu_eva_rx = eva_rx;
+    let cpu_eva_resp_tx = eva_resp_tx;
     let cpu_handle = std::thread::Builder::new()
         .name("cpu-network".into())
         .spawn(move || {
-            info!("[CPU] Thread started -- networking + parsing + history");
+            info!("[CPU] Thread started -- networking + parsing + history + EVA");
             let net = cpu::network::NetworkEngine::new();
+            let eva_client = eva::EvaClient::new();
 
             // ── Browser history stacks ──
             let mut back_stack: Vec<String> = Vec::new();
@@ -133,77 +174,107 @@ fn main() -> Result<()> {
                 }
             };
 
-            // Listen for navigation events
-            for msg in cpu_ui_rx {
-                match msg {
-                    PipelineMsg::Navigate(url) => {
-                        info!("[CPU] Navigating to: {url}");
-                        // Push current URL to back stack before navigating
-                        if let Some(cur) = current_url.take() {
-                            back_stack.push(cur);
-                        }
-                        // Clear forward stack on new navigation
-                        forward_stack.clear();
-                        current_url = Some(url.clone());
-                        process_url(&net, &url, &cpu_to_npu_tx);
-                    }
-                    PipelineMsg::Back => {
-                        if let Some(prev_url) = back_stack.pop() {
-                            info!("[CPU] Going back to: {prev_url}");
-                            if let Some(cur) = current_url.take() {
-                                forward_stack.push(cur);
+            // Listen for navigation events and EVA queries using select
+            loop {
+                channel::select! {
+                    recv(cpu_ui_rx) -> msg => {
+                        let msg = match msg {
+                            Ok(m) => m,
+                            Err(_) => break, // channel closed
+                        };
+                        match msg {
+                            PipelineMsg::Navigate(url) => {
+                                info!("[CPU] Navigating to: {url}");
+                                if let Some(cur) = current_url.take() {
+                                    back_stack.push(cur);
+                                }
+                                forward_stack.clear();
+                                current_url = Some(url.clone());
+                                process_url(&net, &url, &cpu_to_npu_tx);
                             }
-                            current_url = Some(prev_url.clone());
-                            if prev_url == cpu::start_page::START_PAGE_URL {
-                                // Reload start page from memory
-                                let html = cpu::start_page::start_page_html().to_string();
-                                let dom = cpu::dom::parse_html(&html);
-                                let _ = cpu_to_npu_tx.send(PipelineMsg::HtmlReady {
-                                    url: prev_url,
-                                    html,
-                                    dom,
+                            PipelineMsg::Back => {
+                                if let Some(prev_url) = back_stack.pop() {
+                                    info!("[CPU] Going back to: {prev_url}");
+                                    if let Some(cur) = current_url.take() {
+                                        forward_stack.push(cur);
+                                    }
+                                    current_url = Some(prev_url.clone());
+                                    if prev_url == cpu::start_page::START_PAGE_URL {
+                                        let html = cpu::start_page::start_page_html().to_string();
+                                        let dom = cpu::dom::parse_html(&html);
+                                        let _ = cpu_to_npu_tx.send(PipelineMsg::HtmlReady {
+                                            url: prev_url,
+                                            html,
+                                            dom,
+                                        });
+                                    } else {
+                                        process_url(&net, &prev_url, &cpu_to_npu_tx);
+                                    }
+                                } else {
+                                    warn!("[CPU] No back history available");
+                                }
+                            }
+                            PipelineMsg::Forward => {
+                                if let Some(next_url) = forward_stack.pop() {
+                                    info!("[CPU] Going forward to: {next_url}");
+                                    if let Some(cur) = current_url.take() {
+                                        back_stack.push(cur);
+                                    }
+                                    current_url = Some(next_url.clone());
+                                    if next_url == cpu::start_page::START_PAGE_URL {
+                                        let html = cpu::start_page::start_page_html().to_string();
+                                        let dom = cpu::dom::parse_html(&html);
+                                        let _ = cpu_to_npu_tx.send(PipelineMsg::HtmlReady {
+                                            url: next_url,
+                                            html,
+                                            dom,
+                                        });
+                                    } else {
+                                        process_url(&net, &next_url, &cpu_to_npu_tx);
+                                    }
+                                } else {
+                                    warn!("[CPU] No forward history available");
+                                }
+                            }
+                            PipelineMsg::Prefetch(url) => {
+                                info!("[CPU] Prefetching: {url}");
+                                let _ = net.prefetch(&url);
+                            }
+                            _ => {}
+                        }
+                    }
+                    recv(cpu_eva_rx) -> msg => {
+                        let msg = match msg {
+                            Ok(m) => m,
+                            Err(_) => break, // channel closed
+                        };
+                        match msg {
+                            PipelineMsg::EvaQuery { message, page_context } => {
+                                info!("[CPU] EVA query received");
+                                let response = eva_client.ask(&message, &page_context)
+                                    .unwrap_or_else(|e| format!("EVA error: {e}"));
+                                let _ = cpu_eva_resp_tx.send(PipelineMsg::EvaResponse {
+                                    text: response,
                                 });
-                            } else {
-                                process_url(&net, &prev_url, &cpu_to_npu_tx);
                             }
-                        } else {
-                            warn!("[CPU] No back history available");
-                        }
-                    }
-                    PipelineMsg::Forward => {
-                        if let Some(next_url) = forward_stack.pop() {
-                            info!("[CPU] Going forward to: {next_url}");
-                            if let Some(cur) = current_url.take() {
-                                back_stack.push(cur);
-                            }
-                            current_url = Some(next_url.clone());
-                            if next_url == cpu::start_page::START_PAGE_URL {
-                                let html = cpu::start_page::start_page_html().to_string();
-                                let dom = cpu::dom::parse_html(&html);
-                                let _ = cpu_to_npu_tx.send(PipelineMsg::HtmlReady {
-                                    url: next_url,
-                                    html,
-                                    dom,
+                            PipelineMsg::EvaSummarize { content } => {
+                                info!("[CPU] EVA summarize requested");
+                                let response = eva_client.summarize_page(&content)
+                                    .unwrap_or_else(|e| format!("EVA error: {e}"));
+                                let _ = cpu_eva_resp_tx.send(PipelineMsg::EvaResponse {
+                                    text: response,
                                 });
-                            } else {
-                                process_url(&net, &next_url, &cpu_to_npu_tx);
                             }
-                        } else {
-                            warn!("[CPU] No forward history available");
+                            _ => {}
                         }
                     }
-                    PipelineMsg::Prefetch(url) => {
-                        info!("[CPU] Prefetching: {url}");
-                        let _ = net.prefetch(&url);
-                    }
-                    _ => {}
                 }
             }
         })?;
 
     // ── GPU rendering + window (must be on main thread) ──
     info!("[GPU] Starting render engine on main thread");
-    gpu::run_gpu_renderer(npu_to_gpu_rx, ui_tx)?;
+    gpu::run_gpu_renderer(npu_to_gpu_rx, ui_tx, eva_tx, eva_resp_rx)?;
 
     let _ = npu_handle.join();
     let _ = cpu_handle.join();

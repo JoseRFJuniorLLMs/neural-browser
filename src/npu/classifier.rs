@@ -180,7 +180,7 @@ const AD_URL_PATTERNS: &[PatternEntry] = &[
     PatternEntry { pattern: "/ads/", confidence: 0.8 },
     PatternEntry { pattern: "/ad/", confidence: 0.7 },
     PatternEntry { pattern: "/adserv", confidence: 0.85 },
-    PatternEntry { pattern: "banner", confidence: 0.6 },
+    PatternEntry { pattern: "/banner-ad", confidence: 0.7 },
     PatternEntry { pattern: "popunder", confidence: 0.9 },
     PatternEntry { pattern: "pop-up", confidence: 0.7 },
 ];
@@ -195,7 +195,7 @@ const TRACKER_PATTERNS: &[PatternEntry] = &[
     PatternEntry { pattern: "beacon", confidence: 0.8 },
     PatternEntry { pattern: "telemetry", confidence: 0.85 },
     PatternEntry { pattern: "collect?", confidence: 0.75 },
-    PatternEntry { pattern: "utm_", confidence: 0.6 },
+    PatternEntry { pattern: "utm_", confidence: 0.35 },  // Low: UTM links are often legitimate
     PatternEntry { pattern: "fbclid", confidence: 0.7 },
     PatternEntry { pattern: "gclid", confidence: 0.7 },
     PatternEntry { pattern: "hotjar", confidence: 0.9 },
@@ -205,7 +205,7 @@ const TRACKER_PATTERNS: &[PatternEntry] = &[
     PatternEntry { pattern: "mixpanel", confidence: 0.85 },
     PatternEntry { pattern: "amplitude", confidence: 0.8 },
     PatternEntry { pattern: "newrelic", confidence: 0.75 },
-    PatternEntry { pattern: "sentry", confidence: 0.6 },
+    PatternEntry { pattern: "sentry.io", confidence: 0.5 },
 ];
 
 // ── Ad text patterns ──
@@ -214,7 +214,7 @@ const AD_TEXT_PATTERNS: &[PatternEntry] = &[
     PatternEntry { pattern: "advertisement", confidence: 0.9 },
     PatternEntry { pattern: "sponsored content", confidence: 0.95 },
     PatternEntry { pattern: "sponsored post", confidence: 0.9 },
-    PatternEntry { pattern: "promoted", confidence: 0.7 },
+    PatternEntry { pattern: "promoted content", confidence: 0.7 },
     PatternEntry { pattern: "ad choice", confidence: 0.9 },
     PatternEntry { pattern: "adchoice", confidence: 0.9 },
     PatternEntry { pattern: "paid partnership", confidence: 0.85 },
@@ -318,10 +318,14 @@ mod tests {
     }
 
     #[test]
-    fn test_promoted_detected() {
+    fn test_promoted_content_detected() {
         let classifier = AdClassifier::new().unwrap();
-        let block = make_block(BlockKind::Paragraph, "Promoted post");
+        // "promoted" alone has too many false positives; "promoted content" is specific
+        let block = make_block(BlockKind::Paragraph, "This is promoted content by a brand");
         assert!(classifier.is_ad(&block));
+        // But "promoted" alone should NOT trigger
+        let block2 = make_block(BlockKind::Paragraph, "Recently promoted to manager");
+        assert!(!classifier.is_ad(&block2));
     }
 
     // ── Ad image URL tests ──
@@ -395,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn test_utm_tracker_detected() {
+    fn test_utm_tracker_low_confidence() {
         let classifier = AdClassifier::new().unwrap();
         let block = make_block(
             BlockKind::Link {
@@ -403,7 +407,12 @@ mod tests {
             },
             "Click here",
         );
-        assert!(classifier.is_ad(&block));
+        // UTM parameters have low confidence (0.35) so they should NOT be blocked
+        // (threshold is 0.5). UTM links are often legitimate content links.
+        assert!(!classifier.is_ad(&block));
+        let c = classifier.classify(&block);
+        assert_eq!(c.kind, ClassificationKind::Tracker);
+        assert!(c.confidence < 0.5);
     }
 
     #[test]

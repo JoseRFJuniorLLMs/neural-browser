@@ -437,14 +437,20 @@ fn extract_domain(url: &str) -> Option<String> {
     Some(domain.to_lowercase())
 }
 
-/// Truncate a summary to a max length, breaking at word boundaries.
+/// Truncate a summary to a max length, breaking at word boundaries (UTF-8 safe).
 fn truncate_summary(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         return text.to_string();
     }
 
-    // Find last space before max_len
-    let truncated = &text[..max_len];
+    // Find a valid UTF-8 boundary at or before max_len
+    let mut end = max_len;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    // Find last space before the boundary for clean word break
+    let truncated = &text[..end];
     if let Some(last_space) = truncated.rfind(' ') {
         format!("{}...", &text[..last_space])
     } else {

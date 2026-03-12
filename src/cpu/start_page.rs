@@ -24,12 +24,15 @@ pub fn start_page_html() -> &'static str {
 
     <h2>Keyboard Shortcuts</h2>
     <ul>
-        <li>F6 — Focus the URL bar (type a URL and press Enter)</li>
-        <li>Enter — Navigate to the typed URL</li>
+        <li>F6 / Ctrl+L — Focus the URL bar (type a URL or search query)</li>
+        <li>Enter — Navigate to URL or search Google</li>
         <li>Escape — Cancel URL editing</li>
-        <li>F5 — Refresh the current page</li>
+        <li>F5 / Ctrl+R — Refresh the current page</li>
+        <li>Alt+Left / Alt+Right — Back / Forward</li>
         <li>Page Up / Page Down — Scroll by page</li>
-        <li>Home — Scroll to top</li>
+        <li>Home / End — Scroll to top / bottom</li>
+        <li>Ctrl+E / F2 — Toggle EVA AI panel</li>
+        <li>Ctrl+S — Ask EVA to summarize current page</li>
     </ul>
 
     <h2>Try These Pages</h2>

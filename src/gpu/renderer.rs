@@ -552,7 +552,7 @@ impl WgpuRenderer {
                     font_size,
                     color,
                     bold,
-                    ..
+                    italic,
                 } => {
                     if text.is_empty() {
                         continue;
@@ -576,10 +576,15 @@ impl WgpuRenderer {
 
                     let is_link = lbox.href.is_some();
                     let weight = if *bold { Weight::BOLD } else { Weight::NORMAL };
+                    let style = if *italic {
+                        glyphon::Style::Italic
+                    } else {
+                        glyphon::Style::Normal
+                    };
                     buf.set_text(
                         &mut self.font_system,
-                        text, // pass reference directly — no clone needed
-                        Attrs::new().family(Family::SansSerif).weight(weight),
+                        text,
+                        Attrs::new().family(Family::SansSerif).weight(weight).style(style),
                         Shaping::Advanced,
                     );
                     buf.shape_until_scroll(&mut self.font_system, false);

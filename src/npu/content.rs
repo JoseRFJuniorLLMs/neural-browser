@@ -128,6 +128,29 @@ impl ContentExtractor {
         Ok(blocks)
     }
 
+    /// Check if a node should be hidden (display:none, visibility:hidden, hidden attr, aria-hidden).
+    fn is_hidden(node: &DomNode) -> bool {
+        // HTML hidden attribute
+        if node.attrs.contains_key("hidden") {
+            return true;
+        }
+        // aria-hidden="true"
+        if node.attrs.get("aria-hidden").map(|v| v == "true").unwrap_or(false) {
+            return true;
+        }
+        // Inline style: display:none or visibility:hidden
+        if let Some(style) = node.attrs.get("style") {
+            let s = style.to_lowercase();
+            if s.contains("display:none") || s.contains("display: none") {
+                return true;
+            }
+            if s.contains("visibility:hidden") || s.contains("visibility: hidden") {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Recursively extract a node and its children into blocks.
     fn extract_node_recursive(
         &self,
@@ -135,6 +158,11 @@ impl ContentExtractor {
         dom: &DomTree,
         blocks: &mut Vec<ContentBlock>,
     ) {
+        // Skip hidden elements
+        if Self::is_hidden(node) {
+            return;
+        }
+
         match node.tag.as_str() {
             // ── Nested list handling: ul/ol inside li ──
             "ul" | "ol" => {
@@ -642,7 +670,24 @@ impl ContentExtractor {
     }
 
     /// Convert a single DOM node to a ContentBlock.
-    fn node_to_block(&self, node: &DomNode, _dom: &DomTree) -> Option<ContentBlock> {
+    fn node_to_block(&self, node: &DomNode, dom: &DomTree) -> Option<ContentBlock> {
+        // Skip hidden elements and elements with hidden ancestors
+        if Self::is_hidden(node) {
+            return None;
+        }
+        // Check if any ancestor is hidden
+        let mut parent_id = node.parent;
+        while let Some(pid) = parent_id {
+            if let Some(parent) = dom.nodes.get(pid) {
+                if Self::is_hidden(parent) {
+                    return None;
+                }
+                parent_id = parent.parent;
+            } else {
+                break;
+            }
+        }
+
         let kind = match node.tag.as_str() {
             "h1" => BlockKind::Heading { level: 1 },
             "h2" => BlockKind::Heading { level: 2 },
@@ -957,5 +1002,43 @@ mod tests {
     fn test_ordered_list_extraction() {
         let blocks = extract("<ol><li>First</li><li>Second</li></ol>");
         assert!(blocks.iter().any(|b| matches!(b.kind, BlockKind::List { ordered: true })));
+    }
+
+    // ── Hidden element filtering tests ──
+
+    #[test]
+    fn test_hidden_attribute_filtered() {
+        let blocks = extract(r#"<p>Visible</p><p hidden>Hidden</p>"#);
+        let paras: Vec<_> = blocks.iter().filter(|b| matches!(b.kind, BlockKind::Paragraph)).collect();
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].text, "Visible");
+    }
+
+    #[test]
+    fn test_display_none_filtered() {
+        let blocks = extract(r#"<p>Visible</p><p style="display:none">Hidden</p>"#);
+        let paras: Vec<_> = blocks.iter().filter(|b| matches!(b.kind, BlockKind::Paragraph)).collect();
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].text, "Visible");
+    }
+
+    #[test]
+    fn test_visibility_hidden_filtered() {
+        let blocks = extract(r#"<p>Visible</p><div style="visibility: hidden"><p>Hidden</p></div>"#);
+        // The div with visibility:hidden should be skipped, so Hidden para won't appear
+        let texts: Vec<_> = blocks.iter()
+            .filter(|b| matches!(b.kind, BlockKind::Paragraph))
+            .map(|b| b.text.as_str())
+            .collect();
+        assert!(texts.contains(&"Visible"));
+        assert!(!texts.contains(&"Hidden"));
+    }
+
+    #[test]
+    fn test_aria_hidden_filtered() {
+        let blocks = extract(r#"<p>Visible</p><p aria-hidden="true">Screen reader only</p>"#);
+        let paras: Vec<_> = blocks.iter().filter(|b| matches!(b.kind, BlockKind::Paragraph)).collect();
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].text, "Visible");
     }
 }

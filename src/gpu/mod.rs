@@ -12,6 +12,7 @@
 
 mod renderer;
 mod layout;
+#[allow(dead_code)]
 pub mod tabs;
 
 use crate::eva::panel::EvaPanel;
@@ -689,15 +690,23 @@ impl ApplicationHandler for GpuApp {
                         let wf = self.renderer.as_ref()
                             .map(|r| r.size().0 as f32 / sf).unwrap_or(1200.0);
                         let tb = renderer::TOOLBAR_HEIGHT;
-                        let btn_w: f32 = 36.0;
-                        let btn_h: f32 = 32.0;
-                        let btn_y = (tb - btn_h) / 2.0;
-                        let back_x: f32 = 8.0;
-                        let fwd_x = back_x + btn_w + 4.0;
-                        let ref_x = fwd_x + btn_w + 4.0;
-                        let eva_btn_w: f32 = 52.0;
-                        let eva_btn_x = wf - eva_btn_w - 8.0;
-                        let url_x = ref_x + btn_w + 12.0;
+                        let nav_btn_size: f32 = 36.0;
+                        let btn_y = (tb - nav_btn_size) / 2.0;
+                        let btn_h = nav_btn_size;
+                        let btn_w = nav_btn_size;
+                        let back_x: f32 = 14.0;
+                        let fwd_x = back_x + nav_btn_size + 4.0;
+                        let ref_x = fwd_x + nav_btn_size + 4.0;
+                        let eva_btn_w: f32 = 68.0;
+                        let eva_btn_x = wf - eva_btn_w - 14.0;
+                        // Pill URL bar — centered between nav buttons and EVA button
+                        let nav_zone_end = ref_x + nav_btn_size + 16.0;
+                        let eva_zone_start = eva_btn_x - 16.0;
+                        let available = eva_zone_start - nav_zone_end;
+                        let pill_max_w: f32 = 680.0;
+                        let pill_w = available.min(pill_max_w).max(200.0);
+                        let pill_x = nav_zone_end + (available - pill_w) / 2.0;
+                        let _url_x = pill_x;
                         let mx = self.mouse_x;
                         let my = self.mouse_y;
 
@@ -732,8 +741,8 @@ impl ApplicationHandler for GpuApp {
                                 return;
                             }
                         }
-                        // Click in URL bar (between nav buttons and EVA button)
-                        if mx >= url_x && mx < eva_btn_x - 8.0 && !self.url_editing {
+                        // Click in pill URL bar (centered)
+                        if mx >= pill_x && mx < pill_x + pill_w && !self.url_editing {
                             self.url_editing = true;
                             // Pre-fill with current URL so user can edit in-place
                             self.url_input = self.url_bar.clone();
@@ -1077,12 +1086,10 @@ impl ApplicationHandler for GpuApp {
 
                         // Ctrl+W = close window
                         if ctrl && ch.as_str() == "w" {
-                            if let Some(window) = &self.window {
-                                info!("[UI] Ctrl+W: requesting window close");
-                                // Proper close via winit — triggers CloseRequested event
-                                
-                                // Fallback: just set not visible + break loop
-                                window.set_visible(false);
+                            info!("[UI] Ctrl+W: requesting window close");
+                            if let Some(_window) = &self.window {
+                                // Exit the event loop properly
+                                event_loop.exit();
                                 std::process::exit(0);
                             }
                             return;
@@ -1206,11 +1213,24 @@ fn normalize_url_input(input: &str) -> String {
     // Already a full URL with known scheme
     if trimmed.starts_with("http://")
         || trimmed.starts_with("https://")
-        || trimmed.starts_with("ftp://")
-        || trimmed.starts_with("data:")
-        || trimmed.starts_with("file://")
     {
         return trimmed.to_string();
+    }
+
+    // Block potentially dangerous schemes
+    if trimmed.starts_with("data:") {
+        log::warn!("[Security] Blocked data: URL");
+        return "neural://error?reason=data_urls_blocked".to_string();
+    }
+    if trimmed.starts_with("ftp://") {
+        log::warn!("[Security] Blocked ftp:// URL");
+        return "neural://error?reason=ftp_urls_blocked".to_string();
+    }
+
+    // Block file:// — local filesystem access is a security risk
+    if trimmed.starts_with("file://") {
+        log::warn!("[Security] Blocked file:// URL: {trimmed}");
+        return "neural://error?reason=file_urls_blocked".to_string();
     }
 
     // Internal pages
@@ -1306,7 +1326,12 @@ mod tests {
     fn test_full_url_passthrough() {
         assert_eq!(normalize_url_input("https://example.com"), "https://example.com");
         assert_eq!(normalize_url_input("http://foo.bar"), "http://foo.bar");
-        assert_eq!(normalize_url_input("ftp://files.example.com"), "ftp://files.example.com");
+    }
+
+    #[test]
+    fn test_dangerous_schemes_blocked() {
+        assert!(normalize_url_input("ftp://files.example.com").starts_with("neural://error"));
+        assert!(normalize_url_input("data:text/html,<script>alert(1)</script>").starts_with("neural://error"));
     }
 
     #[test]
@@ -1348,6 +1373,14 @@ mod tests {
     fn test_single_word_searches() {
         let result = normalize_url_input("rust");
         assert!(result.starts_with("https://www.google.com/search?q=rust"));
+    }
+
+    #[test]
+    fn test_file_url_blocked() {
+        let result = normalize_url_input("file:///etc/passwd");
+        assert!(result.starts_with("neural://error"), "file:// should be blocked, got: {result}");
+        let result2 = normalize_url_input("file://C:/Windows/System32");
+        assert!(result2.starts_with("neural://error"), "file:// should be blocked, got: {result2}");
     }
 
     // ── urlencoding_simple tests ──

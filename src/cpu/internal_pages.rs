@@ -180,7 +180,7 @@ fn page_settings() -> String {
 <h2>NPU Engine</h2>
 <table>
     <tr><th>Setting</th><th>Value</th></tr>
-    <tr><td>Runtime</td><td>ONNX Runtime + DirectML</td></tr>
+    <tr><td>Runtime</td><td>Heuristic classifier (ML-ready)</td></tr>
     <tr><td>Ad Blocker</td><td>ML heuristic classifier <span class="badge badge-ok">active</span></td></tr>
     <tr><td>Language Detection</td><td>Statistical + Unicode analysis <span class="badge badge-ok">active</span></td></tr>
 </table>
@@ -264,7 +264,7 @@ fn page_about() -> String {
 <p>Neural Browser uses a three-processor pipeline inspired by how the human brain processes visual information:</p>
 <ul>
     <li><strong>CPU</strong> — Networking, HTML parsing, DOM tree construction, browser history</li>
-    <li><strong>NPU</strong> — AI content understanding, ad blocking, language detection (ONNX Runtime + DirectML)</li>
+    <li><strong>NPU</strong> — AI content understanding, ad blocking, language detection (Heuristic classifier (ML-ready))</li>
     <li><strong>GPU</strong> — Layout computation, text rasterization, compositing (wgpu + glyphon)</li>
 </ul>
 </div>
@@ -275,8 +275,8 @@ fn page_about() -> String {
     <tr><th>Layer</th><th>Technology</th></tr>
     <tr><td>Language</td><td>Rust</td></tr>
     <tr><td>Networking</td><td>ureq + rustls</td></tr>
-    <tr><td>HTML Parsing</td><td>html5ever</td></tr>
-    <tr><td>AI Runtime</td><td>ONNX Runtime + DirectML</td></tr>
+    <tr><td>HTML Parsing</td><td>Custom state-machine parser</td></tr>
+    <tr><td>AI Runtime</td><td>Heuristic classifier (ML-ready)</td></tr>
     <tr><td>Rendering</td><td>wgpu</td></tr>
     <tr><td>Text</td><td>glyphon + cosmic-text</td></tr>
     <tr><td>Windowing</td><td>winit</td></tr>
@@ -285,7 +285,7 @@ fn page_about() -> String {
 
 <div class="section">
 <h2>Credits</h2>
-<p>Built with Rust and open-source libraries. Powered by the wgpu graphics API and ONNX Runtime for neural inference.</p>
+<p>Built with Rust and open-source libraries. Powered by the wgpu graphics API and Boa JS engine.</p>
 </div>"#;
 
     wrap_page("About", body)
@@ -327,20 +327,8 @@ fn page_not_found(url: &str) -> String {
 // ── Utility ─────────────────────────────────────────────────────────────
 
 /// Escape HTML special characters to prevent XSS.
-fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#x27;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
+// html_escape: use super::html_escape
+use super::html_escape;
 
 #[cfg(test)]
 mod tests {

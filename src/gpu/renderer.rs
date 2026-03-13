@@ -6,7 +6,6 @@
 //! All rendering is GPU-accelerated.
 
 use super::layout::{LayoutBox, LayoutKind};
-#[allow(unused_imports)] // Will be used when EVA panel rendering is implemented
 use crate::eva::panel::{EvaPanel, Role};
 use crate::ui::Theme;
 use anyhow::Result;
@@ -51,6 +50,18 @@ struct RectVertex {
     color: [f32; 4],
 }
 
+/// Vertex for rounded rectangles (pill-shaped URL bar, buttons with radius).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct RoundedRectVertex {
+    ndc_pos: [f32; 2],      // Clip-space position
+    color: [f32; 4],        // RGBA fill
+    pixel_pos: [f32; 2],    // Pixel-space position (for SDF)
+    rect_center: [f32; 2],  // Center of rect in pixels
+    rect_half: [f32; 2],    // Half-size of rect in pixels
+    radius: f32,            // Corner radius in pixels
+}
+
 /// A cached GPU texture with its bind group and dimensions.
 struct CachedTexture {
     bind_group: wgpu::BindGroup,
@@ -61,10 +72,10 @@ struct CachedTexture {
 }
 
 /// Toolbar height in pixels (navbar with buttons + URL bar).
-pub const TOOLBAR_HEIGHT: f32 = 52.0;
+pub const TOOLBAR_HEIGHT: f32 = 72.0;
 
 /// Status bar height in pixels.
-pub const STATUS_BAR_HEIGHT: f32 = 22.0;
+pub const STATUS_BAR_HEIGHT: f32 = 28.0;
 
 pub struct WgpuRenderer {
     surface: wgpu::Surface<'static>,
@@ -84,6 +95,8 @@ pub struct WgpuRenderer {
     image_sampler: wgpu::Sampler,
     // Rectangle rendering pipeline (navbar, buttons, panels)
     rect_pipeline: wgpu::RenderPipeline,
+    // Rounded rectangle pipeline (pill-shaped URL bar, rounded buttons)
+    rounded_rect_pipeline: wgpu::RenderPipeline,
     // Texture cache: URL -> CachedTexture (avoids re-uploading every frame)
     texture_cache: HashMap<String, CachedTexture>,
 }
@@ -307,6 +320,60 @@ impl WgpuRenderer {
                 cache: None,
             });
 
+        // ── Rounded rect pipeline (SDF-based) ──
+        let rounded_rect_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rounded_rect_shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("rounded_rect_shader.wgsl").into(),
+            ),
+        });
+        let rounded_rect_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("rounded_rect_pipeline_layout"),
+                bind_group_layouts: &[],
+                push_constant_ranges: &[],
+            });
+        let rounded_rect_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("rounded_rect_pipeline"),
+                layout: Some(&rounded_rect_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &rounded_rect_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<RoundedRectVertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },  // ndc_pos
+                            wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },  // color
+                            wgpu::VertexAttribute { offset: 24, shader_location: 2, format: wgpu::VertexFormat::Float32x2 }, // pixel_pos
+                            wgpu::VertexAttribute { offset: 32, shader_location: 3, format: wgpu::VertexFormat::Float32x2 }, // rect_center
+                            wgpu::VertexAttribute { offset: 40, shader_location: 4, format: wgpu::VertexFormat::Float32x2 }, // rect_half
+                            wgpu::VertexAttribute { offset: 48, shader_location: 5, format: wgpu::VertexFormat::Float32 },   // radius
+                        ],
+                    }],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &rounded_rect_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
         let image_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("image_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -331,6 +398,7 @@ impl WgpuRenderer {
             image_bind_group_layout,
             image_sampler,
             rect_pipeline,
+            rounded_rect_pipeline,
             texture_cache: HashMap::new(),
         })
     }
@@ -451,7 +519,15 @@ impl WgpuRenderer {
     }
 
     /// Build quad vertices for an image at the given pixel position and size.
+    #[allow(dead_code)]
     fn build_image_quad(&self, x: f32, y: f32, w: f32, h: f32) -> [ImageVertex; 6] {
+        self.build_image_quad_uv(x, y, w, h, 1.0)
+    }
+
+    /// Build 6 vertices for a textured image quad with UV clipping.
+    /// `u_max` controls how much of the texture width is shown (1.0 = full, 0.5 = left half).
+    /// This enables proper cropping when the EVA panel clips images, instead of squishing.
+    fn build_image_quad_uv(&self, x: f32, y: f32, w: f32, h: f32, u_max: f32) -> [ImageVertex; 6] {
         let tl = self.pixel_to_ndc(x, y);
         let tr = self.pixel_to_ndc(x + w, y);
         let bl = self.pixel_to_ndc(x, y + h);
@@ -461,11 +537,11 @@ impl WgpuRenderer {
             // Triangle 1: TL, BL, TR
             ImageVertex { position: tl, uv: [0.0, 0.0] },
             ImageVertex { position: bl, uv: [0.0, 1.0] },
-            ImageVertex { position: tr, uv: [1.0, 0.0] },
+            ImageVertex { position: tr, uv: [u_max, 0.0] },
             // Triangle 2: TR, BL, BR
-            ImageVertex { position: tr, uv: [1.0, 0.0] },
+            ImageVertex { position: tr, uv: [u_max, 0.0] },
             ImageVertex { position: bl, uv: [0.0, 1.0] },
-            ImageVertex { position: br, uv: [1.0, 1.0] },
+            ImageVertex { position: br, uv: [u_max, 1.0] },
         ]
     }
 
@@ -482,6 +558,25 @@ impl WgpuRenderer {
             RectVertex { position: tr, color },
             RectVertex { position: bl, color },
             RectVertex { position: br, color },
+        ]
+    }
+
+    /// Build 6 vertices for a rounded rectangle at pixel coordinates with SDF corner rounding.
+    fn build_rounded_rect(&self, x: f32, y: f32, w: f32, h: f32, color: [f32; 4], radius: f32) -> [RoundedRectVertex; 6] {
+        let tl_ndc = self.pixel_to_ndc(x, y);
+        let tr_ndc = self.pixel_to_ndc(x + w, y);
+        let bl_ndc = self.pixel_to_ndc(x, y + h);
+        let br_ndc = self.pixel_to_ndc(x + w, y + h);
+        let center = [x + w / 2.0, y + h / 2.0];
+        let half = [w / 2.0, h / 2.0];
+        let r = radius;
+        [
+            RoundedRectVertex { ndc_pos: tl_ndc, color, pixel_pos: [x, y], rect_center: center, rect_half: half, radius: r },
+            RoundedRectVertex { ndc_pos: bl_ndc, color, pixel_pos: [x, y + h], rect_center: center, rect_half: half, radius: r },
+            RoundedRectVertex { ndc_pos: tr_ndc, color, pixel_pos: [x + w, y], rect_center: center, rect_half: half, radius: r },
+            RoundedRectVertex { ndc_pos: tr_ndc, color, pixel_pos: [x + w, y], rect_center: center, rect_half: half, radius: r },
+            RoundedRectVertex { ndc_pos: bl_ndc, color, pixel_pos: [x, y + h], rect_center: center, rect_half: half, radius: r },
+            RoundedRectVertex { ndc_pos: br_ndc, color, pixel_pos: [x + w, y + h], rect_center: center, rect_half: half, radius: r },
         ]
     }
 
@@ -613,54 +708,55 @@ impl WgpuRenderer {
         let mut buffers: Vec<(GlyphonBuffer, f32, f32, TextBounds, GlyphonColor)> = Vec::new();
         let mut rect_vertices: Vec<RectVertex> = Vec::new();
 
-        // ── Chrome-style toolbar ──
+        // ── Airbnb-style toolbar ──
         rect_vertices.extend_from_slice(&self.build_rect(0.0, 0.0, wf, tb, ctx.theme.toolbar_bg));
+        let mut rounded_vertices: Vec<RoundedRectVertex> = Vec::new();
 
-        let btn_w: f32 = 36.0;
-        let btn_h: f32 = 32.0;
-        let btn_y: f32 = (tb - btn_h) / 2.0;
-        let btn_gap: f32 = 4.0;
-        let margin_left: f32 = 8.0;
+        // Layout constants
+        let nav_btn_size: f32 = 36.0;
+        let nav_btn_y: f32 = (tb - nav_btn_size) / 2.0;
+        let margin_left: f32 = 14.0;
         let back_x = margin_left;
-        let fwd_x = back_x + btn_w + btn_gap;
-        let ref_x = fwd_x + btn_w + btn_gap;
+        let fwd_x = back_x + nav_btn_size + 4.0;
+        let ref_x = fwd_x + nav_btn_size + 4.0;
 
-        // Nav button backgrounds
-        rect_vertices.extend_from_slice(&self.build_rect(back_x, btn_y, btn_w, btn_h, ctx.theme.button_bg));
-        rect_vertices.extend_from_slice(&self.build_rect(fwd_x, btn_y, btn_w, btn_h, ctx.theme.button_bg));
-        rect_vertices.extend_from_slice(&self.build_rect(ref_x, btn_y, btn_w, btn_h, ctx.theme.button_bg));
+        // Small circular nav buttons (rounded)
+        let nav_radius = nav_btn_size / 2.0;
+        for bx in [back_x, fwd_x, ref_x] {
+            rounded_vertices.extend(self.build_rounded_rect(bx, nav_btn_y, nav_btn_size, nav_btn_size, ctx.theme.button_bg, nav_radius));
+        }
 
-        // Nav button labels
-        let btn_text_y = btn_y + 6.0;
+        // Nav button labels (compact)
         for (label, bx) in [("\u{25C0}", back_x), ("\u{25B6}", fwd_x), ("\u{21BB}", ref_x)] {
-            let mut btn_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(16.0, 20.0));
-            btn_buf.set_size(&mut self.font_system, Some(btn_w), Some(btn_h));
+            let mut btn_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(20.0, 24.0));
+            btn_buf.set_size(&mut self.font_system, Some(nav_btn_size), Some(nav_btn_size));
             btn_buf.set_text(&mut self.font_system, label,
                 Attrs::new().family(Family::SansSerif).weight(Weight::NORMAL), Shaping::Advanced);
             btn_buf.shape_until_scroll(&mut self.font_system, false);
             let tc = ctx.theme.button_text;
-            buffers.push((btn_buf, bx + 10.0, btn_text_y,
-                TextBounds { left: bx as i32, top: btn_y as i32, right: (bx + btn_w) as i32, bottom: (btn_y + btn_h) as i32 },
-                GlyphonColor::rgb((tc[0]*255.0) as u8, (tc[1]*255.0) as u8, (tc[2]*255.0) as u8)));
+            buffers.push((btn_buf, bx + 10.0, nav_btn_y + 8.0,
+                TextBounds { left: bx as i32, top: nav_btn_y as i32, right: (bx + nav_btn_size) as i32, bottom: (nav_btn_y + nav_btn_size) as i32 },
+                GlyphonColor::rgb((tc[0]*255.0).clamp(0.0, 255.0) as u8, (tc[1]*255.0).clamp(0.0, 255.0) as u8, (tc[2]*255.0).clamp(0.0, 255.0) as u8)));
         }
 
-        // EVA button (right side of toolbar)
-        let eva_btn_w: f32 = 52.0;
+        // EVA button (right side, rounded pill)
+        let eva_btn_w: f32 = 68.0;
+        let eva_btn_h: f32 = 38.0;
+        let eva_btn_y = (tb - eva_btn_h) / 2.0;
         let eva_btn_x = if eva_panel.is_some() {
-            // When panel visible, place button just left of panel edge
-            (panel_x - eva_btn_w - 8.0).max(0.0)
+            (panel_x - eva_btn_w - 10.0).max(0.0)
         } else {
-            wf - eva_btn_w - 8.0
+            wf - eva_btn_w - 14.0
         };
         let eva_bg = if eva_panel.is_some() || ctx.eva_visible {
-            [0.25, 0.65, 0.55, 1.0] // green-teal when active
+            [0.20, 0.60, 0.50, 1.0]
         } else {
             ctx.theme.button_bg
         };
-        rect_vertices.extend_from_slice(&self.build_rect(eva_btn_x, btn_y, eva_btn_w, btn_h, eva_bg));
+        rounded_vertices.extend(self.build_rounded_rect(eva_btn_x, eva_btn_y, eva_btn_w, eva_btn_h, eva_bg, eva_btn_h / 2.0));
 
-        let mut eva_btn_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(13.0, 18.0));
-        eva_btn_buf.set_size(&mut self.font_system, Some(eva_btn_w), Some(btn_h));
+        let mut eva_btn_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(16.0, 20.0));
+        eva_btn_buf.set_size(&mut self.font_system, Some(eva_btn_w - 8.0), Some(eva_btn_h));
         let eva_label = if eva_panel.is_some() || ctx.eva_visible { "EVA \u{2715}" } else { "\u{2726} EVA" };
         eva_btn_buf.set_text(&mut self.font_system, eva_label,
             Attrs::new().family(Family::SansSerif).weight(Weight::BOLD), Shaping::Advanced);
@@ -669,39 +765,60 @@ impl WgpuRenderer {
             GlyphonColor::rgb(255, 255, 255)
         } else {
             let tc = ctx.theme.button_text;
-            GlyphonColor::rgb((tc[0]*255.0) as u8, (tc[1]*255.0) as u8, (tc[2]*255.0) as u8)
+            GlyphonColor::rgb((tc[0]*255.0).clamp(0.0, 255.0) as u8, (tc[1]*255.0).clamp(0.0, 255.0) as u8, (tc[2]*255.0).clamp(0.0, 255.0) as u8)
         };
-        buffers.push((eva_btn_buf, eva_btn_x + 6.0, btn_text_y,
-            TextBounds { left: eva_btn_x as i32, top: btn_y as i32,
-                right: (eva_btn_x + eva_btn_w) as i32, bottom: (btn_y + btn_h) as i32 },
+        buffers.push((eva_btn_buf, eva_btn_x + 10.0, eva_btn_y + 10.0,
+            TextBounds { left: eva_btn_x as i32, top: eva_btn_y as i32,
+                right: (eva_btn_x + eva_btn_w) as i32, bottom: (eva_btn_y + eva_btn_h) as i32 },
             eva_text_color));
 
-        // URL bar background (between nav buttons and EVA button)
-        let url_x = ref_x + btn_w + btn_gap + 8.0;
-        let url_w_raw = eva_btn_x - url_x - 8.0;
-        let url_w = if eva_panel.is_some() { url_w_raw.max(50.0) } else { url_w_raw };
-        let url_bg = if ctx.url_editing {
-            [ctx.theme.url_bar_bg[0]+0.04, ctx.theme.url_bar_bg[1]+0.04, ctx.theme.url_bar_bg[2]+0.04, 1.0]
-        } else { ctx.theme.url_bar_bg };
-        rect_vertices.extend_from_slice(&self.build_rect(url_x, btn_y, url_w, btn_h, url_bg));
+        // ═══ CENTERED PILL URL BAR (Airbnb-style) ═══
+        let nav_zone_end = ref_x + nav_btn_size + 16.0;
+        let eva_zone_start = eva_btn_x - 16.0;
+        let available = eva_zone_start - nav_zone_end;
+        let pill_max_w: f32 = 680.0;
+        let pill_w = available.min(pill_max_w).max(200.0);
+        let pill_h: f32 = 46.0;
+        let pill_x = nav_zone_end + (available - pill_w) / 2.0;
+        let pill_y = (tb - pill_h) / 2.0;
+        let pill_radius = pill_h / 2.0; // Fully rounded ends (pill shape)
 
-        // Toolbar bottom border
-        rect_vertices.extend_from_slice(&self.build_rect(0.0, tb - 1.0, wf, 1.0, ctx.theme.url_bar_border));
+        // Pill background — lighter than toolbar, with subtle border effect
+        let pill_bg = if ctx.url_editing {
+            [0.22, 0.22, 0.28, 1.0] // slightly brighter when editing
+        } else {
+            [0.18, 0.18, 0.24, 1.0] // subtle light background
+        };
+        rounded_vertices.extend(self.build_rounded_rect(pill_x, pill_y, pill_w, pill_h, pill_bg, pill_radius));
 
+        // Pill border ring (1px lighter outline)
+        let border_color = if ctx.url_editing {
+            [0.35, 0.55, 0.80, 0.6] // blue glow when editing
+        } else {
+            [0.30, 0.30, 0.38, 0.5] // subtle border
+        };
+        rounded_vertices.extend(self.build_rounded_rect(pill_x - 1.5, pill_y - 1.5, pill_w + 3.0, pill_h + 3.0, border_color, pill_radius + 1.5));
+
+        // Toolbar subtle bottom shadow
+        rect_vertices.extend_from_slice(&self.build_rect(0.0, tb - 1.0, wf, 1.0, [0.0, 0.0, 0.0, 0.15]));
+
+        // URL text inside the pill
         let (url_display, url_color) = if ctx.url_editing {
             if ctx.url_input.is_empty() {
-                ("\u{1F50D} Search or type a URL".to_string(), GlyphonColor::rgb(120, 120, 140))
+                ("\u{1F50D}  Search or enter URL...".to_string(), GlyphonColor::rgb(130, 130, 155))
             } else {
-                (format!("{}\u{2588}", ctx.url_input), GlyphonColor::rgb(230, 230, 240))
+                (format!("{}\u{2588}", ctx.url_input), GlyphonColor::rgb(235, 235, 245))
             }
         } else if ctx.loading {
-            (format!("\u{23F3} {}", ctx.url), GlyphonColor::rgb(160, 190, 255))
+            (format!("\u{23F3}  {}", ctx.url), GlyphonColor::rgb(160, 190, 255))
         } else {
-            (format!("\u{1F512} {}", ctx.url), GlyphonColor::rgb(180, 195, 225))
+            (format!("\u{1F512}  {}", ctx.url), GlyphonColor::rgb(200, 210, 235))
         };
 
-        let mut url_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(14.0, 18.0));
-        url_buf.set_size(&mut self.font_system, Some(url_w - 16.0), Some(btn_h));
+        let url_text_x = pill_x + 20.0;
+        let url_text_w = pill_w - 40.0;
+        let mut url_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(18.0, 24.0));
+        url_buf.set_size(&mut self.font_system, Some(url_text_w), Some(pill_h));
         url_buf.set_text(
             &mut self.font_system, &url_display,
             Attrs::new().family(Family::SansSerif).weight(Weight::NORMAL),
@@ -709,18 +826,18 @@ impl WgpuRenderer {
         );
         url_buf.shape_until_scroll(&mut self.font_system, false);
         buffers.push((
-            url_buf, url_x + 8.0, btn_y + 7.0,
+            url_buf, url_text_x, pill_y + 12.0,
             TextBounds {
-                left: url_x as i32, top: btn_y as i32,
-                right: (url_x + url_w) as i32, bottom: (btn_y + btn_h) as i32,
+                left: pill_x as i32, top: pill_y as i32,
+                right: (pill_x + pill_w) as i32, bottom: (pill_y + pill_h) as i32,
             },
             url_color,
         ));
 
         // Loading indicator
         if ctx.loading {
-            let mut load_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(14.0, 18.0));
-            load_buf.set_size(&mut self.font_system, Some(content_right - 40.0), Some(30.0));
+            let mut load_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(22.0, 28.0));
+            load_buf.set_size(&mut self.font_system, Some(content_right - 40.0), Some(36.0));
             let dots = match (ctx.loading_ticks / 15) % 4 {
                 0 => "Loading", 1 => "Loading.", 2 => "Loading..", _ => "Loading...",
             };
@@ -731,12 +848,12 @@ impl WgpuRenderer {
             buffers.push((
                 load_buf, (content_right / 2.0) - 40.0, (hf / 2.0) - 10.0,
                 TextBounds { left: 0, top: tb as i32, right: content_right as i32, bottom: h as i32 - sb as i32 },
-                GlyphonColor::rgb((lc[0]*255.0) as u8, (lc[1]*255.0) as u8, (lc[2]*255.0) as u8),
+                GlyphonColor::rgb((lc[0]*255.0).clamp(0.0, 255.0) as u8, (lc[1]*255.0).clamp(0.0, 255.0) as u8, (lc[2]*255.0).clamp(0.0, 255.0) as u8),
             ));
         }
 
         // Status bar text
-        let mut status_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(11.0, 14.0));
+        let mut status_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(14.0, 18.0));
         status_buf.set_size(&mut self.font_system, Some(wf), Some(if eva_panel.is_some() { 20.0 } else { sb }));
         let n_blocks = layout.len();
 
@@ -778,7 +895,7 @@ impl WgpuRenderer {
         ));
 
         // Content background rects (code blocks, quotes, etc.)
-        let mut content_bg_rects: Vec<[f32; 6]> = Vec::new();
+        let mut content_bg_rects: Vec<RectVertex> = Vec::new();
 
         // Content layout boxes -> text buffers
         for lbox in layout {
@@ -790,9 +907,10 @@ impl WgpuRenderer {
                     if bottom < TOOLBAR_HEIGHT || top > hf - STATUS_BAR_HEIGHT {
                         continue;
                     }
-                    content_bg_rects.extend_from_slice(&self.build_rect(
+                    let verts = self.build_rect(
                         lbox.x, lbox.y, lbox.width, lbox.height, *color,
-                    ));
+                    );
+                    content_bg_rects.extend(verts);
                 }
                 LayoutKind::Text {
                     text,
@@ -847,9 +965,10 @@ impl WgpuRenderer {
 
                     // Determine final color (hover/visited override for links)
                     let final_color = self.link_color(&lbox.href, ctx, *color);
-                    let r = (final_color[0] * 255.0) as u8;
-                    let g = (final_color[1] * 255.0) as u8;
-                    let b = (final_color[2] * 255.0) as u8;
+                    let r = (final_color[0] * 255.0).clamp(0.0, 255.0) as u8;
+                    let g = (final_color[1] * 255.0).clamp(0.0, 255.0) as u8;
+                    let b_ch = (final_color[2] * 255.0).clamp(0.0, 255.0) as u8;
+                    let a = (final_color[3] * 255.0).clamp(0.0, 255.0) as u8;
 
                     buffers.push((
                         buf,
@@ -861,7 +980,7 @@ impl WgpuRenderer {
                             right: if eva_panel.is_some() { content_right as i32 } else { (lbox.x + lbox.width) as i32 },
                             bottom: bottom.min(h as i32 - STATUS_BAR_HEIGHT as i32),
                         },
-                        GlyphonColor::rgb(r, g, b),
+                        GlyphonColor::rgba(r, g, b_ch, a),
                     ));
 
                     // Link underline: render a thin line below the text
@@ -902,12 +1021,12 @@ impl WgpuRenderer {
                                     right: (lbox.x + lbox.width) as i32,
                                     bottom: (ul_top + 4).min(h as i32 - STATUS_BAR_HEIGHT as i32),
                                 },
-                                GlyphonColor::rgb(r, g, b),
+                                GlyphonColor::rgba(r, g, b_ch, a),
                             ));
                         }
                     }
                 }
-                LayoutKind::Code { text, .. } => {
+                LayoutKind::Code { text, font_size, .. } => {
                     if text.is_empty() {
                         continue;
                     }
@@ -925,9 +1044,11 @@ impl WgpuRenderer {
                         lbox.width
                     };
 
+                    let code_fs = *font_size;
+                    let code_lh = code_fs * 1.5;
                     let mut buf = GlyphonBuffer::new(
                         &mut self.font_system,
-                        Metrics::new(13.0, 19.0),
+                        Metrics::new(code_fs, code_lh),
                     );
                     buf.set_size(
                         &mut self.font_system,
@@ -976,7 +1097,7 @@ impl WgpuRenderer {
 
                             let mut buf = GlyphonBuffer::new(
                                 &mut self.font_system,
-                                Metrics::new(13.0, 18.0),
+                                Metrics::new(15.0, 20.0),
                             );
                             buf.set_size(&mut self.font_system, Some(lbox.width), Some(30.0));
                             buf.set_text(
@@ -1006,6 +1127,111 @@ impl WgpuRenderer {
                 }
                 LayoutKind::DecodedImage { .. } => {
                     // Handled in image render pass below
+                }
+                LayoutKind::Separator => {
+                    // Thin horizontal line
+                    let top = lbox.y as i32;
+                    if top > TOOLBAR_HEIGHT as i32 && top < h as i32 - STATUS_BAR_HEIGHT as i32 {
+                        let sep_color = [0.35, 0.35, 0.42, 0.6];
+                        content_bg_rects.extend(self.build_rect(
+                            lbox.x, lbox.y, lbox.width, 1.0, sep_color,
+                        ));
+                    }
+                }
+                LayoutKind::InputBox { placeholder, font_size } => {
+                    let top = lbox.y as i32;
+                    let bottom = (lbox.y + lbox.height) as i32;
+                    if bottom < TOOLBAR_HEIGHT as i32 || top > h as i32 - STATUS_BAR_HEIGHT as i32 {
+                        continue;
+                    }
+                    // Input border (rounded rectangle outline)
+                    let border_color = [0.35, 0.38, 0.48, 0.8];
+                    let radius = lbox.height / 2.0;
+                    rounded_vertices.extend(self.build_rounded_rect(
+                        lbox.x - 1.5, lbox.y - 1.5,
+                        lbox.width + 3.0, lbox.height + 3.0,
+                        border_color, radius + 1.5,
+                    ));
+                    // Input background
+                    let input_bg = [0.14, 0.14, 0.18, 1.0];
+                    rounded_vertices.extend(self.build_rounded_rect(
+                        lbox.x, lbox.y,
+                        lbox.width, lbox.height,
+                        input_bg, radius,
+                    ));
+                    // Search icon + placeholder text
+                    let display = format!("\u{1F50D}  {}", placeholder);
+                    let mut buf = GlyphonBuffer::new(
+                        &mut self.font_system,
+                        Metrics::new(*font_size, font_size * 1.4),
+                    );
+                    buf.set_size(&mut self.font_system, Some(lbox.width - 32.0), Some(lbox.height));
+                    buf.set_text(
+                        &mut self.font_system,
+                        &display,
+                        Attrs::new().family(Family::SansSerif).weight(Weight::NORMAL),
+                        Shaping::Advanced,
+                    );
+                    buf.shape_until_scroll(&mut self.font_system, false);
+                    buffers.push((
+                        buf,
+                        lbox.x + 16.0,
+                        lbox.y + (lbox.height - font_size * 1.4) / 2.0,
+                        TextBounds {
+                            left: lbox.x as i32,
+                            top: top.max(TOOLBAR_HEIGHT as i32),
+                            right: (lbox.x + lbox.width) as i32,
+                            bottom: bottom.min(h as i32 - STATUS_BAR_HEIGHT as i32),
+                        },
+                        GlyphonColor::rgb(140, 145, 165),
+                    ));
+                }
+                LayoutKind::Button { text, font_size, bg_color, text_color } => {
+                    let top = lbox.y as i32;
+                    let bottom = (lbox.y + lbox.height) as i32;
+                    if bottom < TOOLBAR_HEIGHT as i32 || top > h as i32 - STATUS_BAR_HEIGHT as i32 {
+                        continue;
+                    }
+                    // Button background (rounded rectangle)
+                    let radius = lbox.height / 2.0;
+                    rounded_vertices.extend(self.build_rounded_rect(
+                        lbox.x, lbox.y,
+                        lbox.width, lbox.height,
+                        *bg_color, radius.min(12.0),
+                    ));
+                    // Button border
+                    let border = [bg_color[0] + 0.1, bg_color[1] + 0.1, bg_color[2] + 0.1, 0.5];
+                    rounded_vertices.extend(self.build_rounded_rect(
+                        lbox.x - 1.0, lbox.y - 1.0,
+                        lbox.width + 2.0, lbox.height + 2.0,
+                        border, radius.min(12.0) + 1.0,
+                    ));
+                    // Button text centered
+                    let mut buf = GlyphonBuffer::new(
+                        &mut self.font_system,
+                        Metrics::new(*font_size, font_size * 1.4),
+                    );
+                    buf.set_size(&mut self.font_system, Some(lbox.width), Some(lbox.height));
+                    buf.set_text(
+                        &mut self.font_system,
+                        text,
+                        Attrs::new().family(Family::SansSerif).weight(Weight::BOLD),
+                        Shaping::Advanced,
+                    );
+                    buf.shape_until_scroll(&mut self.font_system, false);
+                    let tc = text_color;
+                    buffers.push((
+                        buf,
+                        lbox.x + 12.0,
+                        lbox.y + (lbox.height - font_size * 1.4) / 2.0,
+                        TextBounds {
+                            left: lbox.x as i32,
+                            top: top.max(TOOLBAR_HEIGHT as i32),
+                            right: (lbox.x + lbox.width) as i32,
+                            bottom: bottom.min(h as i32 - STATUS_BAR_HEIGHT as i32),
+                        },
+                        GlyphonColor::rgb((tc[0]*255.0).clamp(0.0, 255.0) as u8, (tc[1]*255.0).clamp(0.0, 255.0) as u8, (tc[2]*255.0).clamp(0.0, 255.0) as u8),
+                    ));
                 }
                 _ => {}
             }
@@ -1085,13 +1311,13 @@ impl WgpuRenderer {
                 let panel_rect_verts = self.build_rect(panel_x, 0.0, panel_width, hf, panel_bg);
                 let mut all = rect_vertices.clone();
                 // Content backgrounds (code blocks, quotes) rendered behind text
-                all.extend_from_slice(&content_bg_rects);
+                all.extend(content_bg_rects.iter().copied());
                 all.extend_from_slice(&panel_rect_verts);
                 all.extend_from_slice(&self.build_rect(0.0, hf - sb, wf, sb, ctx.theme.toolbar_bg));
                 all
             } else {
                 // Content backgrounds (code blocks, quotes) rendered behind text
-                rect_vertices.extend_from_slice(&content_bg_rects);
+                rect_vertices.extend(content_bg_rects);
                 // Status bar background (non-EVA mode)
                 rect_vertices.extend_from_slice(&self.build_rect(0.0, hf - sb, wf, sb, ctx.theme.toolbar_bg));
                 rect_vertices
@@ -1106,6 +1332,18 @@ impl WgpuRenderer {
                 pass.set_pipeline(&self.rect_pipeline);
                 pass.set_vertex_buffer(0, rect_buffer.slice(..));
                 pass.draw(0..final_rects.len() as u32, 0..1);
+            }
+
+            // Rounded rects (pill URL bar, circular buttons) — drawn on top of flat rects
+            if !rounded_vertices.is_empty() {
+                let rounded_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("rounded_rect_vertex_buffer"),
+                    contents: bytemuck::cast_slice(&rounded_vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                pass.set_pipeline(&self.rounded_rect_pipeline);
+                pass.set_vertex_buffer(0, rounded_buffer.slice(..));
+                pass.draw(0..rounded_vertices.len() as u32, 0..1);
             }
         }
 
@@ -1133,12 +1371,11 @@ impl WgpuRenderer {
         }
 
         // ── Pass 3: Render images as textured quads ──
-        let mut decoded_renders: Vec<(wgpu::Buffer, wgpu::BindGroup, wgpu::Texture)> = Vec::new();
         let mut cached_renders: Vec<(wgpu::Buffer, String)> = Vec::new();
 
         for lbox in layout {
             match &lbox.kind {
-                LayoutKind::DecodedImage { width: img_w, height: img_h, rgba, .. } => {
+                LayoutKind::DecodedImage { width: img_w, height: img_h, rgba, alt } => {
                     let top = lbox.y;
                     let bottom = lbox.y + lbox.height;
                     if bottom < 40.0 || top > h as f32 {
@@ -1153,14 +1390,32 @@ impl WgpuRenderer {
                         lbox.width
                     };
 
-                    let (texture, bind_group) = self.create_image_texture(*img_w, *img_h, rgba);
-                    let vertices = self.build_image_quad(lbox.x, lbox.y, render_w, lbox.height);
+                    // Cache decoded images to avoid re-creating GPU textures every frame.
+                    // Key: "decoded:{width}x{height}:{data_len}:{first_bytes_hash}"
+                    let hash_sample: u64 = rgba.iter().take(64).enumerate()
+                        .fold(0u64, |acc, (i, &b)| acc.wrapping_add((b as u64) << (i % 8 * 8)));
+                    let cache_key = format!("decoded:{}x{}:{}:{:x}", img_w, img_h, rgba.len(), hash_sample);
+
+                    if !self.texture_cache.contains_key(&cache_key) {
+                        let (texture, bind_group) = self.create_image_texture(*img_w, *img_h, rgba);
+                        self.texture_cache.insert(cache_key.clone(), CachedTexture {
+                            bind_group,
+                            width: *img_w,
+                            height: *img_h,
+                            texture,
+                        });
+                    }
+
+                    // Render from cache with UV-correct clipping
+                    let u_max = if render_w < lbox.width { render_w / lbox.width } else { 1.0 };
+                    let vertices = self.build_image_quad_uv(lbox.x, lbox.y, render_w, lbox.height, u_max);
                     let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("image_vertex_buffer"),
+                        label: Some("decoded_image_vertex_buffer"),
                         contents: bytemuck::cast_slice(&vertices),
                         usage: wgpu::BufferUsages::VERTEX,
                     });
-                    decoded_renders.push((vertex_buffer, bind_group, texture));
+                    cached_renders.push((vertex_buffer, cache_key));
+                    let _ = alt; // suppress unused warning
                 }
                 LayoutKind::Image { src, .. } => {
                     // Render from texture cache if available
@@ -1179,7 +1434,9 @@ impl WgpuRenderer {
                             lbox.width
                         };
 
-                        let vertices = self.build_image_quad(lbox.x, lbox.y, render_w, lbox.height);
+                        // UV-correct clipping: crop instead of squish
+                        let u_max = if render_w < lbox.width { render_w / lbox.width } else { 1.0 };
+                        let vertices = self.build_image_quad_uv(lbox.x, lbox.y, render_w, lbox.height, u_max);
                         let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                             label: Some("cached_image_vertex_buffer"),
                             contents: bytemuck::cast_slice(&vertices),
@@ -1192,7 +1449,7 @@ impl WgpuRenderer {
             }
         }
 
-        let has_images = !decoded_renders.is_empty() || !cached_renders.is_empty();
+        let has_images = !cached_renders.is_empty();
         if has_images {
             let img_label = if eva_panel.is_some() { "image_pass_eva" } else { "image_pass" };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1212,14 +1469,7 @@ impl WgpuRenderer {
 
             pass.set_pipeline(&self.image_pipeline);
 
-            // Render decoded images (per-frame textures)
-            for (vertex_buffer, bind_group, _texture) in &decoded_renders {
-                pass.set_bind_group(0, bind_group, &[]);
-                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                pass.draw(0..6, 0..1);
-            }
-
-            // Render cached texture images
+            // Render all images from texture cache
             for (vertex_buffer, src) in &cached_renders {
                 if let Some(cached) = self.texture_cache.get(src) {
                     pass.set_bind_group(0, &cached.bind_group, &[]);
@@ -1251,7 +1501,7 @@ impl WgpuRenderer {
         // ── AI panel header — shows current provider ──
         let provider_name = eva_panel.provider.name();
         let header_text = format!("  {}  [Tab: switch] [Esc: close]", provider_name);
-        let mut header_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(16.0, 22.0));
+        let mut header_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(18.0, 24.0));
         header_buf.set_size(&mut self.font_system, Some(panel_width - 20.0), Some(30.0));
         header_buf.set_text(&mut self.font_system, &header_text,
             Attrs::new().family(Family::SansSerif).weight(Weight::BOLD), Shaping::Advanced);
@@ -1278,7 +1528,7 @@ impl WgpuRenderer {
         // ── EVA messages ──
         let msg_top = 48.0;
         let msg_bottom = h as f32 - 60.0;
-        let mut cursor_y = msg_top;
+        let mut cursor_y = msg_top - eva_panel.scroll_offset;
 
         for msg in &eva_panel.messages {
             if cursor_y > msg_bottom { break; }
@@ -1298,10 +1548,10 @@ impl WgpuRenderer {
                 format!("{prefix}: {}", msg.text)
             };
             let msg_width = panel_width - 30.0;
-            let font_size = 13.0;
+            let font_size = 15.0;
             let line_h = font_size * 1.5;
             let chars_per_line = (msg_width / (font_size * 0.55)).max(1.0);
-            let lines = (display.len() as f32 / chars_per_line).ceil().max(1.0);
+            let lines = (display.chars().count() as f32 / chars_per_line).ceil().max(1.0);
             let block_height = lines * line_h;
 
             let mut buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(font_size, line_h));
@@ -1328,7 +1578,7 @@ impl WgpuRenderer {
 
         // EVA loading indicator
         if eva_panel.is_loading {
-            let mut load_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(12.0, 16.0));
+            let mut load_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(14.0, 18.0));
             load_buf.set_size(&mut self.font_system, Some(panel_width - 20.0), Some(20.0));
             load_buf.set_text(&mut self.font_system, "EVA is thinking...",
                 Attrs::new().family(Family::SansSerif).weight(Weight::NORMAL), Shaping::Advanced);
@@ -1355,7 +1605,7 @@ impl WgpuRenderer {
             ));
 
             let input_display = format!("> {}\u{2588}", eva_panel.get_input());
-            let mut input_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(13.0, 18.0));
+            let mut input_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(15.0, 20.0));
             input_buf.set_size(&mut self.font_system, Some(panel_width - 20.0), Some(30.0));
             input_buf.set_text(&mut self.font_system, &input_display,
                 Attrs::new().family(Family::Monospace).weight(Weight::NORMAL), Shaping::Advanced);

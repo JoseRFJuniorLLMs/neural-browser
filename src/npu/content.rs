@@ -52,6 +52,12 @@ pub enum BlockKind {
     Summary,
     /// Form element (rendered as text description)
     Form,
+    /// Visual input field (text box rendered as a rounded rectangle)
+    InputField { placeholder: String, input_type: String },
+    /// Group of buttons rendered side by side horizontally
+    ButtonGroup,
+    /// Horizontal group of inline elements (nav links, etc.)
+    InlineGroup,
     /// Link
     Link { href: String },
     /// Separator / horizontal rule
@@ -229,6 +235,14 @@ impl ContentExtractor {
             "form" => {
                 let form_block = self.extract_form(node, dom);
                 if let Some(b) = form_block {
+                    blocks.push(b);
+                }
+            }
+
+            // ── Navigation: extract links as horizontal InlineGroup ──
+            "nav" => {
+                let nav_block = self.extract_nav(node, dom);
+                if let Some(b) = nav_block {
                     blocks.push(b);
                 }
             }
@@ -511,67 +525,207 @@ impl ContentExtractor {
         })
     }
 
-    /// Extract form as a text description.
+    /// Extract form as structured visual elements (input fields + buttons).
     fn extract_form(&self, form_node: &DomNode, dom: &DomTree) -> Option<ContentBlock> {
-        let mut parts: Vec<String> = Vec::new();
-        let action = form_node.attrs.get("action").cloned().unwrap_or_default();
+        let mut input_fields: Vec<ContentBlock> = Vec::new();
+        let mut button_blocks: Vec<ContentBlock> = Vec::new();
+        let mut label_blocks: Vec<ContentBlock> = Vec::new();
 
-        self.collect_form_fields(form_node, dom, &mut parts);
+        self.collect_form_visual(form_node, dom, &mut input_fields, &mut button_blocks, &mut label_blocks);
 
-        if parts.is_empty() {
+        if input_fields.is_empty() && button_blocks.is_empty() && label_blocks.is_empty() {
             return None;
         }
 
-        let text = if action.is_empty() {
-            format!("[Form] {}", parts.join(", "))
-        } else {
-            format!("[Form -> {}] {}", action, parts.join(", "))
-        };
+        let mut children = Vec::new();
+
+        // Labels as paragraphs
+        for lb in label_blocks {
+            children.push(lb);
+        }
+
+        // Input fields as visual InputField blocks
+        for inp in input_fields {
+            children.push(inp);
+        }
+
+        // Buttons grouped horizontally in a ButtonGroup
+        if !button_blocks.is_empty() {
+            children.push(ContentBlock {
+                kind: BlockKind::ButtonGroup,
+                text: String::new(),
+                depth: form_node.depth,
+                relevance: 0.7,
+                children: button_blocks,
+                image_data: None, node_id: None, computed_style: None,
+            });
+        }
 
         Some(ContentBlock {
             kind: BlockKind::Form,
-            text,
+            text: String::new(),
             depth: form_node.depth,
-            relevance: 0.4,
-            children: Vec::new(),
+            relevance: 0.6,
+            children,
             image_data: None, node_id: Some(form_node.id), computed_style: None,
         })
     }
 
-    /// Recursively collect form field descriptions.
-    fn collect_form_fields(&self, node: &DomNode, dom: &DomTree, parts: &mut Vec<String>) {
+    /// Recursively collect form fields as structured visual blocks.
+    fn collect_form_visual(
+        &self,
+        node: &DomNode,
+        dom: &DomTree,
+        inputs: &mut Vec<ContentBlock>,
+        buttons: &mut Vec<ContentBlock>,
+        labels: &mut Vec<ContentBlock>,
+    ) {
         match node.tag.as_str() {
             "input" => {
                 let input_type = node.attrs.get("type").map(|s| s.as_str()).unwrap_or("text");
-                let name = node.attrs.get("name").or(node.attrs.get("placeholder"));
-                let label = name.map(|s| s.as_str()).unwrap_or("field");
+                let placeholder = node.attrs.get("placeholder")
+                    .or(node.attrs.get("name"))
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
                 match input_type {
                     "submit" => {
-                        let value = node.attrs.get("value").map(|s| s.as_str()).unwrap_or("Submit");
-                        parts.push(format!("[Button: {}]", value));
+                        let value = node.attrs.get("value")
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "Submit".to_string());
+                        buttons.push(ContentBlock {
+                            kind: BlockKind::Paragraph,
+                            text: value,
+                            depth: node.depth,
+                            relevance: 0.7,
+                            children: Vec::new(),
+                            image_data: None, node_id: Some(node.id), computed_style: None,
+                        });
                     }
-                    "hidden" => {} // skip hidden fields
+                    "hidden" => {} // skip
+                    "checkbox" => {
+                        inputs.push(ContentBlock {
+                            kind: BlockKind::InputField {
+                                placeholder: format!("\u{2610} {}", placeholder),
+                                input_type: "checkbox".to_string(),
+                            },
+                            text: placeholder,
+                            depth: node.depth,
+                            relevance: 0.6,
+                            children: Vec::new(),
+                            image_data: None, node_id: Some(node.id), computed_style: None,
+                        });
+                    }
+                    "radio" => {
+                        inputs.push(ContentBlock {
+                            kind: BlockKind::InputField {
+                                placeholder: format!("\u{25CB} {}", placeholder),
+                                input_type: "radio".to_string(),
+                            },
+                            text: placeholder,
+                            depth: node.depth,
+                            relevance: 0.6,
+                            children: Vec::new(),
+                            image_data: None, node_id: Some(node.id), computed_style: None,
+                        });
+                    }
+                    "search" | "text" | "email" | "url" | "tel" | "number" | "password" => {
+                        let ph = if input_type == "password" {
+                            "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}".to_string()
+                        } else if placeholder.is_empty() {
+                            format!("Enter {}...", input_type)
+                        } else {
+                            placeholder.clone()
+                        };
+                        inputs.push(ContentBlock {
+                            kind: BlockKind::InputField {
+                                placeholder: ph,
+                                input_type: input_type.to_string(),
+                            },
+                            text: placeholder,
+                            depth: node.depth,
+                            relevance: 0.7,
+                            children: Vec::new(),
+                            image_data: None, node_id: Some(node.id), computed_style: None,
+                        });
+                    }
                     _ => {
-                        parts.push(format!("[{}: {}]", input_type, label));
+                        inputs.push(ContentBlock {
+                            kind: BlockKind::InputField {
+                                placeholder: if placeholder.is_empty() { "...".to_string() } else { placeholder.clone() },
+                                input_type: input_type.to_string(),
+                            },
+                            text: placeholder,
+                            depth: node.depth,
+                            relevance: 0.5,
+                            children: Vec::new(),
+                            image_data: None, node_id: Some(node.id), computed_style: None,
+                        });
                     }
                 }
             }
             "textarea" => {
-                let name = node.attrs.get("name").map(|s| s.as_str()).unwrap_or("text area");
-                parts.push(format!("[textarea: {}]", name));
+                let placeholder = node.attrs.get("placeholder")
+                    .or(node.attrs.get("name"))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "Enter text...".to_string());
+                inputs.push(ContentBlock {
+                    kind: BlockKind::InputField {
+                        placeholder: placeholder.clone(),
+                        input_type: "textarea".to_string(),
+                    },
+                    text: placeholder,
+                    depth: node.depth,
+                    relevance: 0.6,
+                    children: Vec::new(),
+                    image_data: None, node_id: Some(node.id), computed_style: None,
+                });
             }
             "select" => {
-                let name = node.attrs.get("name").map(|s| s.as_str()).unwrap_or("select");
-                parts.push(format!("[select: {}]", name));
+                let name = node.attrs.get("name")
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "Select...".to_string());
+                inputs.push(ContentBlock {
+                    kind: BlockKind::InputField {
+                        placeholder: format!("\u{25BE} {}", name),
+                        input_type: "select".to_string(),
+                    },
+                    text: name,
+                    depth: node.depth,
+                    relevance: 0.5,
+                    children: Vec::new(),
+                    image_data: None, node_id: Some(node.id), computed_style: None,
+                });
             }
             "button" => {
-                let text = if node.text.is_empty() { "Button" } else { &node.text };
-                parts.push(format!("[Button: {}]", text));
+                let text = if node.text.is_empty() {
+                    self.collect_text_recursive(node, dom)
+                } else {
+                    node.text.trim().to_string()
+                };
+                if !text.is_empty() {
+                    buttons.push(ContentBlock {
+                        kind: BlockKind::Paragraph,
+                        text,
+                        depth: node.depth,
+                        relevance: 0.7,
+                        children: Vec::new(),
+                        image_data: None, node_id: Some(node.id), computed_style: None,
+                    });
+                }
             }
             "label" => {
-                if !node.text.is_empty() {
-                    parts.push(node.text.clone());
+                let text = self.collect_text_recursive(node, dom);
+                if !text.is_empty() {
+                    labels.push(ContentBlock {
+                        kind: BlockKind::Paragraph,
+                        text,
+                        depth: node.depth,
+                        relevance: 0.5,
+                        children: Vec::new(),
+                        image_data: None, node_id: Some(node.id), computed_style: None,
+                    });
                 }
+                return; // don't recurse into label children (already collected text)
             }
             _ => {}
         }
@@ -579,9 +733,49 @@ impl ContentExtractor {
         // Recurse into children
         for &child_id in &node.children {
             if let Some(child) = dom.nodes.get(child_id) {
-                self.collect_form_fields(child, dom, parts);
+                self.collect_form_visual(child, dom, inputs, buttons, labels);
             }
         }
+    }
+
+    /// Extract navigation element as horizontal InlineGroup of links.
+    fn extract_nav(&self, nav_node: &DomNode, dom: &DomTree) -> Option<ContentBlock> {
+        let mut link_children = Vec::new();
+
+        // Collect all <a> descendants
+        let a_ids = self.collect_descendant_tags(nav_node, dom, "a");
+        for a_id in &a_ids {
+            if let Some(a_node) = dom.nodes.get(*a_id) {
+                if Self::is_hidden(a_node) {
+                    continue;
+                }
+                let href = a_node.attrs.get("href").cloned().unwrap_or_default();
+                let text = self.collect_text_recursive(a_node, dom);
+                if !text.is_empty() && text.len() < 60 {
+                    link_children.push(ContentBlock {
+                        kind: BlockKind::Link { href },
+                        text,
+                        depth: a_node.depth,
+                        relevance: 0.5,
+                        children: Vec::new(),
+                        image_data: None, node_id: Some(*a_id), computed_style: None,
+                    });
+                }
+            }
+        }
+
+        if link_children.is_empty() {
+            return None;
+        }
+
+        Some(ContentBlock {
+            kind: BlockKind::InlineGroup,
+            text: String::new(),
+            depth: nav_node.depth,
+            relevance: 0.4,
+            children: link_children,
+            image_data: None, node_id: Some(nav_node.id), computed_style: None,
+        })
     }
 
     /// Collect all descendant node IDs with a given tag.
@@ -655,25 +849,68 @@ impl ContentExtractor {
             }
         }
 
-        // Fallback: all nodes that look like content
+        // Fallback: all nodes that look like content.
+        // Skip children of container tags (ul, ol, table, dl, figure, details, form)
+        // to avoid duplicates — extract_node_recursive handles their children.
+        let container_tags = ["ul", "ol", "table", "dl", "figure", "details", "form", "nav"];
         dom.nodes
             .iter()
-            .filter(|n| self.is_content_tag(&n.tag))
+            .filter(|n| {
+                if !self.is_content_tag(&n.tag) {
+                    return false;
+                }
+                // Skip nodes whose parent is a container (they'll be processed recursively)
+                let dominated = ["li", "tr", "td", "th", "dt", "dd", "figcaption",
+                    "summary", "input", "textarea", "select", "button", "label",
+                    "thead", "tbody", "tfoot", "caption", "colgroup"];
+                if dominated.contains(&n.tag.as_str()) {
+                    // Check if any ancestor is a container
+                    let mut pid = n.parent;
+                    while let Some(p) = pid {
+                        if let Some(parent) = dom.nodes.get(p) {
+                            if container_tags.contains(&parent.tag.as_str()) {
+                                return false; // skip — parent container handles this
+                            }
+                            pid = parent.parent;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                true
+            })
             .collect()
     }
 
-    /// Collect all descendant nodes of a given node.
+    /// Collect direct content nodes from a container (main/article/div[role=main]).
+    ///
+    /// IMPORTANT: When we find a "container tag" (ul, ol, table, dl, figure, details, form)
+    /// we add it to the result but DO NOT descend into its children — because
+    /// `extract_node_recursive` already handles their children recursively.
+    /// This prevents duplicate blocks (e.g., <li> appearing both as standalone
+    /// ListItem AND as child of a List).
     fn collect_children<'a>(&self, dom: &'a DomTree, parent_id: usize) -> Vec<&'a DomNode> {
         let mut result = Vec::new();
         let mut stack = vec![parent_id];
 
+        // Tags that extract_node_recursive handles with their own child traversal.
+        // We must NOT descend into these — just collect the container itself.
+        let container_tags = ["ul", "ol", "table", "dl", "figure", "details", "form", "nav"];
+
         while let Some(id) = stack.pop() {
             if let Some(node) = dom.nodes.get(id) {
+                let is_container = container_tags.contains(&node.tag.as_str());
+
                 if self.is_content_tag(&node.tag) || !node.text.is_empty() {
                     result.push(node);
                 }
-                for &child_id in node.children.iter().rev() {
-                    stack.push(child_id);
+
+                // Only descend into children if this is NOT a container tag
+                // (containers are fully handled by extract_node_recursive)
+                if !is_container {
+                    for &child_id in node.children.iter().rev() {
+                        stack.push(child_id);
+                    }
                 }
             }
         }
@@ -690,6 +927,7 @@ impl ContentExtractor {
                 | "table" | "dl" | "dt" | "dd"
                 | "details" | "summary"
                 | "form" | "input" | "textarea" | "select" | "button"
+                | "nav"
                 | "hr" | "a"
         )
     }
@@ -723,8 +961,18 @@ impl ContentExtractor {
             "p" => BlockKind::Paragraph,
             "pre" | "code" => BlockKind::Code {
                 language: node.attrs.get("class")
-                    .and_then(|c| c.strip_prefix("language-"))
-                    .map(|s| s.to_string()),
+                    .and_then(|cls| {
+                        // Support: "language-rust", "lang-js", "highlight language-python other"
+                        for part in cls.split_whitespace() {
+                            if let Some(lang) = part.strip_prefix("language-") {
+                                return Some(lang.to_string());
+                            }
+                            if let Some(lang) = part.strip_prefix("lang-") {
+                                return Some(lang.to_string());
+                            }
+                        }
+                        None
+                    }),
             },
             "blockquote" => BlockKind::Quote,
             // ul/ol/li are handled by extract_node_recursive, but keep fallback
@@ -853,6 +1101,9 @@ impl ContentExtractor {
                 }
                 BlockKind::Link { .. } => score = 0.4,
                 BlockKind::Separator => score = 0.3,
+                BlockKind::InputField { .. } => score = 0.7,
+                BlockKind::ButtonGroup => score = 0.7,
+                BlockKind::InlineGroup => score = 0.4,
             }
 
             // Penalize repeated short text (likely nav items)

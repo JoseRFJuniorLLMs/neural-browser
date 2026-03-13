@@ -23,6 +23,9 @@ arboard = "3"
 # ── CPU: JavaScript Engine ──
 boa_engine = "0.20"
 
+# ── Encoding ──
+encoding_rs = "0.8"
+
 # ── Shared ──
 pollster = "0.4"
 crossbeam-channel = "0.5"

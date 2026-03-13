@@ -50,6 +50,10 @@ pub enum LayoutKind {
     Code { text: String, language: Option<String>, font_size: f32 },
     /// Background rect (for code blocks, quotes, etc.)
     Background { color: [f32; 4] },
+    /// Visual input box (rounded rectangle with placeholder text)
+    InputBox { placeholder: String, font_size: f32 },
+    /// Visual button (rounded filled rectangle with text)
+    Button { text: String, font_size: f32, bg_color: [f32; 4], text_color: [f32; 4] },
 }
 
 /// Estimate the number of wrapped lines for a text given a width and font size.
@@ -201,11 +205,11 @@ pub fn compute_layout_zoom(
             }
             BlockKind::Heading { level } => {
                 let default_size = match level {
-                    1 => 32.0,
-                    2 => 26.0,
-                    3 => 22.0,
-                    4 => 18.0,
-                    _ => 16.0,
+                    1 => 38.0,
+                    2 => 32.0,
+                    3 => 26.0,
+                    4 => 22.0,
+                    _ => 20.0,
                 };
                 let font_size = css_font_size(block, default_size, z);
                 let color = css_color(block, theme.heading);
@@ -255,7 +259,7 @@ pub fn compute_layout_zoom(
                 if block.text.is_empty() {
                     continue;
                 }
-                let font_size = css_font_size(block, 16.0, z);
+                let font_size = css_font_size(block, 20.0, z);
                 let line_height = css_line_height(block, font_size, 1.6);
                 let color = css_color(block, theme.text);
                 let bold = css_bold(block, false);
@@ -293,7 +297,7 @@ pub fn compute_layout_zoom(
                 cursor_y += lines * line_height + css_margin_bottom(block, 14.0, z);
             }
             BlockKind::Code { language } => {
-                let font_size = css_font_size(block, 14.0, z);
+                let font_size = css_font_size(block, 16.0, z);
                 let line_height = css_line_height(block, font_size, 1.5);
                 let lines = block.text.lines().count().max(1) as f32;
                 let block_height = lines * line_height + 24.0;
@@ -325,7 +329,7 @@ pub fn compute_layout_zoom(
                 cursor_y += block_height + 18.0;
             }
             BlockKind::Quote => {
-                let font_size = css_font_size(block, 15.0, z);
+                let font_size = css_font_size(block, 19.0, z);
                 let line_height = css_line_height(block, font_size, 1.6);
                 let lines = estimate_lines(&block.text, content_width - 40.0, font_size);
                 let block_height = lines * line_height + 16.0;
@@ -389,7 +393,7 @@ pub fn compute_layout_zoom(
                             height: 20.0,
                             kind: LayoutKind::Text {
                                 text: alt.clone(),
-                                font_size: 12.0,
+                                font_size: 15.0,
                                 color: theme.text_dim,
                                 bold: false,
                                 italic: true,
@@ -426,7 +430,7 @@ pub fn compute_layout_zoom(
                             height: 20.0,
                             kind: LayoutKind::Text {
                                 text: alt.clone(),
-                                font_size: 12.0,
+                                font_size: 15.0,
                                 color: theme.text_dim,
                                 bold: false,
                                 italic: true,
@@ -460,7 +464,7 @@ pub fn compute_layout_zoom(
                     if child.relevance < 0.15 || is_css_hidden(child) {
                         continue;
                     }
-                    let font_size = css_font_size(child, 15.0, z);
+                    let font_size = css_font_size(child, 19.0, z);
                     let color = css_color(child, theme.text);
                     let bold = css_bold(child, false);
                     let italic = css_italic(child, false);
@@ -521,7 +525,7 @@ pub fn compute_layout_zoom(
             }
             BlockKind::ListItem => {
                 // Standalone list items (outside a List container)
-                let font_size = 15.0 * z;
+                let font_size = 19.0 * z;
                 let prefix = format!("\u{2022}  {}", block.text);
                 let lines = estimate_lines(&prefix, content_width - 24.0, font_size);
 
@@ -545,7 +549,7 @@ pub fn compute_layout_zoom(
                 if block.text.is_empty() {
                     continue;
                 }
-                let font_size = css_font_size(block, 15.0, z);
+                let font_size = css_font_size(block, 19.0, z);
                 let color = css_color(block, theme.link);
                 let bold = css_bold(block, false);
                 let italic = css_italic(block, false);
@@ -583,7 +587,7 @@ pub fn compute_layout_zoom(
             BlockKind::Table => {
                 // Render table rows as pipe-separated text (children are TableRow)
                 if !block.children.is_empty() {
-                    let font_size = 14.0 * z;
+                    let font_size = 16.0 * z;
                     let line_h = font_size * 1.5;
                     for child in &block.children {
                         if let BlockKind::TableRow = &child.kind {
@@ -596,6 +600,7 @@ pub fn compute_layout_zoom(
                                 kind: LayoutKind::Code {
                                     text: child.text.clone(),
                                     language: None,
+                                    font_size,
                                 },
                                 href: None,
                             });
@@ -605,7 +610,7 @@ pub fn compute_layout_zoom(
                     cursor_y += 8.0;
                 } else if !block.text.is_empty() {
                     // Fallback: render table text as code block
-                    let font_size = 14.0 * z;
+                    let font_size = 16.0 * z;
                     let lines = block.text.lines().count().max(1) as f32;
                     let block_height = lines * font_size * 1.5 + 16.0;
                     layout.push(LayoutBox {
@@ -616,6 +621,7 @@ pub fn compute_layout_zoom(
                         kind: LayoutKind::Code {
                             text: block.text.clone(),
                             language: None,
+                            font_size,
                         },
                         href: None,
                     });
@@ -625,7 +631,7 @@ pub fn compute_layout_zoom(
             BlockKind::TableRow => {
                 // Standalone table row (outside Table)
                 if !block.text.is_empty() {
-                    let font_size = 14.0 * z;
+                    let font_size = 16.0 * z;
                     let lines = estimate_lines(&block.text, content_width, font_size);
                     layout.push(LayoutBox {
                         x: margin_x,
@@ -635,6 +641,7 @@ pub fn compute_layout_zoom(
                         kind: LayoutKind::Code {
                             text: block.text.clone(),
                             language: None,
+                            font_size,
                         },
                         href: None,
                     });
@@ -646,7 +653,7 @@ pub fn compute_layout_zoom(
                 for child in &block.children {
                     match &child.kind {
                         BlockKind::DefinitionTerm => {
-                            let font_size = 15.0 * z;
+                            let font_size = 19.0 * z;
                             let lines = estimate_lines(&child.text, content_width, font_size);
                             layout.push(LayoutBox {
                                 x: margin_x,
@@ -665,7 +672,7 @@ pub fn compute_layout_zoom(
                             cursor_y += lines * font_size * 1.5 + 4.0;
                         }
                         BlockKind::DefinitionDesc => {
-                            let font_size = 14.0 * z;
+                            let font_size = 18.0 * z;
                             let lines = estimate_lines(&child.text, content_width - 24.0, font_size);
                             layout.push(LayoutBox {
                                 x: margin_x + 24.0,
@@ -693,7 +700,7 @@ pub fn compute_layout_zoom(
                 for child in &block.children {
                     match &child.kind {
                         BlockKind::Summary => {
-                            let font_size = 15.0 * z;
+                            let font_size = 19.0 * z;
                             let text = format!("\u{25B6} {}", child.text);
                             let lines = estimate_lines(&text, content_width, font_size);
                             layout.push(LayoutBox {
@@ -715,7 +722,7 @@ pub fn compute_layout_zoom(
                         _ => {
                             // Render other children as paragraphs
                             if !child.text.is_empty() {
-                                let font_size = 15.0 * z;
+                                let font_size = 19.0 * z;
                                 let lines = estimate_lines(&child.text, content_width - 16.0, font_size);
                                 layout.push(LayoutBox {
                                     x: margin_x + 16.0,
@@ -739,9 +746,122 @@ pub fn compute_layout_zoom(
                 cursor_y += 6.0;
             }
             BlockKind::Form => {
-                // Render form description
-                if !block.text.is_empty() {
-                    let font_size = 14.0 * z;
+                // Render form children (InputFields, ButtonGroups, labels)
+                cursor_y += 8.0 * z;
+                for child in &block.children {
+                    if child.relevance < 0.15 || is_css_hidden(child) {
+                        continue;
+                    }
+                    match &child.kind {
+                        BlockKind::InputField { placeholder, input_type } => {
+                            let font_size = 18.0 * z;
+                            // Search/text inputs get a wide visual box
+                            let is_text_input = matches!(input_type.as_str(),
+                                "search" | "text" | "email" | "url" | "tel" | "number" | "password" | "textarea");
+                            if is_text_input {
+                                let box_w = (content_width * 0.75).min(560.0 * z);
+                                let box_h = 48.0 * z;
+                                let box_x = margin_x + (content_width - box_w) / 2.0; // center
+                                layout.push(LayoutBox {
+                                    x: box_x,
+                                    y: cursor_y,
+                                    width: box_w,
+                                    height: box_h,
+                                    kind: LayoutKind::InputBox {
+                                        placeholder: placeholder.clone(),
+                                        font_size,
+                                    },
+                                    href: None,
+                                });
+                                cursor_y += box_h + 12.0 * z;
+                            } else {
+                                // Checkbox/radio/select: render as text
+                                let lines = estimate_lines(placeholder, content_width, font_size);
+                                layout.push(LayoutBox {
+                                    x: margin_x + 24.0 * z,
+                                    y: cursor_y,
+                                    width: content_width - 24.0 * z,
+                                    height: lines * font_size * 1.5,
+                                    kind: LayoutKind::Text {
+                                        text: placeholder.clone(),
+                                        font_size,
+                                        color: theme.text,
+                                        bold: false,
+                                        italic: false,
+                                    },
+                                    href: None,
+                                });
+                                cursor_y += lines * font_size * 1.5 + 6.0 * z;
+                            }
+                        }
+                        BlockKind::ButtonGroup => {
+                            // Render buttons side by side, centered
+                            let btn_font_size = 16.0 * z;
+                            let btn_h = 44.0 * z;
+                            let btn_gap = 12.0 * z;
+                            let btn_pad = 28.0 * z; // horizontal padding inside button
+
+                            // Calculate total width of all buttons
+                            let mut btn_widths: Vec<f32> = Vec::new();
+                            for btn_child in &child.children {
+                                let text_w = btn_child.text.len() as f32 * btn_font_size * 0.55;
+                                btn_widths.push(text_w + btn_pad * 2.0);
+                            }
+                            let total_w: f32 = btn_widths.iter().sum::<f32>()
+                                + btn_gap * (btn_widths.len().max(1) - 1) as f32;
+
+                            let start_x = margin_x + (content_width - total_w).max(0.0) / 2.0;
+                            let mut btn_x = start_x;
+
+                            for (i, btn_child) in child.children.iter().enumerate() {
+                                let bw = btn_widths.get(i).copied().unwrap_or(100.0 * z);
+                                layout.push(LayoutBox {
+                                    x: btn_x,
+                                    y: cursor_y,
+                                    width: bw,
+                                    height: btn_h,
+                                    kind: LayoutKind::Button {
+                                        text: btn_child.text.clone(),
+                                        font_size: btn_font_size,
+                                        bg_color: [0.24, 0.24, 0.32, 1.0],
+                                        text_color: theme.text,
+                                    },
+                                    href: None,
+                                });
+                                btn_x += bw + btn_gap;
+                            }
+                            cursor_y += btn_h + 14.0 * z;
+                        }
+                        BlockKind::Paragraph => {
+                            // Label text
+                            if !child.text.is_empty() {
+                                let font_size = 16.0 * z;
+                                let lines = estimate_lines(&child.text, content_width, font_size);
+                                layout.push(LayoutBox {
+                                    x: margin_x,
+                                    y: cursor_y,
+                                    width: content_width,
+                                    height: lines * font_size * 1.5,
+                                    kind: LayoutKind::Text {
+                                        text: child.text.clone(),
+                                        font_size,
+                                        color: theme.text_dim,
+                                        bold: false,
+                                        italic: false,
+                                    },
+                                    href: None,
+                                });
+                                cursor_y += lines * font_size * 1.5 + 4.0 * z;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                cursor_y += 6.0 * z;
+
+                // Fallback: if no children but has text, render as before
+                if block.children.is_empty() && !block.text.is_empty() {
+                    let font_size = 18.0 * z;
                     let lines = estimate_lines(&block.text, content_width, font_size);
                     layout.push(LayoutBox {
                         x: margin_x,
@@ -759,6 +879,128 @@ pub fn compute_layout_zoom(
                     });
                     cursor_y += lines * font_size * 1.5 + 8.0;
                 }
+            }
+            BlockKind::InputField { placeholder, input_type } => {
+                // Standalone InputField (outside form)
+                let font_size = 18.0 * z;
+                let is_text_input = matches!(input_type.as_str(),
+                    "search" | "text" | "email" | "url" | "tel" | "number" | "password" | "textarea");
+                if is_text_input {
+                    let box_w = (content_width * 0.75).min(560.0 * z);
+                    let box_h = 48.0 * z;
+                    let box_x = margin_x + (content_width - box_w) / 2.0;
+                    layout.push(LayoutBox {
+                        x: box_x,
+                        y: cursor_y,
+                        width: box_w,
+                        height: box_h,
+                        kind: LayoutKind::InputBox {
+                            placeholder: placeholder.clone(),
+                            font_size,
+                        },
+                        href: None,
+                    });
+                    cursor_y += box_h + 12.0 * z;
+                } else {
+                    let lines = estimate_lines(placeholder, content_width, font_size);
+                    layout.push(LayoutBox {
+                        x: margin_x,
+                        y: cursor_y,
+                        width: content_width,
+                        height: lines * font_size * 1.5,
+                        kind: LayoutKind::Text {
+                            text: placeholder.clone(),
+                            font_size,
+                            color: theme.text,
+                            bold: false,
+                            italic: false,
+                        },
+                        href: None,
+                    });
+                    cursor_y += lines * font_size * 1.5 + 6.0 * z;
+                }
+            }
+            BlockKind::ButtonGroup => {
+                // Standalone ButtonGroup (outside form)
+                let btn_font_size = 16.0 * z;
+                let btn_h = 44.0 * z;
+                let btn_gap = 12.0 * z;
+                let btn_pad = 28.0 * z;
+
+                let mut btn_widths: Vec<f32> = Vec::new();
+                for btn_child in &block.children {
+                    let text_w = btn_child.text.len() as f32 * btn_font_size * 0.55;
+                    btn_widths.push(text_w + btn_pad * 2.0);
+                }
+                let total_w: f32 = btn_widths.iter().sum::<f32>()
+                    + btn_gap * (btn_widths.len().max(1) - 1) as f32;
+                let start_x = margin_x + (content_width - total_w).max(0.0) / 2.0;
+                let mut btn_x = start_x;
+
+                for (i, btn_child) in block.children.iter().enumerate() {
+                    let bw = btn_widths.get(i).copied().unwrap_or(100.0 * z);
+                    layout.push(LayoutBox {
+                        x: btn_x,
+                        y: cursor_y,
+                        width: bw,
+                        height: btn_h,
+                        kind: LayoutKind::Button {
+                            text: btn_child.text.clone(),
+                            font_size: btn_font_size,
+                            bg_color: [0.24, 0.24, 0.32, 1.0],
+                            text_color: theme.text,
+                        },
+                        href: None,
+                    });
+                    btn_x += bw + btn_gap;
+                }
+                cursor_y += btn_h + 14.0 * z;
+            }
+            BlockKind::InlineGroup => {
+                // Horizontal flow: render children side by side
+                let font_size = 15.0 * z;
+                let line_h = font_size * 1.5;
+                let gap = 16.0 * z;
+                let mut x = margin_x;
+                let max_x = margin_x + content_width;
+
+                for child in &block.children {
+                    if child.text.is_empty() || child.relevance < 0.15 {
+                        continue;
+                    }
+                    let text_w = child.text.len() as f32 * font_size * 0.55 + 4.0;
+
+                    // Wrap to next line if exceeds width
+                    if x + text_w > max_x && x > margin_x {
+                        x = margin_x;
+                        cursor_y += line_h + 4.0 * z;
+                    }
+
+                    let href = if let BlockKind::Link { href } = &child.kind {
+                        Some(href.clone())
+                    } else {
+                        None
+                    };
+
+                    let color = if href.is_some() { theme.link } else { theme.text };
+
+                    layout.push(LayoutBox {
+                        x,
+                        y: cursor_y,
+                        width: text_w,
+                        height: line_h,
+                        kind: LayoutKind::Text {
+                            text: child.text.clone(),
+                            font_size,
+                            color,
+                            bold: false,
+                            italic: false,
+                        },
+                        href,
+                    });
+                    x += text_w + gap;
+                }
+                cursor_y += line_h + 10.0 * z;
             }
             BlockKind::Figure => {
                 // Render figure children (images + captions)
@@ -815,7 +1057,7 @@ pub fn compute_layout_zoom(
                             }
                         }
                         BlockKind::FigCaption => {
-                            let font_size = 12.0 * z;
+                            let font_size = 15.0 * z;
                             let lines = estimate_lines(&child.text, content_width, font_size);
                             layout.push(LayoutBox {
                                 x: margin_x,

@@ -36,6 +36,8 @@ pub struct NpuResult {
 pub struct NpuEngine {
     content_extractor: content::ContentExtractor,
     ad_classifier: classifier::AdClassifier,
+    /// Shared network engine for image fetching (reused across pages).
+    image_net: NetworkEngine,
 }
 
 impl NpuEngine {
@@ -44,11 +46,13 @@ impl NpuEngine {
 
         let content_extractor = content::ContentExtractor::new()?;
         let ad_classifier = classifier::AdClassifier::new()?;
+        let image_net = NetworkEngine::new();
 
         info!("[NPU] Engine ready — models loaded");
         Ok(Self {
             content_extractor,
             ad_classifier,
+            image_net,
         })
     }
 
@@ -181,7 +185,6 @@ impl NpuEngine {
     /// Resolves relative URLs, downloads bytes, decodes to RGBA pixels.
     /// Stores decoded data in block.image_data. Capped at MAX_IMAGES_PER_PAGE.
     fn fetch_images(&self, blocks: &mut [ContentBlock], page_url: &str) {
-        let net = NetworkEngine::new();
         let base_url = url::Url::parse(page_url).ok();
 
         let mut images_fetched: usize = 0;
@@ -194,7 +197,7 @@ impl NpuEngine {
 
             match &block.kind {
                 BlockKind::Image { src, .. } => {
-                    if let Some(data) = self.try_fetch_and_decode_image(&net, src, &base_url) {
+                    if let Some(data) = self.try_fetch_and_decode_image(src, &base_url) {
                         block.image_data = Some(data);
                         images_fetched += 1;
                     }
@@ -205,7 +208,7 @@ impl NpuEngine {
                             break;
                         }
                         if let BlockKind::Image { src, .. } = &child.kind {
-                            if let Some(data) = self.try_fetch_and_decode_image(&net, src, &base_url) {
+                            if let Some(data) = self.try_fetch_and_decode_image(src, &base_url) {
                                 child.image_data = Some(data);
                                 images_fetched += 1;
                             }
@@ -225,7 +228,6 @@ impl NpuEngine {
     /// Returns (width, height, rgba_bytes) on success, None on failure.
     fn try_fetch_and_decode_image(
         &self,
-        net: &NetworkEngine,
         src: &str,
         base_url: &Option<url::Url>,
     ) -> Option<(u32, u32, Vec<u8>)> {
@@ -247,7 +249,7 @@ impl NpuEngine {
         };
 
         // Fetch image bytes
-        let bytes = match net.fetch_image(&resolved) {
+        let bytes = match self.image_net.fetch_image(&resolved) {
             Ok(b) => b,
             Err(e) => {
                 warn!("[NPU] Image fetch failed for {resolved}: {e}");
@@ -424,7 +426,7 @@ impl NpuEngine {
                 found_heading = true;
                 continue;
             }
-            if matches!(block.kind, BlockKind::Paragraph) && block.text.len() >= 50
+            if matches!(block.kind, BlockKind::Paragraph) && block.text.chars().count() >= 50
                 && (found_heading || block.relevance >= 0.5) {
                     return Some(truncate_summary(&block.text, 300));
                 }
@@ -432,7 +434,7 @@ impl NpuEngine {
 
         // Strategy 3: Any paragraph with at least 50 characters
         for block in blocks {
-            if matches!(block.kind, BlockKind::Paragraph) && block.text.len() >= 50 {
+            if matches!(block.kind, BlockKind::Paragraph) && block.text.chars().count() >= 50 {
                 return Some(truncate_summary(&block.text, 300));
             }
         }
@@ -450,7 +452,7 @@ impl NpuEngine {
             .collect::<Vec<_>>()
             .join(" ");
 
-        if text.len() < 20 {
+        if text.chars().count() < 20 {
             return None;
         }
 
@@ -606,7 +608,7 @@ fn extract_domain(url: &str) -> Option<String> {
 
 /// Truncate a summary to a max length, breaking at word boundaries (UTF-8 safe).
 fn truncate_summary(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
+    if text.chars().count() <= max_len {
         return text.to_string();
     }
 

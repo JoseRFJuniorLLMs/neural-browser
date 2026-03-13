@@ -108,6 +108,7 @@ impl JsEngine {
     }
 
     /// Execute all collected scripts against the DOM tree.
+    #[allow(dead_code)]
     pub fn execute_scripts(&mut self, dom: &mut DomTree, scripts: &[ScriptInfo]) -> Result<()> {
         self.execute_scripts_with_externals(dom, scripts, &HashMap::new(), "")
     }
@@ -462,6 +463,20 @@ fn register_element_helpers(ctx: &mut Context, dom: DomPtr) {
         }),
     ).expect("removeAttribute");
 
+    // __nb_getAttrKeys(nodeId) -> "key1\nkey2\n..." (all attribute names, newline-separated)
+    ctx.register_global_builtin_callable(js_string!("__nb_getAttrKeys"), 1,
+        NativeFunction::from_copy_closure(move |_, args, ctx| {
+            let nid = args.get_or_undefined(0).to_i32(ctx)? as usize;
+            let d = unsafe { dom.get() };
+            if let Some(node) = d.nodes.get(nid) {
+                let keys: Vec<&str> = node.attrs.keys().map(|k| k.as_str()).collect();
+                Ok(JsValue::from(js_string!(keys.join("\n"))))
+            } else {
+                Ok(JsValue::from(js_string!("")))
+            }
+        }),
+    ).expect("getAttrKeys");
+
     // __nb_hasAttribute(nodeId, key) -> bool
     ctx.register_global_builtin_callable(js_string!("__nb_hasAttribute"), 2,
         NativeFunction::from_copy_closure(move |_, args, ctx| {
@@ -602,11 +617,12 @@ fn register_element_helpers(ctx: &mut Context, dom: DomPtr) {
 fn reconstruct_html(dom: &DomTree, node_id: usize) -> String {
     let mut out = String::new();
     if let Some(node) = dom.nodes.get(node_id) {
+        // Emit text content before children (mixed content: "Hello<b>World</b>")
+        if !node.text.is_empty() {
+            out.push_str(&node.text);
+        }
         for &child_id in &node.children {
             reconstruct_node(dom, child_id, &mut out);
-        }
-        if node.children.is_empty() && !node.text.is_empty() {
-            out.push_str(&node.text);
         }
     }
     out
@@ -1333,7 +1349,11 @@ fn register_window_location(ctx: &mut Context, page_url: &str) {
                 parsed.query().map(|q| format!("?{q}")).unwrap_or_default(),
                 parsed.fragment().map(|f| format!("#{f}")).unwrap_or_default(),
                 parsed.origin().ascii_serialization(),
-                parsed.host_str().unwrap_or("").to_string(),
+                // host = hostname:port (or just hostname if default port)
+                match parsed.port() {
+                    Some(p) => format!("{}:{}", parsed.host_str().unwrap_or(""), p),
+                    None => parsed.host_str().unwrap_or("").to_string(),
+                },
                 parsed.port().map(|p| p.to_string()).unwrap_or_default(),
             )
         } else {
@@ -1363,6 +1383,10 @@ fn register_window_location(ctx: &mut Context, page_url: &str) {
         .build();
 
     ctx.register_global_property(js_string!("location"), location, Attribute::all()).expect("location");
+
+    // Fix location.toString() to return href
+    let ts_js = "location.toString = function() { return location.href; };";
+    if let Err(e) = ctx.eval(Source::from_bytes(ts_js.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 
     // Also set window.location and document.location
     // SECURITY: Escape href/hostname to prevent JS string injection
@@ -2047,23 +2071,21 @@ fn register_element_wrapper(ctx: &mut Context) {
         enumerable: true, configurable: true
     });
 
-    // ── outerHTML property (includes attributes) ──
+    // ── outerHTML property (includes own tag + attributes + children) ──
     Object.defineProperty(__NB_Element.prototype, "outerHTML", {
         get: function() {
-            // Use the Rust-side reconstruction which includes attributes
-            return __nb_getInnerHTML(this.__nb_id) || (function(el) {
+            return (function(el) {
                 var tag = __nb_getTagName(el.__nb_id).toLowerCase();
                 if (tag.charAt(0) === "#") return el.textContent || "";
                 var attrs = "";
-                var id = el.id; if (id) attrs += ' id="' + id + '"';
-                var cls = el.className; if (cls) attrs += ' class="' + cls + '"';
-                var inner = "";
-                var kids = __nb_getChildren(el.__nb_id) || [];
-                for (var i = 0; i < kids.length; i++) {
-                    var child = __nb_wrap(kids[i]);
-                    if (child) inner += child.outerHTML || "";
+                var keys = (__nb_getAttrKeys(el.__nb_id) || "").split("\n").filter(Boolean);
+                for (var i = 0; i < keys.length; i++) {
+                    var v = __nb_getAttribute(el.__nb_id, keys[i]) || "";
+                    attrs += " " + keys[i] + '="' + v.replace(/&/g,"&amp;").replace(/"/g,"&quot;") + '"';
                 }
-                if (el.textContent && kids.length === 0) inner = el.textContent;
+                // Use Rust-side innerHTML for content (includes attribute escaping)
+                var inner = __nb_getInnerHTML(el.__nb_id) || "";
+                if (!inner && el.textContent) inner = el.textContent;
                 return "<" + tag + attrs + ">" + inner + "</" + tag + ">";
             })(this);
         },
@@ -3030,7 +3052,16 @@ fn register_cookie_api(ctx: &mut Context, cookies: StoragePtr) {
                     let name = nv[..eq].trim().to_string();
                     let value = nv[eq+1..].trim().to_string();
                     if !name.is_empty() {
-                        c.insert(name, value);
+                        // Check for expires in the past (cookie deletion convention)
+                        let raw_lower = raw.to_lowercase();
+                        let is_delete = raw_lower.contains("expires=thu, 01 jan 1970")
+                            || raw_lower.contains("max-age=0")
+                            || raw_lower.contains("max-age=-");
+                        if is_delete {
+                            c.remove(&name);
+                        } else {
+                            c.insert(name, value);
+                        }
                     }
                 }
             }

@@ -16,6 +16,7 @@ mod gpu;
 mod ui;
 #[allow(dead_code)] // EVA integration is WIP
 mod eva;
+#[allow(dead_code)] // Semantic history — NietzscheDB integration WIP
 mod memory;
 mod css; // CSS engine — integrated into NPU→GPU pipeline
 
@@ -204,6 +205,8 @@ fn main() -> Result<()> {
             let semantic_memory = memory::SemanticMemory::new();
 
             // ── Browser history stacks ──
+            const MAX_HISTORY: usize = 500;
+            const MAX_STACK: usize = 100;
             let mut back_stack: Vec<String> = Vec::new();
             let mut forward_stack: Vec<String> = Vec::new();
             let mut visited_urls: Vec<String> = Vec::new();
@@ -211,12 +214,13 @@ fn main() -> Result<()> {
             let mut current_url: Option<String> = match std::env::args().nth(1) {
                 Some(url) => {
                     visited_urls.push(url.clone());
-                    process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls, &mut js_engine);
+                    process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls, &mut js_engine, Some(&semantic_memory));
                     Some(url)
                 }
                 None => {
                     let url = cpu::start_page::START_PAGE_URL.to_string();
-                    process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls, &mut js_engine);
+                    visited_urls.push(url.clone());
+                    process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls, &mut js_engine, None);
                     Some(url)
                 }
             };
@@ -232,26 +236,35 @@ fn main() -> Result<()> {
                         match msg {
                             PipelineMsg::Navigate(url) => {
                                 info!("[CPU] Navigating to: {url}");
-                                // Record visit in semantic history
-                                if !url.starts_with("neural://") {
-                                    semantic_memory.store_page(&url, "", "", "");
-                                }
                                 visited_urls.push(url.clone());
+                                if visited_urls.len() > MAX_HISTORY {
+                                    visited_urls.drain(..visited_urls.len() - MAX_HISTORY);
+                                }
                                 if let Some(cur) = current_url.take() {
                                     back_stack.push(cur);
+                                    if back_stack.len() > MAX_STACK {
+                                        back_stack.drain(..back_stack.len() - MAX_STACK);
+                                    }
                                 }
                                 forward_stack.clear();
                                 current_url = Some(url.clone());
-                                process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls, &mut js_engine);
+                                process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls, &mut js_engine, Some(&semantic_memory));
                             }
                             PipelineMsg::Back => {
                                 if let Some(prev_url) = back_stack.pop() {
                                     info!("[CPU] Going back to: {prev_url}");
                                     if let Some(cur) = current_url.take() {
                                         forward_stack.push(cur);
+                                        if forward_stack.len() > MAX_STACK {
+                                            forward_stack.drain(..forward_stack.len() - MAX_STACK);
+                                        }
+                                    }
+                                    visited_urls.push(prev_url.clone());
+                                    if visited_urls.len() > MAX_HISTORY {
+                                        visited_urls.drain(..visited_urls.len() - MAX_HISTORY);
                                     }
                                     current_url = Some(prev_url.clone());
-                                    process_url_or_internal(&net, &prev_url, &cpu_to_npu_tx, &visited_urls, &mut js_engine);
+                                    process_url_or_internal(&net, &prev_url, &cpu_to_npu_tx, &visited_urls, &mut js_engine, Some(&semantic_memory));
                                 } else {
                                     warn!("[CPU] No back history available");
                                 }
@@ -261,9 +274,16 @@ fn main() -> Result<()> {
                                     info!("[CPU] Going forward to: {next_url}");
                                     if let Some(cur) = current_url.take() {
                                         back_stack.push(cur);
+                                        if back_stack.len() > MAX_STACK {
+                                            back_stack.drain(..back_stack.len() - MAX_STACK);
+                                        }
+                                    }
+                                    visited_urls.push(next_url.clone());
+                                    if visited_urls.len() > MAX_HISTORY {
+                                        visited_urls.drain(..visited_urls.len() - MAX_HISTORY);
                                     }
                                     current_url = Some(next_url.clone());
-                                    process_url_or_internal(&net, &next_url, &cpu_to_npu_tx, &visited_urls, &mut js_engine);
+                                    process_url_or_internal(&net, &next_url, &cpu_to_npu_tx, &visited_urls, &mut js_engine, Some(&semantic_memory));
                                 } else {
                                     warn!("[CPU] No forward history available");
                                 }
@@ -396,6 +416,7 @@ fn process_url_or_internal(
     tx: &channel::Sender<PipelineMsg>,
     visited_urls: &[String],
     js: &mut cpu::js_engine::JsEngine,
+    semantic_memory: Option<&memory::SemanticMemory>,
 ) {
     // neural://start → start_page.rs
     if url == cpu::start_page::START_PAGE_URL {
@@ -423,7 +444,7 @@ fn process_url_or_internal(
     }
 
     // Regular HTTP(S) URL → network fetch
-    process_url(net, url, tx, js);
+    process_url(net, url, tx, js, semantic_memory);
 }
 
 /// Fetch and parse a URL, sending the result to the NPU.
@@ -434,6 +455,7 @@ fn process_url(
     url: &str,
     tx: &channel::Sender<PipelineMsg>,
     js: &mut cpu::js_engine::JsEngine,
+    semantic_memory: Option<&memory::SemanticMemory>,
 ) {
     let html = match net.fetch(url) {
         Ok(h) => h,
@@ -495,9 +517,26 @@ fn process_url(
         }
     }
 
+    // ── Store in semantic memory (after JS so title/content are final) ──
+    if let Some(mem) = semantic_memory {
+        let title = dom.extract_title().unwrap_or_default();
+        // Collect first ~500 chars of text content for semantic vector
+        let content: String = dom.nodes.iter()
+            .filter(|n| !n.text.is_empty() && n.tag != "script" && n.tag != "style")
+            .map(|n| n.text.as_str())
+            .take(20)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let content_trunc = if content.len() > 500 { &content[..500] } else { &content };
+        mem.store_page(url, &title, "", content_trunc);
+    }
+
+    // Reconstruct HTML from modified DOM (JS may have changed the DOM)
+    let final_html = dom.reconstruct_html();
+
     if let Err(e) = tx.send(PipelineMsg::HtmlReady {
         url: url.to_string(),
-        html,
+        html: final_html,
         dom,
     }) {
         error!("[CPU] Failed to send to NPU: {e}");

@@ -94,6 +94,100 @@ impl DomTree {
             .collect()
     }
 
+    /// Extract page title from <title> tag.
+    pub fn extract_title(&self) -> Option<String> {
+        for node in &self.nodes {
+            if node.tag == "title" {
+                let title = node.text.trim();
+                if !title.is_empty() {
+                    return Some(title.to_string());
+                }
+                // Check first child text
+                for &child_id in &node.children {
+                    if let Some(child) = self.nodes.get(child_id) {
+                        let t = child.text.trim();
+                        if !t.is_empty() {
+                            return Some(t.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Reconstruct HTML string from the DOM tree.
+    /// Used after JS modifies the DOM to get the updated HTML for NPU.
+    pub fn reconstruct_html(&self) -> String {
+        if self.nodes.is_empty() {
+            return String::new();
+        }
+        let mut out = String::with_capacity(4096);
+        // Find root nodes (no parent)
+        for (i, node) in self.nodes.iter().enumerate() {
+            if node.parent.is_none() {
+                self.reconstruct_node(i, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Reconstruct a single node and its children as HTML.
+    fn reconstruct_node(&self, node_id: usize, out: &mut String) {
+        let node = match self.nodes.get(node_id) {
+            Some(n) => n,
+            None => return,
+        };
+
+        // Text-only node (no tag)
+        if node.tag.is_empty() || node.tag == "#text" {
+            out.push_str(&node.text);
+            return;
+        }
+
+        // Opening tag
+        out.push('<');
+        out.push_str(&node.tag);
+        for (key, val) in &node.attrs {
+            out.push(' ');
+            out.push_str(key);
+            out.push_str("=\"");
+            // Escape attribute value
+            for c in val.chars() {
+                match c {
+                    '"' => out.push_str("&quot;"),
+                    '&' => out.push_str("&amp;"),
+                    '<' => out.push_str("&lt;"),
+                    '>' => out.push_str("&gt;"),
+                    _ => out.push(c),
+                }
+            }
+            out.push('"');
+        }
+        out.push('>');
+
+        // Self-closing / void elements
+        let void_tags = ["br", "hr", "img", "input", "meta", "link", "area", "base", "col", "embed", "source", "track", "wbr"];
+        if void_tags.contains(&node.tag.as_str()) {
+            return;
+        }
+
+        // Text content
+        if !node.text.is_empty() {
+            out.push_str(&node.text);
+        }
+
+        // Children
+        for &child_id in &node.children {
+            self.reconstruct_node(child_id, out);
+        }
+
+        // Closing tag
+        out.push_str("</");
+        out.push_str(&node.tag);
+        out.push('>');
+    }
+
     // ── Mutable DOM APIs (for JavaScript engine) ──
 
     /// Create a new detached element node. Returns its node ID.
@@ -114,8 +208,12 @@ impl DomTree {
     /// Check if `potential_ancestor` is an ancestor of `node` by walking up the parent chain.
     fn is_ancestor(&self, potential_ancestor: usize, node: usize) -> bool {
         let mut current = Some(node);
+        let max_steps = self.nodes.len(); // can't be deeper than total nodes
+        let mut steps = 0;
         while let Some(id) = current {
             if id == potential_ancestor { return true; }
+            steps += 1;
+            if steps > max_steps { return false; } // cycle detected
             current = self.nodes.get(id).and_then(|n| n.parent);
         }
         false
@@ -147,7 +245,8 @@ impl DomTree {
         true
     }
 
-    /// Remove `child` from `parent`.
+    /// Remove `child` from `parent`. Detaches the entire subtree so removed
+    /// nodes don't pollute query results.
     pub fn remove_child(&mut self, parent_id: usize, child_id: usize) -> bool {
         if parent_id >= self.nodes.len() || child_id >= self.nodes.len() {
             return false;
@@ -155,10 +254,22 @@ impl DomTree {
         let before = self.nodes[parent_id].children.len();
         self.nodes[parent_id].children.retain(|&c| c != child_id);
         if self.nodes[parent_id].children.len() < before {
-            self.nodes[child_id].parent = None;
+            self.detach_subtree(child_id);
             true
         } else {
             false
+        }
+    }
+
+    /// Recursively detach a node and all its descendants (set parent=None, depth=0).
+    /// This ensures removed subtrees don't appear in queries.
+    fn detach_subtree(&mut self, node_id: usize) {
+        if node_id >= self.nodes.len() { return; }
+        self.nodes[node_id].parent = None;
+        self.nodes[node_id].depth = 0;
+        let children: Vec<usize> = self.nodes[node_id].children.clone();
+        for child in children {
+            self.detach_subtree(child);
         }
     }
 
@@ -177,14 +288,20 @@ impl DomTree {
         self.nodes.get(node_id)?.attrs.get(key).map(|s| s.as_str())
     }
 
-    /// Set the text content of a node (replaces existing text).
+    /// Set the text content of a node. Per DOM spec, this removes all children
+    /// and replaces them with the given text.
     pub fn set_text_content(&mut self, node_id: usize, text: &str) -> bool {
-        if let Some(node) = self.nodes.get_mut(node_id) {
-            node.text = text.to_string();
-            true
-        } else {
-            false
+        if node_id >= self.nodes.len() {
+            return false;
         }
+        // Detach all children (DOM spec: textContent setter removes all child nodes)
+        let children: Vec<usize> = self.nodes[node_id].children.clone();
+        for &child in &children {
+            self.detach_subtree(child);
+        }
+        self.nodes[node_id].children.clear();
+        self.nodes[node_id].text = text.to_string();
+        true
     }
 
     /// Set innerHTML on a node: re-parses HTML and attaches children.
@@ -192,12 +309,10 @@ impl DomTree {
         if node_id >= self.nodes.len() {
             return false;
         }
-        // Detach old children before clearing
+        // Recursively detach old children so they don't pollute queries
         let old_children: Vec<usize> = self.nodes[node_id].children.clone();
         for &old_child in &old_children {
-            if old_child < self.nodes.len() {
-                self.nodes[old_child].parent = None;
-            }
+            self.detach_subtree(old_child);
         }
         self.nodes[node_id].children.clear();
         self.nodes[node_id].text.clear();
@@ -287,6 +402,7 @@ fn matches_simple_selector(node: &DomNode, selector: &str) -> bool {
     let mut tag_req: Option<String> = None;
     let mut class_reqs: Vec<String> = Vec::new();
     let mut id_req: Option<String> = None;
+    let mut has_attr_req = false;
 
     let mut chars = sel.chars().peekable();
     let mut current = String::new();
@@ -297,13 +413,15 @@ fn matches_simple_selector(node: &DomNode, selector: &str) -> bool {
             '.' => {
                 if mode == 'T' && !current.is_empty() { tag_req = Some(current.to_lowercase()); }
                 else if mode == 'C' && !current.is_empty() { class_reqs.push(current.clone()); }
+                else if mode == 'I' && !current.is_empty() { id_req = Some(current.clone()); }
                 current.clear();
                 mode = 'C';
                 chars.next();
             }
-            '#' if mode != 'C' || current.is_empty() => {
+            '#' => {
                 if mode == 'T' && !current.is_empty() { tag_req = Some(current.to_lowercase()); }
                 else if mode == 'C' && !current.is_empty() { class_reqs.push(current.clone()); }
+                else if mode == 'I' && !current.is_empty() { id_req = Some(current.clone()); }
                 current.clear();
                 mode = 'I';
                 chars.next();
@@ -311,6 +429,7 @@ fn matches_simple_selector(node: &DomNode, selector: &str) -> bool {
             '[' => {
                 if mode == 'T' && !current.is_empty() { tag_req = Some(current.to_lowercase()); }
                 else if mode == 'C' && !current.is_empty() { class_reqs.push(current.clone()); }
+                else if mode == 'I' && !current.is_empty() { id_req = Some(current.clone()); }
                 current.clear();
                 chars.next();
                 // Read attribute selector
@@ -328,6 +447,7 @@ fn matches_simple_selector(node: &DomNode, selector: &str) -> bool {
                 } else {
                     if !node.attrs.contains_key(attr_content.trim()) { return false; }
                 }
+                has_attr_req = true;
                 mode = 'T';
                 continue;
             }
@@ -356,7 +476,7 @@ fn matches_simple_selector(node: &DomNode, selector: &str) -> bool {
         }
     }
     // Must have matched at least one requirement
-    tag_req.is_some() || id_req.is_some() || !class_reqs.is_empty()
+    tag_req.is_some() || id_req.is_some() || !class_reqs.is_empty() || has_attr_req
 }
 
 /// Tags whose content should be completely skipped (not added as text).
@@ -475,6 +595,49 @@ pub fn parse_html(html: &str) -> DomTree {
                     .next()
                     .unwrap_or("div")
                     .to_lowercase();
+
+                // Auto-close implicit tags (HTML5 optional closing tags)
+                // e.g. <li> closes previous <li>, <p> closes previous <p>, etc.
+                match tag_name.as_str() {
+                    "li" => {
+                        // Close previous <li> at the same list level
+                        if let Some(&top) = stack.last() {
+                            if nodes[top].tag == "li" { stack.pop(); }
+                        }
+                    }
+                    "dt" | "dd" => {
+                        if let Some(&top) = stack.last() {
+                            if nodes[top].tag == "dt" || nodes[top].tag == "dd" { stack.pop(); }
+                        }
+                    }
+                    "p" => {
+                        if let Some(&top) = stack.last() {
+                            if nodes[top].tag == "p" { stack.pop(); }
+                        }
+                    }
+                    "tr" => {
+                        if let Some(&top) = stack.last() {
+                            if nodes[top].tag == "tr" { stack.pop(); }
+                        }
+                    }
+                    "td" | "th" => {
+                        if let Some(&top) = stack.last() {
+                            if nodes[top].tag == "td" || nodes[top].tag == "th" { stack.pop(); }
+                        }
+                    }
+                    "thead" | "tbody" | "tfoot" => {
+                        if let Some(&top) = stack.last() {
+                            if matches!(nodes[top].tag.as_str(), "thead" | "tbody" | "tfoot") { stack.pop(); }
+                        }
+                    }
+                    "option" => {
+                        if let Some(&top) = stack.last() {
+                            if nodes[top].tag == "option" { stack.pop(); }
+                        }
+                    }
+                    _ => {}
+                }
+
                 let depth = stack.len();
 
                 // Parse attributes

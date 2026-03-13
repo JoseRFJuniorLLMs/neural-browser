@@ -465,13 +465,29 @@ impl GpuApp {
     }
 
     /// Resolve a potentially relative href against the current URL.
+    /// Blocks dangerous URI schemes (javascript:, data:, vbscript:).
     fn resolve_href(&self, href: &str) -> String {
+        // Block dangerous schemes that could execute code
+        let lower = href.trim().to_lowercase();
+        if lower.starts_with("javascript:")
+            || lower.starts_with("data:")
+            || lower.starts_with("vbscript:")
+            || lower.starts_with("blob:")
+        {
+            return String::new(); // blocked
+        }
+
         if href.starts_with("http://") || href.starts_with("https://") {
             return href.to_string();
         }
         if let Ok(base) = url::Url::parse(&self.url_bar) {
             if let Ok(resolved) = base.join(href) {
-                return resolved.to_string();
+                // Verify resolved URL also has safe scheme
+                let scheme = resolved.scheme();
+                if scheme == "http" || scheme == "https" || scheme == "neural" {
+                    return resolved.to_string();
+                }
+                return String::new(); // blocked
             }
         }
         href.to_string()
@@ -595,8 +611,12 @@ impl ApplicationHandler for GpuApp {
                     // Hit test links
                     if let Some(href) = self.hit_test_link(self.mouse_x, self.mouse_y) {
                         let resolved = self.resolve_href(&href);
-                        info!("[UI] Link clicked: {resolved}");
-                        self.navigate(&resolved);
+                        if resolved.is_empty() {
+                            info!("[UI] Blocked dangerous link: {href}");
+                        } else {
+                            info!("[UI] Link clicked: {resolved}");
+                            self.navigate(&resolved);
+                        }
                     } else if self.url_editing {
                         // Click outside URL bar cancels editing
                         self.url_editing = false;

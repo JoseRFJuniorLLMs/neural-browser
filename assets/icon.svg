@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <!-- CPU blue glow -->
+    <radialGradient id="gCpu" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#4D9FFF" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#1A5FAA" stop-opacity="0"/>
+    </radialGradient>
+    <!-- NPU violet glow -->
+    <radialGradient id="gNpu" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#A855F7" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#6B21A8" stop-opacity="0"/>
+    </radialGradient>
+    <!-- GPU cyan glow -->
+    <radialGradient id="gGpu" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#22D3EE" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#0E7490" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Central neuron gradient -->
+    <radialGradient id="gCore" cx="50%" cy="50%" r="45%">
+      <stop offset="0%" stop-color="#F8FAFC"/>
+      <stop offset="40%" stop-color="#E2E8F0"/>
+      <stop offset="100%" stop-color="#94A3B8"/>
+    </radialGradient>
+    <!-- Background -->
+    <radialGradient id="gBg" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#1E1B2E"/>
+      <stop offset="100%" stop-color="#0A0A12"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="256" cy="256" r="256" fill="url(#gBg)"/>
+
+  <!-- Subtle ring -->
+  <circle cx="256" cy="256" r="200" fill="none" stroke="#334155" stroke-width="1" opacity="0.3"/>
+
+  <!-- Three dendrite glows -->
+  <ellipse cx="160" cy="130" rx="90" ry="70" fill="url(#gCpu)" opacity="0.4"/>
+  <ellipse cx="352" cy="130" rx="90" ry="70" fill="url(#gNpu)" opacity="0.4"/>
+  <ellipse cx="256" cy="380" rx="90" ry="70" fill="url(#gGpu)" opacity="0.4"/>
+
+  <!-- Dendrite lines (synaptic connections) -->
+  <!-- CPU dendrite (top-left) -->
+  <line x1="256" y1="236" x2="155" y2="140" stroke="#4D9FFF" stroke-width="3" stroke-linecap="round" opacity="0.8"/>
+  <line x1="240" y1="245" x2="130" y2="165" stroke="#4D9FFF" stroke-width="2" stroke-linecap="round" opacity="0.5"/>
+  <line x1="248" y1="230" x2="175" y2="115" stroke="#4D9FFF" stroke-width="2" stroke-linecap="round" opacity="0.5"/>
+
+  <!-- NPU dendrite (top-right) -->
+  <line x1="256" y1="236" x2="357" y2="140" stroke="#A855F7" stroke-width="3" stroke-linecap="round" opacity="0.8"/>
+  <line x1="272" y1="245" x2="382" y2="165" stroke="#A855F7" stroke-width="2" stroke-linecap="round" opacity="0.5"/>
+  <line x1="264" y1="230" x2="337" y2="115" stroke="#A855F7" stroke-width="2" stroke-linecap="round" opacity="0.5"/>
+
+  <!-- GPU dendrite (bottom) -->
+  <line x1="256" y1="276" x2="256" y2="375" stroke="#22D3EE" stroke-width="3" stroke-linecap="round" opacity="0.8"/>
+  <line x1="240" y1="272" x2="210" y2="365" stroke="#22D3EE" stroke-width="2" stroke-linecap="round" opacity="0.5"/>
+  <line x1="272" y1="272" x2="302" y2="365" stroke="#22D3EE" stroke-width="2" stroke-linecap="round" opacity="0.5"/>
+
+  <!-- Synaptic terminals (small circles at dendrite ends) -->
+  <!-- CPU -->
+  <circle cx="155" cy="140" r="6" fill="#4D9FFF"/>
+  <circle cx="130" cy="165" r="4" fill="#4D9FFF" opacity="0.7"/>
+  <circle cx="175" cy="115" r="4" fill="#4D9FFF" opacity="0.7"/>
+  <!-- NPU -->
+  <circle cx="357" cy="140" r="6" fill="#A855F7"/>
+  <circle cx="382" cy="165" r="4" fill="#A855F7" opacity="0.7"/>
+  <circle cx="337" cy="115" r="4" fill="#A855F7" opacity="0.7"/>
+  <!-- GPU -->
+  <circle cx="256" cy="375" r="6" fill="#22D3EE"/>
+  <circle cx="210" cy="365" r="4" fill="#22D3EE" opacity="0.7"/>
+  <circle cx="302" cy="365" r="4" fill="#22D3EE" opacity="0.7"/>
+
+  <!-- Signal pulses on dendrites -->
+  <circle cx="200" cy="185" r="3" fill="#4D9FFF" opacity="0.9">
+    <animate attributeName="opacity" values="0.9;0.2;0.9" dur="2s" repeatCount="indefinite"/>
+  </circle>
+  <circle cx="312" cy="185" r="3" fill="#A855F7" opacity="0.9">
+    <animate attributeName="opacity" values="0.2;0.9;0.2" dur="2s" repeatCount="indefinite"/>
+  </circle>
+  <circle cx="256" cy="330" r="3" fill="#22D3EE" opacity="0.9">
+    <animate attributeName="opacity" values="0.9;0.2;0.9" dur="1.5s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- Central neuron body (the "viewport") -->
+  <circle cx="256" cy="256" r="45" fill="url(#gCore)" stroke="#CBD5E1" stroke-width="2"/>
+
+  <!-- Inner "N" letter -->
+  <text x="256" y="272" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="bold" font-size="46" fill="#1E1B2E" letter-spacing="-2">N</text>
+
+  <!-- Processor labels -->
+  <text x="140" cy="100" y="100" text-anchor="middle" font-family="monospace" font-size="16" fill="#4D9FFF" font-weight="bold" opacity="0.9">CPU</text>
+  <text x="372" y="100" text-anchor="middle" font-family="monospace" font-size="16" fill="#A855F7" font-weight="bold" opacity="0.9">NPU</text>
+  <text x="256" y="420" text-anchor="middle" font-family="monospace" font-size="16" fill="#22D3EE" font-weight="bold" opacity="0.9">GPU</text>
+</svg>

@@ -16,6 +16,7 @@ mod gpu;
 mod ui;
 #[allow(dead_code)] // EVA integration is WIP
 mod eva;
+mod memory;
 
 use anyhow::Result;
 use crossbeam_channel as channel;
@@ -187,6 +188,9 @@ fn main() -> Result<()> {
             let net = cpu::network::NetworkEngine::new();
             let ai_client = std::sync::Arc::new(eva::AiClient::new());
 
+            // ── Semantic history (NietzscheDB) ──
+            let semantic_memory = memory::SemanticMemory::new();
+
             // ── Browser history stacks ──
             let mut back_stack: Vec<String> = Vec::new();
             let mut forward_stack: Vec<String> = Vec::new();
@@ -222,6 +226,10 @@ fn main() -> Result<()> {
                         match msg {
                             PipelineMsg::Navigate(url) => {
                                 info!("[CPU] Navigating to: {url}");
+                                // Record visit in semantic history
+                                if !url.starts_with("neural://") {
+                                    semantic_memory.store_page(&url, "", "", "");
+                                }
                                 if let Some(cur) = current_url.take() {
                                     back_stack.push(cur);
                                 }

@@ -83,6 +83,13 @@ cargo build --release
 | **Scroll** | Mouse wheel or PageUp/PageDown |
 | **Home** | Scroll to top |
 | **Click** | Follow links |
+| **F2** | Toggle AI panel (EVA) |
+| **Tab** | Cycle AI provider (EVA → Claude → Gemini → GPT-4 → Local) |
+| **Ctrl+S** | Summarize current page (AI) |
+| **Ctrl+R** | Toggle reading mode |
+| **Ctrl+I** | Proactive insights (AI suggests questions) |
+| **Ctrl+T** | Translate page (AI) |
+| **?query** | Smart search (natural language → AI answer) |
 
 ## Architecture
 
@@ -102,9 +109,16 @@ neural-browser/
 │   │   ├── mod.rs           # winit event loop + window/input management
 │   │   ├── renderer.rs      # wgpu + glyphon text rendering
 │   │   └── layout.rs        # ContentBlocks → positioned LayoutBoxes + hit testing
+│   ├── eva/
+│   │   ├── mod.rs           # Multi-AI client (EVA, Claude, Gemini, GPT-4, Local/ONNX)
+│   │   └── panel.rs         # AI chat panel state + conversation history
+│   ├── memory/
+│   │   └── mod.rs           # Semantic history (NietzscheDB + n-gram embeddings)
 │   └── ui/
 │       └── mod.rs           # Theme + navigation types
-└── models/                   # ONNX models (NPU inference)
+├── assets/
+│   └── icon.svg             # App icon (tri-processor neuron)
+└── models/                   # ONNX models (NPU inference + Local LLM)
 ```
 
 ### NPU Content Classification
@@ -169,12 +183,23 @@ Working:
 - [x] Built-in start page (`neural://start`)
 - [x] Mouse hover link preview
 - [x] Layout caching (recompute on change only)
-- [x] Image support (PNG, JPEG, WebP)
+- [x] Image support (PNG, JPEG, WebP) + image fetching pipeline
 - [x] Visited URL tracking
+- [x] Multi-AI provider system (EVA, Claude, Gemini, GPT-4, Local)
+- [x] AI chat panel with provider cycling (Tab key)
+- [x] Smart search (natural language queries → AI answers)
+- [x] Page translation (Ctrl+T)
+- [x] Proactive insights (Ctrl+I — AI suggests questions about the page)
+- [x] Reading mode (Ctrl+R — filter low-relevance content)
+- [x] Local LLM via ONNX Runtime (NPU/DirectML acceleration)
+- [x] Semantic history (NietzscheDB + n-gram hash embeddings)
+- [x] Voice response (EVA native audio model)
 
 Planned:
 - [ ] ONNX models for NPU (MarkupLM, ad classifier)
-- [ ] Image decode → GPU textures
+- [ ] Full Local LLM inference (tokenizer integration for Phi-3)
+- [ ] Semantic history search in URL bar
+- [ ] Image decode → GPU textures (pipeline ready, wgpu textures pending)
 - [ ] Redirect handling (301/302)
 - [ ] Tabs
 - [ ] Rectangle shader (colored backgrounds)

@@ -122,10 +122,13 @@ impl NpuEngine {
         let mut scored: Vec<(f32, String)> = Vec::new();
 
         for (href, text) in &links {
-            // Skip anchors, javascript, and empty hrefs
+            // Skip anchors, dangerous schemes, and empty hrefs
             if href.is_empty()
                 || href.starts_with('#')
                 || href.starts_with("javascript:")
+                || href.starts_with("data:")
+                || href.starts_with("blob:")
+                || href.starts_with("vbscript:")
                 || href.starts_with("mailto:")
                 || href.starts_with("tel:")
             {

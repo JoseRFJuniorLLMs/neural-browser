@@ -152,6 +152,7 @@ impl ContentExtractor {
                         depth: node.depth,
                         relevance: 0.5,
                         children: list_children,
+                        image_data: None,
                     });
                 }
             }
@@ -233,6 +234,7 @@ impl ContentExtractor {
                                 depth: child.depth,
                                 relevance: 0.5,
                                 children: nested_items,
+                                image_data: None,
                             });
                         }
                     }
@@ -305,6 +307,7 @@ impl ContentExtractor {
             depth: table_node.depth,
             relevance: 0.7,
             children: row_blocks,
+            image_data: None,
         })
     }
 
@@ -354,6 +357,7 @@ impl ContentExtractor {
             depth: dl_node.depth,
             relevance: 0.6,
             children,
+            image_data: None,
         })
     }
 
@@ -402,6 +406,7 @@ impl ContentExtractor {
             depth: fig_node.depth,
             relevance: 0.7,
             children,
+            image_data: None,
         })
     }
 

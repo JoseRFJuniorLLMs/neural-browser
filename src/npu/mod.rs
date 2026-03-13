@@ -424,11 +424,10 @@ impl NpuEngine {
                 found_heading = true;
                 continue;
             }
-            if matches!(block.kind, BlockKind::Paragraph) && block.text.len() >= 50 {
-                if found_heading || block.relevance >= 0.5 {
+            if matches!(block.kind, BlockKind::Paragraph) && block.text.len() >= 50
+                && (found_heading || block.relevance >= 0.5) {
                     return Some(truncate_summary(&block.text, 300));
                 }
-            }
         }
 
         // Strategy 3: Any paragraph with at least 50 characters

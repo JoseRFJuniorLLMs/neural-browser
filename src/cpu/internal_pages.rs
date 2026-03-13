@@ -112,6 +112,7 @@ fn nav_bar() -> &'static str {
         <a href="neural://start">Home</a>
         <a href="neural://settings">Settings</a>
         <a href="neural://history">History</a>
+        <a href="neural://files">Files</a>
         <a href="neural://about">About</a>
     </div>"#
 }
@@ -180,8 +181,8 @@ fn page_settings() -> String {
 <table>
     <tr><th>Setting</th><th>Value</th></tr>
     <tr><td>Runtime</td><td>ONNX Runtime + DirectML</td></tr>
-    <tr><td>Ad Blocker</td><td>ML heuristic classifier<span class="badge badge-ok">active</span></td></tr>
-    <tr><td>Language Detection</td><td>Statistical + Unicode analysis<span class="badge badge-ok">active</span></td></tr>
+    <tr><td>Ad Blocker</td><td>ML heuristic classifier <span class="badge badge-ok">active</span></td></tr>
+    <tr><td>Language Detection</td><td>Statistical + Unicode analysis <span class="badge badge-ok">active</span></td></tr>
 </table>
 </div>
 
@@ -206,8 +207,8 @@ fn page_settings() -> String {
     <tr><td>Alt+Left / Alt+Right</td><td>Back / Forward</td></tr>
     <tr><td>Page Up / Page Down</td><td>Scroll by page</td></tr>
     <tr><td>Home / End</td><td>Scroll to top / bottom</td></tr>
-    <tr><td>Ctrl+E / F2</td><td>Toggle EVA AI panel</td></tr>
-    <tr><td>Ctrl+S</td><td>Ask EVA to summarize page</td></tr>
+    <tr><td>Ctrl+E / F2</td><td>Toggle AI assistant panel</td></tr>
+    <tr><td>Ctrl+S</td><td>Ask AI to summarize page</td></tr>
 </table>
 </div>"#,
     );

@@ -14,6 +14,7 @@ use super::values::*;
 
 /// A complete CSS stylesheet.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
     pub imports: Vec<String>,
@@ -21,6 +22,7 @@ pub struct Stylesheet {
 
 /// A CSS rule: selector list + declarations.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Rule {
     pub selectors: Vec<Selector>,
     pub declarations: Vec<Declaration>,
@@ -37,6 +39,7 @@ pub struct Selector {
 
 /// A part of a compound selector.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum SelectorPart {
     /// Universal selector `*`
     Universal,
@@ -83,6 +86,7 @@ pub enum AttrOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Specificity(pub u32, pub u32, pub u32);
 
+#[allow(dead_code)]
 impl Specificity {
     pub const ZERO: Self = Self(0, 0, 0);
     pub const INLINE: Self = Self(1000, 0, 0);
@@ -102,6 +106,7 @@ pub struct Declaration {
 
 /// A generic CSS value (before resolution to typed values).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum CssValue {
     Keyword(String),
     Color(CssColor),
@@ -232,6 +237,7 @@ impl CssParser {
         self.tokens.get(self.pos).unwrap_or(&Token::Eof)
     }
 
+    #[allow(dead_code)]
     fn consume(&mut self) -> Token {
         let tok = self.tokens.get(self.pos).cloned().unwrap_or(Token::Eof);
         self.pos += 1;

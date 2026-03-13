@@ -127,13 +127,43 @@ impl AdClassifier {
 struct PatternEntry {
     pattern: &'static str,
     confidence: f32,
+    /// If true, require word boundaries around the pattern (avoids substring false positives).
+    word_boundary: bool,
+}
+
+/// Check if a character is a word boundary (not alphanumeric or underscore).
+fn is_word_boundary(c: char) -> bool {
+    !c.is_alphanumeric() && c != '_'
 }
 
 /// Check text against a list of patterns; return highest confidence match.
+/// Patterns with `word_boundary: true` require non-alphanumeric characters (or string
+/// edges) before and after the match, preventing "ad choice" from matching "bad choice".
 fn match_patterns(text: &str, patterns: &[PatternEntry]) -> Option<f32> {
     let mut best: Option<f32> = None;
     for p in patterns {
-        if text.contains(p.pattern) {
+        let matched = if p.word_boundary {
+            // Word-boundary-aware search
+            let pat = p.pattern;
+            let mut start = 0;
+            let mut found = false;
+            while let Some(pos) = text[start..].find(pat) {
+                let abs_pos = start + pos;
+                let before_ok = abs_pos == 0 || text[..abs_pos].chars().last().is_none_or(is_word_boundary);
+                let after_pos = abs_pos + pat.len();
+                let after_ok = after_pos >= text.len() || text[after_pos..].chars().next().is_none_or(is_word_boundary);
+                if before_ok && after_ok {
+                    found = true;
+                    break;
+                }
+                start = abs_pos + 1;
+            }
+            found
+        } else {
+            text.contains(p.pattern)
+        };
+
+        if matched {
             let current = best.unwrap_or(0.0);
             if p.confidence > current {
                 best = Some(p.confidence);
@@ -147,132 +177,129 @@ fn match_patterns(text: &str, patterns: &[PatternEntry]) -> Option<f32> {
 
 const AD_URL_PATTERNS: &[PatternEntry] = &[
     // Google ads
-    PatternEntry { pattern: "doubleclick", confidence: 0.95 },
-    PatternEntry { pattern: "googlesyndication", confidence: 0.95 },
-    PatternEntry { pattern: "googleadservices", confidence: 0.95 },
-    PatternEntry { pattern: "pagead", confidence: 0.85 },
+    PatternEntry { pattern: "doubleclick", confidence: 0.95, word_boundary: false },
+    PatternEntry { pattern: "googlesyndication", confidence: 0.95, word_boundary: false },
+    PatternEntry { pattern: "googleadservices", confidence: 0.95, word_boundary: false },
+    PatternEntry { pattern: "pagead", confidence: 0.85, word_boundary: false },
     // Generic ad systems
-    PatternEntry { pattern: "adsystem", confidence: 0.9 },
-    PatternEntry { pattern: "adservice", confidence: 0.9 },
-    PatternEntry { pattern: "adnxs", confidence: 0.9 },
-    PatternEntry { pattern: "advertising", confidence: 0.8 },
+    PatternEntry { pattern: "adsystem", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "adservice", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "adnxs", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "advertising", confidence: 0.8, word_boundary: false },
     // Major ad networks
-    PatternEntry { pattern: "amazon-adsystem", confidence: 0.95 },
-    PatternEntry { pattern: "taboola", confidence: 0.95 },
-    PatternEntry { pattern: "outbrain", confidence: 0.95 },
-    PatternEntry { pattern: "criteo", confidence: 0.95 },
-    PatternEntry { pattern: "mediavine", confidence: 0.9 },
-    PatternEntry { pattern: "revcontent", confidence: 0.9 },
-    PatternEntry { pattern: "mgid.com", confidence: 0.9 },
-    PatternEntry { pattern: "zergnet", confidence: 0.85 },
-    PatternEntry { pattern: "adblade", confidence: 0.9 },
-    PatternEntry { pattern: "adroll", confidence: 0.9 },
-    PatternEntry { pattern: "pubmatic", confidence: 0.9 },
-    PatternEntry { pattern: "openx", confidence: 0.85 },
-    PatternEntry { pattern: "rubiconproject", confidence: 0.9 },
-    PatternEntry { pattern: "indexexchange", confidence: 0.85 },
-    PatternEntry { pattern: "appnexus", confidence: 0.9 },
-    PatternEntry { pattern: "smartadserver", confidence: 0.9 },
-    PatternEntry { pattern: "bidswitch", confidence: 0.85 },
-    PatternEntry { pattern: "sharethrough", confidence: 0.85 },
-    PatternEntry { pattern: "moat.com", confidence: 0.8 },
+    PatternEntry { pattern: "amazon-adsystem", confidence: 0.95, word_boundary: false },
+    PatternEntry { pattern: "taboola", confidence: 0.95, word_boundary: false },
+    PatternEntry { pattern: "outbrain", confidence: 0.95, word_boundary: false },
+    PatternEntry { pattern: "criteo", confidence: 0.95, word_boundary: false },
+    PatternEntry { pattern: "mediavine", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "revcontent", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "mgid.com", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "zergnet", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "adblade", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "adroll", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "pubmatic", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "openx", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "rubiconproject", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "indexexchange", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "appnexus", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "smartadserver", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "bidswitch", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "sharethrough", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "moat.com", confidence: 0.8, word_boundary: false },
     // URL path patterns
-    PatternEntry { pattern: "/ads/", confidence: 0.8 },
-    PatternEntry { pattern: "/ad/", confidence: 0.7 },
-    PatternEntry { pattern: "/adserv", confidence: 0.85 },
-    PatternEntry { pattern: "/banner-ad", confidence: 0.7 },
-    PatternEntry { pattern: "popunder", confidence: 0.9 },
-    PatternEntry { pattern: "pop-up", confidence: 0.7 },
+    PatternEntry { pattern: "/ads/", confidence: 0.8, word_boundary: false },
+    PatternEntry { pattern: "/ad/", confidence: 0.7, word_boundary: false },
+    PatternEntry { pattern: "/adserv", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "/banner-ad", confidence: 0.7, word_boundary: false },
+    PatternEntry { pattern: "popunder", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "pop-up", confidence: 0.7, word_boundary: false },
 ];
 
 // ── Tracker patterns ──
 
 const TRACKER_PATTERNS: &[PatternEntry] = &[
-    PatternEntry { pattern: "analytics", confidence: 0.7 },
-    PatternEntry { pattern: "tracking", confidence: 0.8 },
-    PatternEntry { pattern: "tracker", confidence: 0.8 },
-    PatternEntry { pattern: "pixel", confidence: 0.75 },
-    PatternEntry { pattern: "beacon", confidence: 0.8 },
-    PatternEntry { pattern: "telemetry", confidence: 0.85 },
-    PatternEntry { pattern: "collect?", confidence: 0.75 },
-    PatternEntry { pattern: "utm_", confidence: 0.35 },  // Low: UTM links are often legitimate
-    PatternEntry { pattern: "fbclid", confidence: 0.7 },
-    PatternEntry { pattern: "gclid", confidence: 0.7 },
-    PatternEntry { pattern: "hotjar", confidence: 0.9 },
-    PatternEntry { pattern: "fullstory", confidence: 0.9 },
-    PatternEntry { pattern: "mouseflow", confidence: 0.9 },
-    PatternEntry { pattern: "segment.io", confidence: 0.85 },
-    PatternEntry { pattern: "mixpanel", confidence: 0.85 },
-    PatternEntry { pattern: "amplitude", confidence: 0.8 },
-    PatternEntry { pattern: "newrelic", confidence: 0.75 },
-    PatternEntry { pattern: "sentry.io", confidence: 0.5 },
+    PatternEntry { pattern: "analytics", confidence: 0.7, word_boundary: false },
+    PatternEntry { pattern: "tracking", confidence: 0.8, word_boundary: true },
+    PatternEntry { pattern: "tracker", confidence: 0.8, word_boundary: true },
+    PatternEntry { pattern: "pixel", confidence: 0.75, word_boundary: true },
+    PatternEntry { pattern: "beacon", confidence: 0.8, word_boundary: true },
+    PatternEntry { pattern: "telemetry", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "collect?", confidence: 0.75, word_boundary: false },
+    PatternEntry { pattern: "utm_", confidence: 0.35, word_boundary: false },  // Low: UTM links are often legitimate
+    PatternEntry { pattern: "fbclid", confidence: 0.7, word_boundary: false },
+    PatternEntry { pattern: "gclid", confidence: 0.7, word_boundary: false },
+    PatternEntry { pattern: "hotjar", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "fullstory", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "mouseflow", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "segment.io", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "mixpanel", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "amplitude", confidence: 0.8, word_boundary: false },
+    PatternEntry { pattern: "newrelic", confidence: 0.75, word_boundary: false },
+    PatternEntry { pattern: "sentry.io", confidence: 0.5, word_boundary: false },
 ];
 
 // ── Ad text patterns ──
 
 const AD_TEXT_PATTERNS: &[PatternEntry] = &[
-    PatternEntry { pattern: "advertisement", confidence: 0.9 },
-    PatternEntry { pattern: "sponsored content", confidence: 0.95 },
-    PatternEntry { pattern: "sponsored post", confidence: 0.9 },
-    PatternEntry { pattern: "promoted content", confidence: 0.7 },
-    PatternEntry { pattern: "ad choice", confidence: 0.9 },
-    PatternEntry { pattern: "adchoice", confidence: 0.9 },
-    PatternEntry { pattern: "paid partnership", confidence: 0.85 },
-    PatternEntry { pattern: "affiliate link", confidence: 0.75 },
+    PatternEntry { pattern: "advertisement", confidence: 0.9, word_boundary: true },
+    PatternEntry { pattern: "sponsored content", confidence: 0.95, word_boundary: false },
+    PatternEntry { pattern: "sponsored post", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "promoted content", confidence: 0.7, word_boundary: false },
+    PatternEntry { pattern: "ad choice", confidence: 0.9, word_boundary: true },
+    PatternEntry { pattern: "adchoice", confidence: 0.9, word_boundary: true },
+    PatternEntry { pattern: "paid partnership", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "affiliate link", confidence: 0.75, word_boundary: false },
 ];
 
 // ── Cookie consent / GDPR popup patterns ──
 
 const COOKIE_CONSENT_PATTERNS: &[PatternEntry] = &[
-    PatternEntry { pattern: "accept all cookies", confidence: 0.95 },
-    PatternEntry { pattern: "accept cookies", confidence: 0.9 },
-    PatternEntry { pattern: "cookie settings", confidence: 0.85 },
-    PatternEntry { pattern: "cookie preferences", confidence: 0.85 },
-    PatternEntry { pattern: "cookie policy", confidence: 0.8 },
-    PatternEntry { pattern: "cookie consent", confidence: 0.9 },
-    PatternEntry { pattern: "we use cookies", confidence: 0.9 },
-    PatternEntry { pattern: "this site uses cookies", confidence: 0.9 },
-    PatternEntry { pattern: "gdpr", confidence: 0.7 },
-    PatternEntry { pattern: "manage consent", confidence: 0.85 },
-    PatternEntry { pattern: "consent manager", confidence: 0.85 },
-    PatternEntry { pattern: "privacy preferences", confidence: 0.75 },
-    PatternEntry { pattern: "reject all", confidence: 0.7 },
-    PatternEntry { pattern: "accept all", confidence: 0.6 },
-    PatternEntry { pattern: "necessary cookies", confidence: 0.85 },
+    PatternEntry { pattern: "accept all cookies", confidence: 0.95, word_boundary: false },
+    PatternEntry { pattern: "accept cookies", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "cookie settings", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "cookie preferences", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "cookie policy", confidence: 0.8, word_boundary: false },
+    PatternEntry { pattern: "cookie consent", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "we use cookies", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "this site uses cookies", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "gdpr", confidence: 0.7, word_boundary: true },
+    PatternEntry { pattern: "manage consent", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "consent manager", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "privacy preferences", confidence: 0.75, word_boundary: false },
+    PatternEntry { pattern: "reject all cookies", confidence: 0.7, word_boundary: false },
+    PatternEntry { pattern: "accept all cookies", confidence: 0.6, word_boundary: false },
+    PatternEntry { pattern: "necessary cookies", confidence: 0.85, word_boundary: false },
 ];
 
 // ── Social media widget patterns ──
 
 const SOCIAL_WIDGET_PATTERNS: &[PatternEntry] = &[
-    PatternEntry { pattern: "share on facebook", confidence: 0.9 },
-    PatternEntry { pattern: "share on twitter", confidence: 0.9 },
-    PatternEntry { pattern: "share on linkedin", confidence: 0.9 },
-    PatternEntry { pattern: "share this", confidence: 0.75 },
-    PatternEntry { pattern: "follow us on", confidence: 0.8 },
-    PatternEntry { pattern: "follow us", confidence: 0.65 },
-    PatternEntry { pattern: "like us on", confidence: 0.8 },
-    PatternEntry { pattern: "tweet this", confidence: 0.85 },
-    PatternEntry { pattern: "pin it", confidence: 0.7 },
-    PatternEntry { pattern: "share via", confidence: 0.75 },
-    PatternEntry { pattern: "social share", confidence: 0.85 },
-    PatternEntry { pattern: "sharing buttons", confidence: 0.85 },
+    PatternEntry { pattern: "share on facebook", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "share on twitter", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "share on linkedin", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "share this", confidence: 0.75, word_boundary: false },
+    PatternEntry { pattern: "follow us on", confidence: 0.8, word_boundary: false },
+    PatternEntry { pattern: "follow us", confidence: 0.65, word_boundary: false },
+    PatternEntry { pattern: "like us on", confidence: 0.8, word_boundary: false },
+    PatternEntry { pattern: "tweet this", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "pin it", confidence: 0.7, word_boundary: true },
+    PatternEntry { pattern: "share via", confidence: 0.75, word_boundary: false },
+    PatternEntry { pattern: "social share", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "sharing buttons", confidence: 0.85, word_boundary: false },
 ];
 
 // ── Newsletter / popup patterns ──
 
 const NEWSLETTER_POPUP_PATTERNS: &[PatternEntry] = &[
-    PatternEntry { pattern: "subscribe to our newsletter", confidence: 0.9 },
-    PatternEntry { pattern: "sign up for our newsletter", confidence: 0.9 },
-    PatternEntry { pattern: "join our mailing list", confidence: 0.85 },
-    PatternEntry { pattern: "get updates in your inbox", confidence: 0.85 },
-    PatternEntry { pattern: "enter your email", confidence: 0.6 },
-    PatternEntry { pattern: "subscribe now", confidence: 0.7 },
-    PatternEntry { pattern: "don't miss out", confidence: 0.6 },
-    PatternEntry { pattern: "stay updated", confidence: 0.55 },
-    PatternEntry { pattern: "no thanks", confidence: 0.5 },
-    PatternEntry { pattern: "maybe later", confidence: 0.5 },
-    PatternEntry { pattern: "close this popup", confidence: 0.85 },
-    PatternEntry { pattern: "exit intent", confidence: 0.9 },
+    PatternEntry { pattern: "subscribe to our newsletter", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "sign up for our newsletter", confidence: 0.9, word_boundary: false },
+    PatternEntry { pattern: "join our mailing list", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "get updates in your inbox", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "enter your email", confidence: 0.6, word_boundary: false },
+    PatternEntry { pattern: "subscribe now", confidence: 0.7, word_boundary: false },
+    PatternEntry { pattern: "don't miss out", confidence: 0.6, word_boundary: false },
+    PatternEntry { pattern: "close this popup", confidence: 0.85, word_boundary: false },
+    PatternEntry { pattern: "exit intent", confidence: 0.9, word_boundary: false },
 ];
 
 #[cfg(test)]

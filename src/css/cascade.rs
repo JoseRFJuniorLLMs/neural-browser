@@ -245,7 +245,7 @@ fn style_node(
     }
 
     // Sort by specificity (lower specificity first, so higher ones override)
-    matched.sort_by(|a, b| a.0.cmp(&b.0));
+    matched.sort_by_key(|a| a.0);
 
     // Apply !important declarations after normal ones
     let (normal, important): (Vec<_>, Vec<_>) =
@@ -262,14 +262,21 @@ fn style_node(
         for decl in inline_normal {
             apply_declaration(&mut style, decl);
         }
+
+        // !important from stylesheets override normal inline but not inline !important
+        for (_, decl) in important {
+            apply_declaration(&mut style, decl);
+        }
+
+        // Inline !important wins over everything
         for decl in inline_important {
             apply_declaration(&mut style, decl);
         }
-    }
-
-    // !important from stylesheets override everything except inline !important
-    for (_, decl) in important {
-        apply_declaration(&mut style, decl);
+    } else {
+        // No inline styles — just apply !important from stylesheets
+        for (_, decl) in important {
+            apply_declaration(&mut style, decl);
+        }
     }
 
     // Recurse into children

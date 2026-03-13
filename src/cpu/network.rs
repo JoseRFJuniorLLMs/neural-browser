@@ -26,8 +26,10 @@ const TIMEOUT_GLOBAL: Duration = Duration::from_secs(45);
 pub struct NetworkEngine {
     agent: ureq::Agent,
     prefetch_cache: Mutex<HashMap<String, String>>,
+    prefetch_order: Mutex<Vec<String>>,
     /// Cache for fetched image bytes (URL -> raw bytes). Up to 50 entries.
     image_cache: Mutex<HashMap<String, Vec<u8>>>,
+    image_order: Mutex<Vec<String>>,
 }
 
 impl NetworkEngine {
@@ -51,7 +53,9 @@ impl NetworkEngine {
         Self {
             agent,
             prefetch_cache: Mutex::new(HashMap::new()),
+            prefetch_order: Mutex::new(Vec::new()),
             image_cache: Mutex::new(HashMap::new()),
+            image_order: Mutex::new(Vec::new()),
         }
     }
 
@@ -59,10 +63,23 @@ impl NetworkEngine {
     /// Checks prefetch cache first.
     /// On HTTP errors (4xx, 5xx) or network failures, returns error page HTML.
     pub fn fetch(&self, url: &str) -> Result<String> {
+        // SECURITY: Only allow http(s) schemes for browser-level fetch
+        if let Ok(parsed) = url::Url::parse(url) {
+            match parsed.scheme() {
+                "http" | "https" => {}
+                scheme => {
+                    warn!("[CPU:NET] Blocked scheme: {scheme}://");
+                    return Ok(generate_error_page(url, &format!("Blocked: {scheme}:// URLs are not supported")));
+                }
+            }
+        }
+
         // Check prefetch cache
         {
             let mut cache = self.prefetch_cache.lock();
             if let Some(html) = cache.remove(url) {
+                let mut order = self.prefetch_order.lock();
+                order.retain(|k| k != url);
                 info!("[CPU:NET] Cache hit for {url}");
                 return Ok(html);
             }
@@ -95,8 +112,8 @@ impl NetworkEngine {
             ));
         }
 
-        // Limit body size to prevent memory exhaustion from huge pages
-        let mut body = String::new();
+        // Accumulate raw bytes first, convert to UTF-8 once at the end
+        let mut raw_bytes: Vec<u8> = Vec::new();
         let mut binding = resp.into_body();
         let mut reader = binding.as_reader();
         let mut buf = [0u8; 8192];
@@ -104,28 +121,24 @@ impl NetworkEngine {
             match std::io::Read::read(&mut reader, &mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    // Validate UTF-8 and append
-                    match std::str::from_utf8(&buf[..n]) {
-                        Ok(chunk) => body.push_str(chunk),
-                        Err(_) => {
-                            // Lossy conversion for non-UTF-8 pages
-                            body.push_str(&String::from_utf8_lossy(&buf[..n]));
-                        }
-                    }
-                    if body.len() > MAX_BODY_SIZE {
+                    raw_bytes.extend_from_slice(&buf[..n]);
+                    if raw_bytes.len() > MAX_BODY_SIZE {
                         warn!("[CPU:NET] Body exceeds {} bytes, truncating", MAX_BODY_SIZE);
                         break;
                     }
                 }
                 Err(e) => {
-                    if body.is_empty() {
+                    if raw_bytes.is_empty() {
                         return Err(anyhow::anyhow!("Failed to read response body: {e}"));
                     }
-                    warn!("[CPU:NET] Body read error after {} bytes: {e}", body.len());
+                    warn!("[CPU:NET] Body read error after {} bytes: {e}", raw_bytes.len());
                     break;
                 }
             }
         }
+
+        let body = String::from_utf8(raw_bytes)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
 
         Ok(body)
     }
@@ -137,13 +150,16 @@ impl NetworkEngine {
     pub fn prefetch(&self, url: &str) -> Result<()> {
         let html = self.fetch(url)?;
         let mut cache = self.prefetch_cache.lock();
-        // Evict oldest entries if cache is full
+        // Evict oldest entries if cache is full (FIFO order)
         if cache.len() >= Self::MAX_PREFETCH_ENTRIES {
-            if let Some(first_key) = cache.keys().next().cloned() {
-                cache.remove(&first_key);
+            let mut order = self.prefetch_order.lock();
+            if let Some(oldest) = order.first().cloned() {
+                cache.remove(&oldest);
+                order.remove(0);
             }
         }
         cache.insert(url.to_string(), html);
+        self.prefetch_order.lock().push(url.to_string());
         Ok(())
     }
 
@@ -183,9 +199,10 @@ impl NetworkEngine {
         let mut binding = resp.into_body();
         let mut reader = binding.as_reader();
         let mut buf = [0u8; 8192];
+        let mut read_ok = false;
         loop {
             match std::io::Read::read(&mut reader, &mut buf) {
-                Ok(0) => break,
+                Ok(0) => { read_ok = true; break; }
                 Ok(n) => {
                     bytes.extend_from_slice(&buf[..n]);
                     if bytes.len() > Self::MAX_IMAGE_SIZE {
@@ -203,16 +220,19 @@ impl NetworkEngine {
             }
         }
 
-        // Cache the result
-        {
+        // Only cache when read completed successfully (no partial images)
+        if read_ok {
             let mut cache = self.image_cache.lock();
             if cache.len() >= Self::MAX_IMAGE_CACHE_ENTRIES {
-                // Evict oldest entry
-                if let Some(first_key) = cache.keys().next().cloned() {
-                    cache.remove(&first_key);
+                // Evict oldest entry (FIFO order)
+                let mut order = self.image_order.lock();
+                if let Some(oldest) = order.first().cloned() {
+                    cache.remove(&oldest);
+                    order.remove(0);
                 }
             }
             cache.insert(url.to_string(), bytes.clone());
+            self.image_order.lock().push(url.to_string());
         }
 
         Ok(bytes)
@@ -226,7 +246,7 @@ fn friendly_error_message(e: &ureq::Error) -> String {
             "Connection timed out. The server took too long to respond.".into()
         }
         ureq::Error::HostNotFound => {
-            format!("Could not find the server. Check the URL and your internet connection.")
+            "Could not find the server. Check the URL and your internet connection.".to_string()
         }
         ureq::Error::ConnectionFailed => {
             "Connection failed. The server may be down or unreachable.".into()

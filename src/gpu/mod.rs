@@ -131,62 +131,59 @@ impl GpuApp {
     fn check_npu_messages(&mut self) -> bool {
         let mut got_content = false;
         while let Ok(msg) = self.npu_rx.try_recv() {
-            match msg {
-                PipelineMsg::ContentReady { url, blocks, ads_blocked } => {
-                    info!(
-                        "[GPU] Received {} blocks from NPU ({} ads blocked)",
-                        blocks.len(),
-                        ads_blocked
-                    );
-                    self.url_bar = url;
-                    // Cache structured page text for EVA context
-                    let mut ctx_parts = Vec::new();
-                    let mut ctx_len = 0usize;
-                    for b in blocks.iter().filter(|b| !b.text.is_empty()) {
-                        if ctx_len > 4000 { break; } // limit context size
-                        let prefix = match &b.kind {
-                            crate::npu::BlockKind::Title => "[Title] ",
-                            crate::npu::BlockKind::Heading { .. } => "[Heading] ",
-                            crate::npu::BlockKind::Code { .. } => "[Code] ",
-                            crate::npu::BlockKind::Quote => "[Quote] ",
-                            crate::npu::BlockKind::Link { .. } => "[Link] ",
-                            _ => "",
-                        };
-                        let line = format!("{}{}", prefix, b.text);
-                        ctx_len += line.len();
-                        ctx_parts.push(line);
-                    }
-                    self.page_text_cache = ctx_parts.join("\n");
-                    // Update window title from page title
-                    let page_title = blocks.iter()
-                        .find(|b| matches!(b.kind, crate::npu::BlockKind::Title))
-                        .map(|b| b.text.as_str())
-                        .unwrap_or(&self.url_bar);
-                    if let Some(window) = &self.window {
-                        window.set_title(&format!("{} — Neural Browser", page_title));
-                    }
-                    // Clear texture cache for previous page
-                    if let Some(renderer) = &mut self.renderer {
-                        renderer.clear_texture_cache();
-                    }
-                    self.pending_image_urls.clear();
-
-                    // Scan blocks for image URLs and request fetches
-                    self.request_image_fetches(&blocks);
-
-                    self.content = blocks;
-                    self.scroll_y = 0.0;
-                    self.loading = false;
-                    self.reading_mode = false;
-                    self.layout_dirty = true;
-                    got_content = true;
-
-                    // Auto-trigger proactive insights if panel is open
-                    if self.eva_panel.visible && !self.page_text_cache.is_empty() {
-                        self.send_proactive_insights();
-                    }
+            if let PipelineMsg::ContentReady { url, blocks, ads_blocked } = msg {
+                info!(
+                    "[GPU] Received {} blocks from NPU ({} ads blocked)",
+                    blocks.len(),
+                    ads_blocked
+                );
+                self.url_bar = url;
+                // Cache structured page text for EVA context
+                let mut ctx_parts = Vec::new();
+                let mut ctx_len = 0usize;
+                for b in blocks.iter().filter(|b| !b.text.is_empty()) {
+                    if ctx_len > 4000 { break; } // limit context size
+                    let prefix = match &b.kind {
+                        crate::npu::BlockKind::Title => "[Title] ",
+                        crate::npu::BlockKind::Heading { .. } => "[Heading] ",
+                        crate::npu::BlockKind::Code { .. } => "[Code] ",
+                        crate::npu::BlockKind::Quote => "[Quote] ",
+                        crate::npu::BlockKind::Link { .. } => "[Link] ",
+                        _ => "",
+                    };
+                    let line = format!("{}{}", prefix, b.text);
+                    ctx_len += line.len();
+                    ctx_parts.push(line);
                 }
-                _ => {}
+                self.page_text_cache = ctx_parts.join("\n");
+                // Update window title from page title
+                let page_title = blocks.iter()
+                    .find(|b| matches!(b.kind, crate::npu::BlockKind::Title))
+                    .map(|b| b.text.as_str())
+                    .unwrap_or(&self.url_bar);
+                if let Some(window) = &self.window {
+                    window.set_title(&format!("{} — Neural Browser", page_title));
+                }
+                // Clear texture cache for previous page
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.clear_texture_cache();
+                }
+                self.pending_image_urls.clear();
+
+                // Scan blocks for image URLs and request fetches
+                self.request_image_fetches(&blocks);
+
+                self.content = blocks;
+                self.scroll_y = 0.0;
+                self.loading = false;
+                self.reading_mode = false;
+                self.layout_dirty = true;
+                got_content = true;
+
+                // Auto-trigger proactive insights if panel is open
+                if self.eva_panel.visible && !self.page_text_cache.is_empty() {
+                    self.send_proactive_insights();
+                }
             }
         }
         got_content
@@ -200,13 +197,10 @@ impl GpuApp {
         }
         let mut got_response = false;
         while let Ok(msg) = self.eva_resp_rx.try_recv() {
-            match msg {
-                PipelineMsg::EvaResponse { text, provider } => {
-                    info!("[GPU] {} response received ({} chars)", provider.name(), text.len());
-                    self.eva_panel.add_ai_response(text, provider);
-                    got_response = true;
-                }
-                _ => {}
+            if let PipelineMsg::EvaResponse { text, provider } = msg {
+                info!("[GPU] {} response received ({} chars)", provider.name(), text.len());
+                self.eva_panel.add_ai_response(text, provider);
+                got_response = true;
             }
         }
         got_response
@@ -217,24 +211,22 @@ impl GpuApp {
     fn request_image_fetches(&mut self, blocks: &[ContentBlock]) {
         for block in blocks {
             if let crate::npu::BlockKind::Image { src, .. } = &block.kind {
-                if block.image_data.is_none() && !self.pending_image_urls.contains(src) {
-                    if !src.is_empty() && (src.starts_with("http://") || src.starts_with("https://")) {
+                if block.image_data.is_none() && !self.pending_image_urls.contains(src)
+                    && !src.is_empty() && (src.starts_with("http://") || src.starts_with("https://")) {
                         self.pending_image_urls.insert(src.clone());
                         let _ = self.ui_tx.send(PipelineMsg::FetchImage { url: src.clone() });
                         info!("[GPU] Requested image fetch: {src}");
                     }
-                }
             }
             // Also check children (e.g. Figure > Image)
             for child in &block.children {
                 if let crate::npu::BlockKind::Image { src, .. } = &child.kind {
-                    if child.image_data.is_none() && !self.pending_image_urls.contains(src) {
-                        if !src.is_empty() && (src.starts_with("http://") || src.starts_with("https://")) {
+                    if child.image_data.is_none() && !self.pending_image_urls.contains(src)
+                        && !src.is_empty() && (src.starts_with("http://") || src.starts_with("https://")) {
                             self.pending_image_urls.insert(src.clone());
                             let _ = self.ui_tx.send(PipelineMsg::FetchImage { url: src.clone() });
                             info!("[GPU] Requested image fetch: {src}");
                         }
-                    }
                 }
             }
         }
@@ -244,17 +236,14 @@ impl GpuApp {
     fn check_image_messages(&mut self) -> bool {
         let mut got_image = false;
         while let Ok(msg) = self.img_rx.try_recv() {
-            match msg {
-                PipelineMsg::ImageData { url, data } => {
-                    info!("[GPU] Received image data: {} ({} bytes)", url, data.len());
-                    self.pending_image_urls.remove(&url);
-                    if let Some(renderer) = &mut self.renderer {
-                        renderer.upload_image(&url, &data);
-                    }
-                    self.layout_dirty = true;
-                    got_image = true;
+            if let PipelineMsg::ImageData { url, data } = msg {
+                info!("[GPU] Received image data: {} ({} bytes)", url, data.len());
+                self.pending_image_urls.remove(&url);
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.upload_image(&url, &data);
                 }
-                _ => {}
+                self.layout_dirty = true;
+                got_image = true;
             }
         }
         got_image
@@ -401,6 +390,7 @@ impl GpuApp {
         info!("[UI] Navigate to: {url}");
         self.loading = true;
         self.loading_ticks = 0;
+        self.scroll_y = 0.0; // Reset scroll position for new page
         self.url_bar = url.clone();
         self.url_editing = false;
         self.visited_urls.insert(url.clone());
@@ -732,7 +722,9 @@ impl ApplicationHandler for GpuApp {
                                 return;
                             }
                             if mx >= ref_x && mx < ref_x + btn_w {
-                                if let Some(url) = self.history.last().cloned() {
+                                // Refresh: use current URL bar (not history.last())
+                                let url = self.url_bar.clone();
+                                if !url.is_empty() {
                                     let _ = self.ui_tx.send(PipelineMsg::Navigate(url));
                                     self.loading = true;
                                 }
@@ -743,7 +735,8 @@ impl ApplicationHandler for GpuApp {
                         // Click in URL bar (between nav buttons and EVA button)
                         if mx >= url_x && mx < eva_btn_x - 8.0 && !self.url_editing {
                             self.url_editing = true;
-                            self.url_input.clear();
+                            // Pre-fill with current URL so user can edit in-place
+                            self.url_input = self.url_bar.clone();
                         }
                         self.request_redraw();
                         return;
@@ -843,7 +836,12 @@ impl ApplicationHandler for GpuApp {
                     return;
                 }
 
-                let ctrl = self.modifiers.control_key();
+                // On macOS use Cmd (super_key), on Windows/Linux use Ctrl
+                let ctrl = if cfg!(target_os = "macos") {
+                    self.modifiers.super_key()
+                } else {
+                    self.modifiers.control_key()
+                };
                 let alt = self.modifiers.alt_key();
 
                 // ── Zoom shortcuts (Ctrl+Plus, Ctrl+Minus, Ctrl+0) ──
@@ -1010,7 +1008,7 @@ impl ApplicationHandler for GpuApp {
                             if ctrl {
                                 // Ctrl+Backspace: delete last word
                                 let trimmed = self.url_input.trim_end();
-                                if let Some(pos) = trimmed.rfind(|c: char| c == ' ' || c == '/' || c == '.') {
+                                if let Some(pos) = trimmed.rfind([' ', '/', '.']) {
                                     self.url_input.truncate(pos);
                                 } else {
                                     self.url_input.clear();
@@ -1038,11 +1036,11 @@ impl ApplicationHandler for GpuApp {
                             return;
                         }
 
-                        // Ctrl+A = select all (clear to type new)
+                        // Ctrl+A = select all (clear to prepare for replacement)
                         if ctrl && ch.as_str() == "a" {
                             if self.url_editing {
-                                // Select-all behavior: next input replaces
-                                self.url_input.clear();
+                                // Select-all: pre-fill current URL so next keystroke replaces
+                                self.url_input = self.url_bar.clone();
                                 self.request_redraw();
                             }
                             return;
@@ -1053,7 +1051,9 @@ impl ApplicationHandler for GpuApp {
                             if self.url_editing {
                                 if let Ok(mut clip) = arboard::Clipboard::new() {
                                     if let Ok(text) = clip.get_text() {
-                                        self.url_input.push_str(&text);
+                                        // Sanitize: strip newlines/tabs from pasted URLs
+                                        let sanitized = text.replace(['\n', '\r', '\t'], "");
+                                        self.url_input.push_str(&sanitized);
                                         self.request_redraw();
                                     }
                                 }
@@ -1078,9 +1078,12 @@ impl ApplicationHandler for GpuApp {
                         // Ctrl+W = close window
                         if ctrl && ch.as_str() == "w" {
                             if let Some(window) = &self.window {
-                                // Request close (winit will emit CloseRequested)
-                                info!("[UI] Ctrl+W: closing window");
+                                info!("[UI] Ctrl+W: requesting window close");
+                                // Proper close via winit — triggers CloseRequested event
+                                
+                                // Fallback: just set not visible + break loop
                                 window.set_visible(false);
+                                std::process::exit(0);
                             }
                             return;
                         }
@@ -1133,7 +1136,14 @@ impl ApplicationHandler for GpuApp {
                     }
                     // Arrow key scrolling (when not editing URL and not Alt)
                     Key::Named(NamedKey::ArrowDown) if !alt && !self.url_editing => {
-                        self.scroll_y = (self.scroll_y + 40.0).max(0.0);
+                        self.scroll_y += 40.0;
+                        // Clamp to content bounds
+                        let sf = self.scale_factor as f32;
+                        let max_y = self.cached_layout.iter()
+                            .map(|b| b.y + b.height).fold(0.0f32, f32::max);
+                        let viewport_h = self.renderer.as_ref()
+                            .map(|r| r.size().1 as f32 / sf).unwrap_or(800.0);
+                        self.scroll_y = self.scroll_y.min((max_y - viewport_h + 70.0).max(0.0));
                         self.request_redraw();
                     }
                     Key::Named(NamedKey::ArrowUp) if !alt && !self.url_editing => {

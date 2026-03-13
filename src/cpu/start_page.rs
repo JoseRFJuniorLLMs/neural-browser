@@ -9,6 +9,55 @@ pub fn start_page_html() -> &'static str {
 <html>
 <head>
     <title>Neural Browser</title>
+    <style>
+    body {
+        font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+        background: #1a1a2e;
+        color: #e0e0e0;
+        margin: 0;
+        padding: 0;
+    }
+    main {
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 40px 20px;
+    }
+    h1 {
+        color: #64ffda;
+        border-bottom: 2px solid #333;
+        padding-bottom: 10px;
+    }
+    h2 {
+        color: #82b1ff;
+        margin-top: 30px;
+    }
+    a {
+        color: #64ffda;
+        text-decoration: none;
+    }
+    a:hover {
+        text-decoration: underline;
+    }
+    ul, ol {
+        padding-left: 20px;
+    }
+    li {
+        padding: 6px 0;
+        border-bottom: 1px solid #2a2a3e;
+    }
+    strong {
+        color: #82b1ff;
+    }
+    p {
+        line-height: 1.6;
+    }
+    code {
+        background: #16213e;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 0.9em;
+    }
+    </style>
 </head>
 <body>
 <main>

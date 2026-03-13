@@ -93,7 +93,7 @@ impl WgpuRenderer {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::DX12 | wgpu::Backends::VULKAN,
+            backends: wgpu::Backends::PRIMARY, // DX12 + Vulkan + Metal (cross-platform)
             ..Default::default()
         });
 
@@ -350,15 +350,46 @@ impl WgpuRenderer {
     }
 
     /// Create a wgpu texture and bind group from decoded RGBA pixel data.
+    /// Automatically downscales images that exceed GPU texture dimension limits.
     fn create_image_texture(
         &self,
         width: u32,
         height: u32,
         rgba: &[u8],
     ) -> (wgpu::Texture, wgpu::BindGroup) {
+        let max_dim = self.device.limits().max_texture_dimension_2d;
+        let (final_w, final_h, final_rgba);
+        if width > max_dim || height > max_dim {
+            // Downscale to fit within GPU limits
+            let scale = (max_dim as f32 / width as f32).min(max_dim as f32 / height as f32);
+            let nw = ((width as f32 * scale) as u32).max(1);
+            let nh = ((height as f32 * scale) as u32).max(1);
+            log::warn!("[GPU] Image {}x{} exceeds max texture dim {max_dim}, downscaling to {nw}x{nh}", width, height);
+            // Simple nearest-neighbor downscale
+            let mut buf = vec![0u8; (nw * nh * 4) as usize];
+            for y in 0..nh {
+                for x in 0..nw {
+                    let sx = (x as f32 / nw as f32 * width as f32) as u32;
+                    let sy = (y as f32 / nh as f32 * height as f32) as u32;
+                    let si = ((sy * width + sx) * 4) as usize;
+                    let di = ((y * nw + x) * 4) as usize;
+                    if si + 3 < rgba.len() && di + 3 < buf.len() {
+                        buf[di..di+4].copy_from_slice(&rgba[si..si+4]);
+                    }
+                }
+            }
+            final_w = nw;
+            final_h = nh;
+            final_rgba = buf;
+        } else {
+            final_w = width;
+            final_h = height;
+            final_rgba = rgba.to_vec();
+        }
+
         let texture_size = wgpu::Extent3d {
-            width,
-            height,
+            width: final_w,
+            height: final_h,
             depth_or_array_layers: 1,
         };
 
@@ -380,11 +411,11 @@ impl WgpuRenderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            rgba,
+            &final_rgba,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * width),
-                rows_per_image: Some(height),
+                bytes_per_row: Some(4 * final_w),
+                rows_per_image: Some(final_h),
             },
             texture_size,
         );
@@ -520,6 +551,35 @@ impl WgpuRenderer {
     }
 
     pub fn render(&mut self, layout: &[LayoutBox], ctx: &RenderContext<'_>) -> Result<()> {
+        self.render_internal(layout, ctx, None)
+    }
+
+    /// Render with EVA panel overlay.
+    /// Calls the normal render pipeline when panel is hidden,
+    /// or renders page content clipped to the left + EVA panel on the right.
+    pub fn render_with_eva(
+        &mut self,
+        layout: &[LayoutBox],
+        ctx: &RenderContext<'_>,
+        eva_panel: &EvaPanel,
+    ) -> Result<()> {
+        if !eva_panel.visible {
+            return self.render(layout, ctx);
+        }
+        self.render_internal(layout, ctx, Some(eva_panel))
+    }
+
+    /// Core rendering logic shared by `render()` and `render_with_eva()`.
+    ///
+    /// When `eva_panel` is `Some`, content is clipped to the left of the EVA
+    /// panel and the panel UI (header, messages, input) is drawn on the right.
+    /// When `None`, the full viewport width is used.
+    fn render_internal(
+        &mut self,
+        layout: &[LayoutBox],
+        ctx: &RenderContext<'_>,
+        eva_panel: Option<&EvaPanel>,
+    ) -> Result<()> {
         let (w, h) = self.size;
         if w == 0 || h == 0 {
             return Ok(());
@@ -534,14 +594,24 @@ impl WgpuRenderer {
             },
         );
 
-        // ── Build text buffers from layout ──
-        let mut buffers: Vec<(GlyphonBuffer, f32, f32, TextBounds, GlyphonColor)> = Vec::new();
-        let mut rect_vertices: Vec<RectVertex> = Vec::new();
-
         let wf = w as f32;
         let hf = h as f32;
         let tb = TOOLBAR_HEIGHT;
         let sb = STATUS_BAR_HEIGHT;
+
+        // When EVA panel is visible, compute panel geometry and content clip edge.
+        // Otherwise content extends to the full window width.
+        let (panel_width, panel_x, content_right) = if let Some(_panel) = eva_panel {
+            let pw: f32 = (350.0_f32).min(wf * 0.4);
+            let px = (wf - pw).max(0.0);
+            (pw, px, px)
+        } else {
+            (0.0, wf, wf)
+        };
+
+        // ── Build text buffers from layout ──
+        let mut buffers: Vec<(GlyphonBuffer, f32, f32, TextBounds, GlyphonColor)> = Vec::new();
+        let mut rect_vertices: Vec<RectVertex> = Vec::new();
 
         // ── Chrome-style toolbar ──
         rect_vertices.extend_from_slice(&self.build_rect(0.0, 0.0, wf, tb, ctx.theme.toolbar_bg));
@@ -576,8 +646,13 @@ impl WgpuRenderer {
 
         // EVA button (right side of toolbar)
         let eva_btn_w: f32 = 52.0;
-        let eva_btn_x = wf - eva_btn_w - 8.0;
-        let eva_bg = if ctx.eva_visible {
+        let eva_btn_x = if eva_panel.is_some() {
+            // When panel visible, place button just left of panel edge
+            (panel_x - eva_btn_w - 8.0).max(0.0)
+        } else {
+            wf - eva_btn_w - 8.0
+        };
+        let eva_bg = if eva_panel.is_some() || ctx.eva_visible {
             [0.25, 0.65, 0.55, 1.0] // green-teal when active
         } else {
             ctx.theme.button_bg
@@ -586,11 +661,11 @@ impl WgpuRenderer {
 
         let mut eva_btn_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(13.0, 18.0));
         eva_btn_buf.set_size(&mut self.font_system, Some(eva_btn_w), Some(btn_h));
-        let eva_label = if ctx.eva_visible { "EVA \u{2715}" } else { "\u{2726} EVA" };
+        let eva_label = if eva_panel.is_some() || ctx.eva_visible { "EVA \u{2715}" } else { "\u{2726} EVA" };
         eva_btn_buf.set_text(&mut self.font_system, eva_label,
             Attrs::new().family(Family::SansSerif).weight(Weight::BOLD), Shaping::Advanced);
         eva_btn_buf.shape_until_scroll(&mut self.font_system, false);
-        let eva_text_color = if ctx.eva_visible {
+        let eva_text_color = if eva_panel.is_some() || ctx.eva_visible {
             GlyphonColor::rgb(255, 255, 255)
         } else {
             let tc = ctx.theme.button_text;
@@ -603,7 +678,8 @@ impl WgpuRenderer {
 
         // URL bar background (between nav buttons and EVA button)
         let url_x = ref_x + btn_w + btn_gap + 8.0;
-        let url_w = eva_btn_x - url_x - 8.0;
+        let url_w_raw = eva_btn_x - url_x - 8.0;
+        let url_w = if eva_panel.is_some() { url_w_raw.max(50.0) } else { url_w_raw };
         let url_bg = if ctx.url_editing {
             [ctx.theme.url_bar_bg[0]+0.04, ctx.theme.url_bar_bg[1]+0.04, ctx.theme.url_bar_bg[2]+0.04, 1.0]
         } else { ctx.theme.url_bar_bg };
@@ -644,7 +720,7 @@ impl WgpuRenderer {
         // Loading indicator
         if ctx.loading {
             let mut load_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(14.0, 18.0));
-            load_buf.set_size(&mut self.font_system, Some(wf - 40.0), Some(30.0));
+            load_buf.set_size(&mut self.font_system, Some(content_right - 40.0), Some(30.0));
             let dots = match (ctx.loading_ticks / 15) % 4 {
                 0 => "Loading", 1 => "Loading.", 2 => "Loading..", _ => "Loading...",
             };
@@ -653,18 +729,15 @@ impl WgpuRenderer {
             load_buf.shape_until_scroll(&mut self.font_system, false);
             let lc = ctx.theme.loading;
             buffers.push((
-                load_buf, (wf / 2.0) - 40.0, (hf / 2.0) - 10.0,
-                TextBounds { left: 0, top: tb as i32, right: w as i32, bottom: h as i32 - sb as i32 },
+                load_buf, (content_right / 2.0) - 40.0, (hf / 2.0) - 10.0,
+                TextBounds { left: 0, top: tb as i32, right: content_right as i32, bottom: h as i32 - sb as i32 },
                 GlyphonColor::rgb((lc[0]*255.0) as u8, (lc[1]*255.0) as u8, (lc[2]*255.0) as u8),
             ));
         }
 
-        // Status bar background
-        rect_vertices.extend_from_slice(&self.build_rect(0.0, hf - sb, wf, sb, ctx.theme.toolbar_bg));
-
         // Status bar text
         let mut status_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(11.0, 14.0));
-        status_buf.set_size(&mut self.font_system, Some(wf), Some(sb));
+        status_buf.set_size(&mut self.font_system, Some(wf), Some(if eva_panel.is_some() { 20.0 } else { sb }));
         let n_blocks = layout.len();
 
         // Show hovered link URL in status bar, or default status
@@ -675,6 +748,8 @@ impl WgpuRenderer {
         };
         let status_text = if let Some(href) = ctx.hovered_href {
             format!("  {href}{zoom_info}")
+        } else if eva_panel.is_some() {
+            format!("  CPU+NPU+GPU | EVA: Ctrl+E | {n_blocks} elements{zoom_info}")
         } else {
             format!(
                 "  CPU: net+parse | NPU: content AI | GPU: render | {n_blocks} elements{zoom_info}"
@@ -702,9 +777,23 @@ impl WgpuRenderer {
             GlyphonColor::rgb(90, 90, 110),
         ));
 
+        // Content background rects (code blocks, quotes, etc.)
+        let mut content_bg_rects: Vec<[f32; 6]> = Vec::new();
+
         // Content layout boxes -> text buffers
         for lbox in layout {
             match &lbox.kind {
+                LayoutKind::Background { color } => {
+                    let top = lbox.y;
+                    let bottom = lbox.y + lbox.height;
+                    // Skip backgrounds outside visible area
+                    if bottom < TOOLBAR_HEIGHT || top > hf - STATUS_BAR_HEIGHT {
+                        continue;
+                    }
+                    content_bg_rects.extend_from_slice(&self.build_rect(
+                        lbox.x, lbox.y, lbox.width, lbox.height, *color,
+                    ));
+                }
                 LayoutKind::Text {
                     text,
                     font_size,
@@ -721,6 +810,15 @@ impl WgpuRenderer {
                         continue;
                     }
 
+                    // Clip width to content area (matters when EVA panel is visible)
+                    let effective_w = if eva_panel.is_some() {
+                        let ew = lbox.width.min(content_right - lbox.x);
+                        if ew <= 0.0 { continue; }
+                        ew
+                    } else {
+                        lbox.width
+                    };
+
                     let line_h = font_size * 1.5;
                     let mut buf = GlyphonBuffer::new(
                         &mut self.font_system,
@@ -728,7 +826,7 @@ impl WgpuRenderer {
                     );
                     buf.set_size(
                         &mut self.font_system,
-                        Some(lbox.width),
+                        Some(effective_w),
                         Some(lbox.height.max(line_h * 2.0)),
                     );
 
@@ -760,14 +858,15 @@ impl WgpuRenderer {
                         TextBounds {
                             left: lbox.x as i32,
                             top: top.max(TOOLBAR_HEIGHT as i32),
-                            right: (lbox.x + lbox.width) as i32,
+                            right: if eva_panel.is_some() { content_right as i32 } else { (lbox.x + lbox.width) as i32 },
                             bottom: bottom.min(h as i32 - STATUS_BAR_HEIGHT as i32),
                         },
                         GlyphonColor::rgb(r, g, b),
                     ));
 
-                    // Link underline: render a thin line of underscores below the text
-                    if is_link {
+                    // Link underline: render a thin line below the text
+                    // (only in non-EVA mode to match original behavior)
+                    if is_link && eva_panel.is_none() {
                         let underline_y = lbox.y + lbox.height - 2.0;
                         let mut ul_buf = GlyphonBuffer::new(
                             &mut self.font_system,
@@ -818,13 +917,21 @@ impl WgpuRenderer {
                         continue;
                     }
 
+                    let effective_w = if eva_panel.is_some() {
+                        let ew = lbox.width.min(content_right - lbox.x);
+                        if ew <= 0.0 { continue; }
+                        ew
+                    } else {
+                        lbox.width
+                    };
+
                     let mut buf = GlyphonBuffer::new(
                         &mut self.font_system,
                         Metrics::new(13.0, 19.0),
                     );
                     buf.set_size(
                         &mut self.font_system,
-                        Some(lbox.width),
+                        Some(effective_w),
                         Some(lbox.height.max(40.0)),
                     );
                     buf.set_text(
@@ -844,55 +951,57 @@ impl WgpuRenderer {
                         TextBounds {
                             left: lbox.x as i32,
                             top: top.max(TOOLBAR_HEIGHT as i32),
-                            right: (lbox.x + lbox.width) as i32,
+                            right: if eva_panel.is_some() { content_right as i32 } else { (lbox.x + lbox.width) as i32 },
                             bottom: bottom.min(h as i32 - STATUS_BAR_HEIGHT as i32),
                         },
                         GlyphonColor::rgb(200, 220, 170),
                     ));
                 }
                 LayoutKind::Image { src, alt } => {
-                    // Check if we have a cached texture for this URL
-                    if self.texture_cache.contains_key(src) {
-                        // Will be rendered in the image pass below
-                    } else {
-                        // Show text placeholder
-                        let label = if alt.is_empty() {
-                            "[image]".to_string()
-                        } else {
-                            format!("[img: {alt}]")
-                        };
-                        let top = lbox.y as i32;
-                        if top > h as i32 || (top + 30) < 0 {
-                            continue;
+                    // Only show image placeholders in non-EVA mode
+                    // (EVA mode skips Image placeholders, matching original behavior)
+                    if eva_panel.is_none() {
+                        // Check if we have a cached texture for this URL
+                        if !self.texture_cache.contains_key(src) {
+                            // Show text placeholder
+                            let label = if alt.is_empty() {
+                                "[image]".to_string()
+                            } else {
+                                format!("[img: {alt}]")
+                            };
+                            let top = lbox.y as i32;
+                            if top > h as i32 || (top + 30) < 0 {
+                                continue;
+                            }
+
+                            let mut buf = GlyphonBuffer::new(
+                                &mut self.font_system,
+                                Metrics::new(13.0, 18.0),
+                            );
+                            buf.set_size(&mut self.font_system, Some(lbox.width), Some(30.0));
+                            buf.set_text(
+                                &mut self.font_system,
+                                &label,
+                                Attrs::new()
+                                    .family(Family::SansSerif)
+                                    .weight(Weight::NORMAL),
+                                Shaping::Advanced,
+                            );
+                            buf.shape_until_scroll(&mut self.font_system, false);
+
+                            buffers.push((
+                                buf,
+                                lbox.x,
+                                lbox.y,
+                                TextBounds {
+                                    left: lbox.x as i32,
+                                    top: top.max(TOOLBAR_HEIGHT as i32),
+                                    right: (lbox.x + lbox.width) as i32,
+                                    bottom: (top + 30).min(h as i32 - STATUS_BAR_HEIGHT as i32),
+                                },
+                                GlyphonColor::rgb(120, 120, 140),
+                            ));
                         }
-
-                        let mut buf = GlyphonBuffer::new(
-                            &mut self.font_system,
-                            Metrics::new(13.0, 18.0),
-                        );
-                        buf.set_size(&mut self.font_system, Some(lbox.width), Some(30.0));
-                        buf.set_text(
-                            &mut self.font_system,
-                            &label,
-                            Attrs::new()
-                                .family(Family::SansSerif)
-                                .weight(Weight::NORMAL),
-                            Shaping::Advanced,
-                        );
-                        buf.shape_until_scroll(&mut self.font_system, false);
-
-                        buffers.push((
-                            buf,
-                            lbox.x,
-                            lbox.y,
-                            TextBounds {
-                                left: lbox.x as i32,
-                                top: top.max(TOOLBAR_HEIGHT as i32),
-                                right: (lbox.x + lbox.width) as i32,
-                                bottom: (top + 30).min(h as i32 - STATUS_BAR_HEIGHT as i32),
-                            },
-                            GlyphonColor::rgb(120, 120, 140),
-                        ));
                     }
                 }
                 LayoutKind::DecodedImage { .. } => {
@@ -900,6 +1009,11 @@ impl WgpuRenderer {
                 }
                 _ => {}
             }
+        }
+
+        // ── EVA panel UI (only when panel is visible) ──
+        if let Some(panel) = eva_panel {
+            self.build_eva_panel_ui(panel, panel_x, panel_width, w, h, &mut buffers);
         }
 
         // ── Build TextArea refs ──
@@ -935,18 +1049,20 @@ impl WgpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        let label = if eva_panel.is_some() { "render_encoder_eva" } else { "render_encoder" };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("render_encoder"),
+                label: Some(label),
             });
 
         let bg = ctx.theme.bg;
 
-        // ── Pass 1: Clear + render rectangles (toolbar, buttons, URL bar) ──
+        // ── Pass 1: Clear + render rectangles (toolbar, buttons, URL bar, panels) ──
         {
+            let rect_label = if eva_panel.is_some() { "rect_pass_eva" } else { "clear_and_rects" };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear_and_rects"),
+                label: Some(rect_label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -962,22 +1078,42 @@ impl WgpuRenderer {
                 occlusion_query_set: None,
             });
 
-            if !rect_vertices.is_empty() {
+            // In EVA mode, add panel background and status bar to rect list.
+            // In non-EVA mode, status bar was already added inline above.
+            let final_rects = if eva_panel.is_some() {
+                let panel_bg = [0.10, 0.10, 0.18, 1.0_f32];
+                let panel_rect_verts = self.build_rect(panel_x, 0.0, panel_width, hf, panel_bg);
+                let mut all = rect_vertices.clone();
+                // Content backgrounds (code blocks, quotes) rendered behind text
+                all.extend_from_slice(&content_bg_rects);
+                all.extend_from_slice(&panel_rect_verts);
+                all.extend_from_slice(&self.build_rect(0.0, hf - sb, wf, sb, ctx.theme.toolbar_bg));
+                all
+            } else {
+                // Content backgrounds (code blocks, quotes) rendered behind text
+                rect_vertices.extend_from_slice(&content_bg_rects);
+                // Status bar background (non-EVA mode)
+                rect_vertices.extend_from_slice(&self.build_rect(0.0, hf - sb, wf, sb, ctx.theme.toolbar_bg));
+                rect_vertices
+            };
+
+            if !final_rects.is_empty() {
                 let rect_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("rect_vertex_buffer"),
-                    contents: bytemuck::cast_slice(&rect_vertices),
+                    contents: bytemuck::cast_slice(&final_rects),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
                 pass.set_pipeline(&self.rect_pipeline);
                 pass.set_vertex_buffer(0, rect_buffer.slice(..));
-                pass.draw(0..rect_vertices.len() as u32, 0..1);
+                pass.draw(0..final_rects.len() as u32, 0..1);
             }
         }
 
         // ── Pass 2: Render text (glyphon) on top of rects ──
         {
+            let text_label = if eva_panel.is_some() { "text_pass_eva" } else { "text_pass" };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("text_pass"),
+                label: Some(text_label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -997,11 +1133,7 @@ impl WgpuRenderer {
         }
 
         // ── Pass 3: Render images as textured quads ──
-        // Includes both DecodedImage blocks (NPU-decoded) and Image blocks with cached textures.
-
-        // First, collect decoded images (creates new textures per-frame)
         let mut decoded_renders: Vec<(wgpu::Buffer, wgpu::BindGroup, wgpu::Texture)> = Vec::new();
-        // Second, collect cached image URLs and their vertex buffers
         let mut cached_renders: Vec<(wgpu::Buffer, String)> = Vec::new();
 
         for lbox in layout {
@@ -1013,8 +1145,16 @@ impl WgpuRenderer {
                         continue;
                     }
 
+                    let render_w = if eva_panel.is_some() {
+                        let clipped = lbox.width.min(content_right - lbox.x);
+                        if clipped <= 0.0 { continue; }
+                        clipped
+                    } else {
+                        lbox.width
+                    };
+
                     let (texture, bind_group) = self.create_image_texture(*img_w, *img_h, rgba);
-                    let vertices = self.build_image_quad(lbox.x, lbox.y, lbox.width, lbox.height);
+                    let vertices = self.build_image_quad(lbox.x, lbox.y, render_w, lbox.height);
                     let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("image_vertex_buffer"),
                         contents: bytemuck::cast_slice(&vertices),
@@ -1031,7 +1171,15 @@ impl WgpuRenderer {
                             continue;
                         }
 
-                        let vertices = self.build_image_quad(lbox.x, lbox.y, lbox.width, lbox.height);
+                        let render_w = if eva_panel.is_some() {
+                            let clipped = lbox.width.min(content_right - lbox.x);
+                            if clipped <= 0.0 { continue; }
+                            clipped
+                        } else {
+                            lbox.width
+                        };
+
+                        let vertices = self.build_image_quad(lbox.x, lbox.y, render_w, lbox.height);
                         let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                             label: Some("cached_image_vertex_buffer"),
                             contents: bytemuck::cast_slice(&vertices),
@@ -1046,8 +1194,9 @@ impl WgpuRenderer {
 
         let has_images = !decoded_renders.is_empty() || !cached_renders.is_empty();
         if has_images {
+            let img_label = if eva_panel.is_some() { "image_pass_eva" } else { "image_pass" };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("image_pass"),
+                label: Some(img_label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -1088,204 +1237,17 @@ impl WgpuRenderer {
         Ok(())
     }
 
-    /// Render with EVA panel overlay.
-    /// Calls the normal render pipeline when panel is hidden,
-    /// or renders page content clipped to the left + EVA panel on the right.
-    pub fn render_with_eva(
+    /// Build EVA panel UI elements (header, messages, input field) into the
+    /// shared buffers. Called only when the EVA panel is visible.
+    fn build_eva_panel_ui(
         &mut self,
-        layout: &[LayoutBox],
-        ctx: &RenderContext<'_>,
         eva_panel: &EvaPanel,
-    ) -> Result<()> {
-        if !eva_panel.visible {
-            return self.render(layout, ctx);
-        }
-
-        let (w, h) = self.size;
-        if w == 0 || h == 0 {
-            return Ok(());
-        }
-
-        self.viewport.update(
-            &self.queue,
-            Resolution { width: w, height: h },
-        );
-
-        let panel_width: f32 = (350.0_f32).min(w as f32 * 0.4);
-        let panel_x = (w as f32 - panel_width).max(0.0);
-
-        let mut buffers: Vec<(GlyphonBuffer, f32, f32, TextBounds, GlyphonColor)> = Vec::new();
-        let mut rect_vertices: Vec<RectVertex> = Vec::new();
-
-        let wf = w as f32;
-        let hf = h as f32;
-        let tb = TOOLBAR_HEIGHT;
-        let sb = STATUS_BAR_HEIGHT;
-
-        // ── Toolbar ──
-        rect_vertices.extend_from_slice(&self.build_rect(0.0, 0.0, wf, tb, ctx.theme.toolbar_bg));
-
-        let btn_w: f32 = 36.0;
-        let btn_h: f32 = 32.0;
-        let btn_y: f32 = (tb - btn_h) / 2.0;
-        let btn_gap: f32 = 4.0;
-        let margin_left: f32 = 8.0;
-        let back_x = margin_left;
-        let fwd_x = back_x + btn_w + btn_gap;
-        let ref_x = fwd_x + btn_w + btn_gap;
-
-        // Nav buttons
-        rect_vertices.extend_from_slice(&self.build_rect(back_x, btn_y, btn_w, btn_h, ctx.theme.button_bg));
-        rect_vertices.extend_from_slice(&self.build_rect(fwd_x, btn_y, btn_w, btn_h, ctx.theme.button_bg));
-        rect_vertices.extend_from_slice(&self.build_rect(ref_x, btn_y, btn_w, btn_h, ctx.theme.button_bg));
-
-        let btn_text_y = btn_y + 6.0;
-        for (label, bx) in [("\u{25C0}", back_x), ("\u{25B6}", fwd_x), ("\u{21BB}", ref_x)] {
-            let mut btn_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(16.0, 20.0));
-            btn_buf.set_size(&mut self.font_system, Some(btn_w), Some(btn_h));
-            btn_buf.set_text(&mut self.font_system, label,
-                Attrs::new().family(Family::SansSerif).weight(Weight::NORMAL), Shaping::Advanced);
-            btn_buf.shape_until_scroll(&mut self.font_system, false);
-            let tc = ctx.theme.button_text;
-            buffers.push((btn_buf, bx + 10.0, btn_text_y,
-                TextBounds { left: bx as i32, top: btn_y as i32, right: (bx + btn_w) as i32, bottom: (btn_y + btn_h) as i32 },
-                GlyphonColor::rgb((tc[0]*255.0) as u8, (tc[1]*255.0) as u8, (tc[2]*255.0) as u8)));
-        }
-
-        // EVA button (active state)
-        let eva_btn_w: f32 = 52.0;
-        let eva_btn_x = panel_x - eva_btn_w - 8.0;
-        rect_vertices.extend_from_slice(&self.build_rect(eva_btn_x.max(0.0), btn_y, eva_btn_w, btn_h,
-            [0.25, 0.65, 0.55, 1.0]));
-        let mut eva_btn_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(13.0, 18.0));
-        eva_btn_buf.set_size(&mut self.font_system, Some(eva_btn_w), Some(btn_h));
-        eva_btn_buf.set_text(&mut self.font_system, "EVA \u{2715}",
-            Attrs::new().family(Family::SansSerif).weight(Weight::BOLD), Shaping::Advanced);
-        eva_btn_buf.shape_until_scroll(&mut self.font_system, false);
-        buffers.push((eva_btn_buf, eva_btn_x.max(0.0) + 6.0, btn_text_y,
-            TextBounds { left: eva_btn_x.max(0.0) as i32, top: btn_y as i32,
-                right: (eva_btn_x + eva_btn_w) as i32, bottom: (btn_y + btn_h) as i32 },
-            GlyphonColor::rgb(255, 255, 255)));
-
-        // URL bar
-        let url_x = ref_x + btn_w + btn_gap + 8.0;
-        let url_w = (eva_btn_x - url_x - 8.0).max(50.0);
-        let url_bg = if ctx.url_editing {
-            [ctx.theme.url_bar_bg[0]+0.04, ctx.theme.url_bar_bg[1]+0.04, ctx.theme.url_bar_bg[2]+0.04, 1.0]
-        } else { ctx.theme.url_bar_bg };
-        rect_vertices.extend_from_slice(&self.build_rect(url_x, btn_y, url_w, btn_h, url_bg));
-
-        // Toolbar border
-        rect_vertices.extend_from_slice(&self.build_rect(0.0, tb - 1.0, wf, 1.0, ctx.theme.url_bar_border));
-
-        let (url_display, url_color) = if ctx.url_editing {
-            if ctx.url_input.is_empty() {
-                ("\u{1F50D} Search or type a URL".to_string(), GlyphonColor::rgb(120, 120, 140))
-            } else {
-                (format!("{}\u{2588}", ctx.url_input), GlyphonColor::rgb(230, 230, 240))
-            }
-        } else if ctx.loading {
-            (format!("\u{23F3} {}", ctx.url), GlyphonColor::rgb(160, 190, 255))
-        } else {
-            (format!("\u{1F512} {}", ctx.url), GlyphonColor::rgb(180, 195, 225))
-        };
-
-        let mut url_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(14.0, 18.0));
-        url_buf.set_size(&mut self.font_system, Some(url_w - 16.0), Some(btn_h));
-        url_buf.set_text(&mut self.font_system, &url_display,
-            Attrs::new().family(Family::SansSerif).weight(Weight::NORMAL), Shaping::Advanced);
-        url_buf.shape_until_scroll(&mut self.font_system, false);
-        buffers.push((
-            url_buf, url_x + 8.0, btn_y + 7.0,
-            TextBounds { left: url_x as i32, top: btn_y as i32, right: (url_x + url_w) as i32, bottom: (btn_y + btn_h) as i32 },
-            url_color,
-        ));
-
-        // Loading indicator
-        if ctx.loading {
-            let mut load_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(14.0, 18.0));
-            load_buf.set_size(&mut self.font_system, Some(panel_x - 40.0), Some(30.0));
-            let dots = match (ctx.loading_ticks / 15) % 4 {
-                0 => "Loading", 1 => "Loading.", 2 => "Loading..", _ => "Loading...",
-            };
-            load_buf.set_text(&mut self.font_system, dots,
-                Attrs::new().family(Family::SansSerif).weight(Weight::NORMAL), Shaping::Advanced);
-            load_buf.shape_until_scroll(&mut self.font_system, false);
-            let lc = ctx.theme.loading;
-            buffers.push((load_buf, (panel_x / 2.0) - 40.0, (h as f32 / 2.0) - 10.0,
-                TextBounds { left: 0, top: TOOLBAR_HEIGHT as i32, right: panel_x as i32, bottom: h as i32 - STATUS_BAR_HEIGHT as i32 },
-                GlyphonColor::rgb((lc[0]*255.0) as u8, (lc[1]*255.0) as u8, (lc[2]*255.0) as u8),
-            ));
-        }
-
-        // Content layout boxes (clipped to left of EVA panel)
-        for lbox in layout {
-            match &lbox.kind {
-                LayoutKind::Text { text, font_size, color, bold, .. } => {
-                    if text.is_empty() { continue; }
-                    let top = lbox.y as i32;
-                    let bottom = (lbox.y + lbox.height) as i32;
-                    if bottom < 0 || top > h as i32 { continue; }
-                    let ew = lbox.width.min(panel_x - lbox.x);
-                    if ew <= 0.0 { continue; }
-
-                    let line_h = font_size * 1.5;
-                    let mut buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(*font_size, line_h));
-                    buf.set_size(&mut self.font_system, Some(ew), Some(lbox.height.max(line_h * 2.0)));
-                    let weight = if *bold { Weight::BOLD } else { Weight::NORMAL };
-                    buf.set_text(&mut self.font_system, text,
-                        Attrs::new().family(Family::SansSerif).weight(weight), Shaping::Advanced);
-                    buf.shape_until_scroll(&mut self.font_system, false);
-
-                    let fc = self.link_color(&lbox.href, ctx, *color);
-                    buffers.push((buf, lbox.x, lbox.y,
-                        TextBounds { left: lbox.x as i32, top: top.max(TOOLBAR_HEIGHT as i32), right: panel_x as i32, bottom: bottom.min(h as i32 - STATUS_BAR_HEIGHT as i32) },
-                        GlyphonColor::rgb((fc[0]*255.0) as u8, (fc[1]*255.0) as u8, (fc[2]*255.0) as u8),
-                    ));
-                }
-                LayoutKind::Code { text, .. } => {
-                    if text.is_empty() { continue; }
-                    let top = lbox.y as i32;
-                    let bottom = (lbox.y + lbox.height) as i32;
-                    if bottom < 0 || top > h as i32 { continue; }
-                    let ew = lbox.width.min(panel_x - lbox.x);
-                    if ew <= 0.0 { continue; }
-
-                    let mut buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(13.0, 19.0));
-                    buf.set_size(&mut self.font_system, Some(ew), Some(lbox.height.max(40.0)));
-                    buf.set_text(&mut self.font_system, text,
-                        Attrs::new().family(Family::Monospace).weight(Weight::NORMAL), Shaping::Advanced);
-                    buf.shape_until_scroll(&mut self.font_system, false);
-                    buffers.push((buf, lbox.x, lbox.y,
-                        TextBounds { left: lbox.x as i32, top: top.max(TOOLBAR_HEIGHT as i32), right: panel_x as i32, bottom: bottom.min(h as i32 - STATUS_BAR_HEIGHT as i32) },
-                        GlyphonColor::rgb(200, 220, 170),
-                    ));
-                }
-                _ => {}
-            }
-        }
-
-        // Status bar
-        let mut status_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(11.0, 14.0));
-        status_buf.set_size(&mut self.font_system, Some(w as f32), Some(20.0));
-        let zoom_info2 = if (ctx.zoom_level - 1.0).abs() > 0.01 {
-            format!(" | Zoom: {:.0}%", ctx.zoom_level * 100.0)
-        } else {
-            String::new()
-        };
-        let status_text = if let Some(href) = ctx.hovered_href {
-            format!("  {href}{zoom_info2}")
-        } else {
-            format!("  CPU+NPU+GPU | EVA: Ctrl+E | {} elements{zoom_info2}", layout.len())
-        };
-        status_buf.set_text(&mut self.font_system, &status_text,
-            Attrs::new().family(Family::Monospace).weight(Weight::NORMAL), Shaping::Advanced);
-        status_buf.shape_until_scroll(&mut self.font_system, false);
-        buffers.push((status_buf, 0.0, h as f32 - STATUS_BAR_HEIGHT,
-            TextBounds { left: 0, top: h as i32 - STATUS_BAR_HEIGHT as i32, right: w as i32, bottom: h as i32 },
-            GlyphonColor::rgb(90, 90, 110),
-        ));
-
+        panel_x: f32,
+        panel_width: f32,
+        w: u32,
+        h: u32,
+        buffers: &mut Vec<(GlyphonBuffer, f32, f32, TextBounds, GlyphonColor)>,
+    ) {
         // ── AI panel header — shows current provider ──
         let provider_name = eva_panel.provider.name();
         let header_text = format!("  {}  [Tab: switch] [Esc: close]", provider_name);
@@ -1404,165 +1366,5 @@ impl WgpuRenderer {
                 GlyphonColor::rgb(200, 210, 230),
             ));
         }
-
-        // ── Build TextArea refs ──
-        let text_areas: Vec<TextArea<'_>> = buffers
-            .iter()
-            .map(|(buf, x, y, bounds, color)| TextArea {
-                buffer: buf, left: *x, top: *y, scale: 1.0, bounds: *bounds,
-                default_color: *color, custom_glyphs: &[],
-            })
-            .collect();
-
-        // ── Prepare + render ──
-        self.text_renderer.prepare(
-            &self.device, &self.queue, &mut self.font_system,
-            &mut self.atlas, &self.viewport, text_areas, &mut self.swash_cache,
-        ).map_err(|e| anyhow::anyhow!("glyphon prepare: {e:?}"))?;
-
-        let output = self.surface.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("render_encoder_eva") });
-
-        let bg = ctx.theme.bg;
-
-        // ── Pass 0: Clear + rectangles (toolbar, buttons, status bar) ──
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("rect_pass_eva"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view, resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: bg[0] as f64, g: bg[1] as f64, b: bg[2] as f64, a: bg[3] as f64,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            // EVA panel background
-            let panel_bg = [0.10, 0.10, 0.18, 1.0_f32];
-            let panel_rect_verts = self.build_rect(panel_x, 0.0, panel_width, hf, panel_bg);
-            let mut all_rects = rect_vertices.clone();
-            all_rects.extend_from_slice(&panel_rect_verts);
-
-            // Status bar background
-            all_rects.extend_from_slice(&self.build_rect(0.0, hf - sb, wf, sb, ctx.theme.toolbar_bg));
-
-            if !all_rects.is_empty() {
-                let rect_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("rect_vb_eva"),
-                    contents: bytemuck::cast_slice(&all_rects),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                pass.set_pipeline(&self.rect_pipeline);
-                pass.set_vertex_buffer(0, rect_buf.slice(..));
-                pass.draw(0..all_rects.len() as u32, 0..1);
-            }
-        }
-
-        // ── Pass 1: Text ──
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("text_pass_eva"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view, resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            self.text_renderer.render(&self.atlas, &self.viewport, &mut pass)
-                .map_err(|e| anyhow::anyhow!("glyphon render: {e:?}"))?;
-        }
-
-        // ── Pass 2: Images (clipped to left of EVA panel) ──
-        let mut decoded_renders_eva: Vec<(wgpu::Buffer, wgpu::BindGroup, wgpu::Texture)> = Vec::new();
-        let mut cached_renders_eva: Vec<(wgpu::Buffer, String)> = Vec::new();
-
-        for lbox in layout {
-            match &lbox.kind {
-                LayoutKind::DecodedImage { width: img_w, height: img_h, rgba, .. } => {
-                    let top = lbox.y;
-                    let bottom = lbox.y + lbox.height;
-                    if bottom < 40.0 || top > h as f32 { continue; }
-                    let clipped_w = lbox.width.min(panel_x - lbox.x);
-                    if clipped_w <= 0.0 { continue; }
-
-                    let (texture, bind_group) = self.create_image_texture(*img_w, *img_h, rgba);
-                    let vertices = self.build_image_quad(lbox.x, lbox.y, clipped_w, lbox.height);
-                    let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("image_vertex_buffer_eva"),
-                        contents: bytemuck::cast_slice(&vertices),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
-                    decoded_renders_eva.push((vertex_buffer, bind_group, texture));
-                }
-                LayoutKind::Image { src, .. } => {
-                    if self.texture_cache.contains_key(src) {
-                        let top = lbox.y;
-                        let bottom = lbox.y + lbox.height;
-                        if bottom < 40.0 || top > h as f32 { continue; }
-                        let clipped_w = lbox.width.min(panel_x - lbox.x);
-                        if clipped_w <= 0.0 { continue; }
-
-                        let vertices = self.build_image_quad(lbox.x, lbox.y, clipped_w, lbox.height);
-                        let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("cached_image_vertex_buffer_eva"),
-                            contents: bytemuck::cast_slice(&vertices),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
-                        cached_renders_eva.push((vertex_buffer, src.clone()));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let has_images_eva = !decoded_renders_eva.is_empty() || !cached_renders_eva.is_empty();
-        if has_images_eva {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("image_pass_eva"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view, resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            pass.set_pipeline(&self.image_pipeline);
-            for (vertex_buffer, bind_group, _texture) in &decoded_renders_eva {
-                pass.set_bind_group(0, bind_group, &[]);
-                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                pass.draw(0..6, 0..1);
-            }
-            for (vertex_buffer, src) in &cached_renders_eva {
-                if let Some(cached) = self.texture_cache.get(src) {
-                    pass.set_bind_group(0, &cached.bind_group, &[]);
-                    pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                    pass.draw(0..6, 0..1);
-                }
-            }
-        }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
-        self.atlas.trim();
-
-        Ok(())
     }
 }

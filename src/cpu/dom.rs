@@ -246,68 +246,22 @@ impl DomTree {
         })
     }
 
-    /// Simple query_selector: supports tag, #id, .class, and combinations.
+    /// Simple query_selector: supports tag, #id, .class, tag.class, tag#id, [attr], [attr=val], *.
     pub fn query_selector(&self, selector: &str) -> Option<usize> {
         let selector = selector.trim();
-        if selector.is_empty() {
-            return None;
-        }
-
-        // #id selector
-        if let Some(id_val) = selector.strip_prefix('#') {
-            return self.get_element_by_id(id_val);
-        }
-
-        // .class selector
-        if let Some(class_val) = selector.strip_prefix('.') {
-            return self.nodes.iter().find_map(|n| {
-                if n.attrs.get("class").map_or(false, |c| {
-                    c.split_whitespace().any(|cls| cls == class_val)
-                }) {
-                    Some(n.id)
-                } else {
-                    None
-                }
-            });
-        }
-
-        // Tag selector
-        let tag = selector.to_lowercase();
+        if selector.is_empty() { return None; }
+        if selector == "*" { return self.nodes.first().map(|n| n.id); }
         self.nodes.iter().find_map(|n| {
-            if n.tag == tag {
-                Some(n.id)
-            } else {
-                None
-            }
+            if matches_simple_selector(n, selector) { Some(n.id) } else { None }
         })
     }
 
     /// Query all matching elements (simple selectors only).
     pub fn query_selector_all(&self, selector: &str) -> Vec<usize> {
         let selector = selector.trim();
-        if selector.is_empty() {
-            return Vec::new();
-        }
-
-        if let Some(id_val) = selector.strip_prefix('#') {
-            return self.get_element_by_id(id_val).into_iter().collect();
-        }
-
-        if let Some(class_val) = selector.strip_prefix('.') {
-            return self.nodes.iter().filter_map(|n| {
-                if n.attrs.get("class").map_or(false, |c| {
-                    c.split_whitespace().any(|cls| cls == class_val)
-                }) {
-                    Some(n.id)
-                } else {
-                    None
-                }
-            }).collect();
-        }
-
-        let tag = selector.to_lowercase();
+        if selector.is_empty() { return Vec::new(); }
         self.nodes.iter().filter_map(|n| {
-            if n.tag == tag { Some(n.id) } else { None }
+            if matches_simple_selector(n, selector) { Some(n.id) } else { None }
         }).collect()
     }
 
@@ -322,6 +276,87 @@ impl DomTree {
             self.update_depth(child, new_depth + 1);
         }
     }
+}
+
+/// Match a simple CSS selector against a node: tag, .class, #id, tag.class, tag#id, [attr], [attr=val], *
+fn matches_simple_selector(node: &DomNode, selector: &str) -> bool {
+    let sel = selector.trim();
+    if sel.is_empty() { return false; }
+    if sel == "*" { return true; }
+
+    let mut tag_req: Option<String> = None;
+    let mut class_reqs: Vec<String> = Vec::new();
+    let mut id_req: Option<String> = None;
+
+    let mut chars = sel.chars().peekable();
+    let mut current = String::new();
+    let mut mode = 'T'; // T=tag, C=class, I=id
+
+    while let Some(&ch) = chars.peek() {
+        match ch {
+            '.' => {
+                if mode == 'T' && !current.is_empty() { tag_req = Some(current.to_lowercase()); }
+                else if mode == 'C' && !current.is_empty() { class_reqs.push(current.clone()); }
+                current.clear();
+                mode = 'C';
+                chars.next();
+            }
+            '#' if mode != 'C' || current.is_empty() => {
+                if mode == 'T' && !current.is_empty() { tag_req = Some(current.to_lowercase()); }
+                else if mode == 'C' && !current.is_empty() { class_reqs.push(current.clone()); }
+                current.clear();
+                mode = 'I';
+                chars.next();
+            }
+            '[' => {
+                if mode == 'T' && !current.is_empty() { tag_req = Some(current.to_lowercase()); }
+                else if mode == 'C' && !current.is_empty() { class_reqs.push(current.clone()); }
+                current.clear();
+                chars.next();
+                // Read attribute selector
+                let mut attr_content = String::new();
+                while let Some(&ach) = chars.peek() {
+                    if ach == ']' { chars.next(); break; }
+                    attr_content.push(ach);
+                    chars.next();
+                }
+                // Parse attr_content: "name" or "name=value" or "name=\"value\""
+                if let Some(eq_pos) = attr_content.find('=') {
+                    let attr_name = attr_content[..eq_pos].trim();
+                    let attr_val = attr_content[eq_pos+1..].trim().trim_matches('"').trim_matches('\'');
+                    if node.attrs.get(attr_name).map(|v| v.as_str()) != Some(attr_val) { return false; }
+                } else {
+                    if !node.attrs.contains_key(attr_content.trim()) { return false; }
+                }
+                mode = 'T';
+                continue;
+            }
+            _ => {
+                current.push(ch);
+                chars.next();
+            }
+        }
+    }
+    match mode {
+        'T' if !current.is_empty() => { tag_req = Some(current.to_lowercase()); }
+        'C' if !current.is_empty() => { class_reqs.push(current); }
+        'I' if !current.is_empty() => { id_req = Some(current); }
+        _ => {}
+    }
+
+    if let Some(ref tag) = tag_req {
+        if node.tag != *tag { return false; }
+    }
+    if let Some(ref id) = id_req {
+        if node.attrs.get("id").map(|s| s.as_str()) != Some(id.as_str()) { return false; }
+    }
+    for cls in &class_reqs {
+        if !node.attrs.get("class").is_some_and(|c| c.split_whitespace().any(|x| x == cls.as_str())) {
+            return false;
+        }
+    }
+    // Must have matched at least one requirement
+    tag_req.is_some() || id_req.is_some() || !class_reqs.is_empty()
 }
 
 /// Tags whose content should be completely skipped (not added as text).
@@ -409,7 +444,7 @@ pub fn parse_html(html: &str) -> DomTree {
 
             if tag_content.starts_with('/') {
                 // ── Closing tag ──
-                let closing_tag = tag_content[1..].trim().split_whitespace()
+                let closing_tag = tag_content[1..].split_whitespace()
                     .next().unwrap_or("").to_lowercase();
                 // Find the matching tag in the stack
                 if let Some(match_pos) = stack.iter().rposition(|&id| nodes[id].tag == closing_tag) {
@@ -487,9 +522,9 @@ pub fn parse_html(html: &str) -> DomTree {
                         let type_attr = nodes.last()
                             .and_then(|n: &DomNode| n.attrs.get("type").cloned());
                         let defer = nodes.last()
-                            .map_or(false, |n| n.attrs.contains_key("defer"));
+                            .is_some_and(|n| n.attrs.contains_key("defer"));
                         let is_async = nodes.last()
-                            .map_or(false, |n| n.attrs.contains_key("async"));
+                            .is_some_and(|n| n.attrs.contains_key("async"));
 
                         let source = if let Some(src) = src_attr {
                             ScriptSource::External(src)
@@ -726,6 +761,7 @@ fn resolve_entity(entity: &str) -> Option<char> {
         "uarr" => Some('\u{2191}'),
         "rarr" => Some('\u{2192}'),
         "darr" => Some('\u{2193}'),
+        "harr" => Some('\u{2194}'),
         "hearts" => Some('\u{2665}'),
         "diams" => Some('\u{2666}'),
         "spades" => Some('\u{2660}'),

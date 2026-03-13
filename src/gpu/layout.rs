@@ -47,7 +47,7 @@ pub enum LayoutKind {
     /// Horizontal separator line
     Separator,
     /// Code block with monospace font
-    Code { text: String, language: Option<String> },
+    Code { text: String, language: Option<String>, font_size: f32 },
     /// Background rect (for code blocks, quotes, etc.)
     Background { color: [f32; 4] },
 }
@@ -290,7 +290,7 @@ pub fn compute_layout_zoom(
                     href: None,
                 });
 
-                cursor_y += lines * line_height + css_margin_bottom(block, 14.0, 1.0);
+                cursor_y += lines * line_height + css_margin_bottom(block, 14.0, z);
             }
             BlockKind::Code { language } => {
                 let font_size = css_font_size(block, 14.0, z);
@@ -317,6 +317,7 @@ pub fn compute_layout_zoom(
                     kind: LayoutKind::Code {
                         text: block.text.clone(),
                         language: language.clone(),
+                        font_size,
                     },
                     href: None,
                 });

@@ -6,6 +6,7 @@
 
 /// A single CSS token with its position in the source.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum Token {
     /// An identifier: `color`, `font-size`, `--custom-prop`
     Ident(String),
@@ -86,6 +87,7 @@ pub enum NumType {
 }
 
 /// CSS Tokenizer state machine.
+#[allow(dead_code)]
 pub struct Tokenizer<'a> {
     input: &'a str,
     chars: Vec<char>,

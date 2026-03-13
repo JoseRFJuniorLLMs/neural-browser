@@ -144,7 +144,21 @@ impl SemanticMemory {
     /// Metadata fields: url, title, summary, visited_at (ISO 8601 timestamp).
     /// Uses n-gram hash vectors for semantic similarity (lightweight, no model needed).
     pub fn store_page(&self, url: &str, title: &str, summary: &str, content: &str) {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // Guard: skip useless entries where both title and content are empty/whitespace
+        if title.trim().is_empty() && content.trim().is_empty() {
+            warn!("[MEMORY] Skipping store_page — title and content are both empty");
+            return;
+        }
+
+        // Generate unique ID: combine epoch seconds (upper bits) with monotonic counter (lower bits).
+        // This avoids collisions across restarts and concurrent instances.
+        let seq = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let epoch_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+        // Use lower 16 bits of epoch + lower 16 bits of seq to fit in u32
+        let id = (epoch_secs << 16) | (seq & 0xFFFF);
         let visited_at = timestamp_now();
 
         // Build semantic vector from page content (n-gram hashing into Poincaré ball)

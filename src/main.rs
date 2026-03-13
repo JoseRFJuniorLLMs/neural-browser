@@ -144,48 +144,45 @@ fn main() -> Result<()> {
             };
 
             for msg in cpu_to_npu_rx {
-                match msg {
-                    PipelineMsg::HtmlReady { url, html, dom } => {
-                        info!("[NPU] Processing: {url}");
-                        match engine.process_page(&url, &html, &dom) {
-                            Ok(result) => {
-                                // Send prefetch suggestions to CPU thread
-                                for prefetch_url in &result.prefetch_urls {
-                                    let _ = npu_prefetch_tx.send(
-                                        PipelineMsg::Prefetch(prefetch_url.clone())
-                                    );
-                                }
-                                if !result.prefetch_urls.is_empty() {
-                                    info!("[NPU] Sent {} prefetch suggestions", result.prefetch_urls.len());
-                                }
+                if let PipelineMsg::HtmlReady { url, html, dom } = msg {
+                    info!("[NPU] Processing: {url}");
+                    match engine.process_page(&url, &html, &dom) {
+                        Ok(result) => {
+                            // Send prefetch suggestions to CPU thread
+                            for prefetch_url in &result.prefetch_urls {
+                                let _ = npu_prefetch_tx.send(
+                                    PipelineMsg::Prefetch(prefetch_url.clone())
+                                );
+                            }
+                            if !result.prefetch_urls.is_empty() {
+                                info!("[NPU] Sent {} prefetch suggestions", result.prefetch_urls.len());
+                            }
 
-                                let _ = npu_to_gpu_tx.send(PipelineMsg::ContentReady {
-                                    url,
-                                    blocks: result.blocks,
-                                    ads_blocked: result.ads_blocked,
-                                });
-                            }
-                            Err(e) => {
-                                error!("[NPU] Processing failed: {e}");
-                                // Send error content so GPU stops loading spinner
-                                let _ = npu_to_gpu_tx.send(PipelineMsg::ContentReady {
-                                    url,
-                                    blocks: vec![npu::ContentBlock {
-                                        kind: npu::BlockKind::Paragraph,
-                                        text: format!("NPU processing error: {e}"),
-                                        depth: 0,
-                                        relevance: 1.0,
-                                        children: Vec::new(),
-                                        image_data: None,
-                                        node_id: None,
-                                        computed_style: None,
-                                    }],
-                                    ads_blocked: 0,
-                                });
-                            }
+                            let _ = npu_to_gpu_tx.send(PipelineMsg::ContentReady {
+                                url,
+                                blocks: result.blocks,
+                                ads_blocked: result.ads_blocked,
+                            });
+                        }
+                        Err(e) => {
+                            error!("[NPU] Processing failed: {e}");
+                            // Send error content so GPU stops loading spinner
+                            let _ = npu_to_gpu_tx.send(PipelineMsg::ContentReady {
+                                url,
+                                blocks: vec![npu::ContentBlock {
+                                    kind: npu::BlockKind::Paragraph,
+                                    text: format!("NPU processing error: {e}"),
+                                    depth: 0,
+                                    relevance: 1.0,
+                                    children: Vec::new(),
+                                    image_data: None,
+                                    node_id: None,
+                                    computed_style: None,
+                                }],
+                                ads_blocked: 0,
+                            });
                         }
                     }
-                    _ => {}
                 }
             }
         })?;
@@ -200,6 +197,7 @@ fn main() -> Result<()> {
         .spawn(move || {
             info!("[CPU] Thread started -- networking + parsing + history + AI");
             let net = cpu::network::NetworkEngine::new();
+            let mut js_engine = cpu::js_engine::JsEngine::new();
             let ai_client = std::sync::Arc::new(eva::AiClient::new());
 
             // ── Semantic history (NietzscheDB) ──
@@ -213,12 +211,12 @@ fn main() -> Result<()> {
             let mut current_url: Option<String> = match std::env::args().nth(1) {
                 Some(url) => {
                     visited_urls.push(url.clone());
-                    process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls);
+                    process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls, &mut js_engine);
                     Some(url)
                 }
                 None => {
                     let url = cpu::start_page::START_PAGE_URL.to_string();
-                    process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls);
+                    process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls, &mut js_engine);
                     Some(url)
                 }
             };
@@ -244,7 +242,7 @@ fn main() -> Result<()> {
                                 }
                                 forward_stack.clear();
                                 current_url = Some(url.clone());
-                                process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls);
+                                process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls, &mut js_engine);
                             }
                             PipelineMsg::Back => {
                                 if let Some(prev_url) = back_stack.pop() {
@@ -253,7 +251,7 @@ fn main() -> Result<()> {
                                         forward_stack.push(cur);
                                     }
                                     current_url = Some(prev_url.clone());
-                                    process_url_or_internal(&net, &prev_url, &cpu_to_npu_tx, &visited_urls);
+                                    process_url_or_internal(&net, &prev_url, &cpu_to_npu_tx, &visited_urls, &mut js_engine);
                                 } else {
                                     warn!("[CPU] No back history available");
                                 }
@@ -265,7 +263,7 @@ fn main() -> Result<()> {
                                         back_stack.push(cur);
                                     }
                                     current_url = Some(next_url.clone());
-                                    process_url_or_internal(&net, &next_url, &cpu_to_npu_tx, &visited_urls);
+                                    process_url_or_internal(&net, &next_url, &cpu_to_npu_tx, &visited_urls, &mut js_engine);
                                 } else {
                                     warn!("[CPU] No forward history available");
                                 }
@@ -397,6 +395,7 @@ fn process_url_or_internal(
     url: &str,
     tx: &channel::Sender<PipelineMsg>,
     visited_urls: &[String],
+    js: &mut cpu::js_engine::JsEngine,
 ) {
     // neural://start → start_page.rs
     if url == cpu::start_page::START_PAGE_URL {
@@ -424,7 +423,7 @@ fn process_url_or_internal(
     }
 
     // Regular HTTP(S) URL → network fetch
-    process_url(net, url, tx);
+    process_url(net, url, tx, js);
 }
 
 /// Fetch and parse a URL, sending the result to the NPU.
@@ -434,6 +433,7 @@ fn process_url(
     net: &cpu::network::NetworkEngine,
     url: &str,
     tx: &channel::Sender<PipelineMsg>,
+    js: &mut cpu::js_engine::JsEngine,
 ) {
     let html = match net.fetch(url) {
         Ok(h) => h,
@@ -450,7 +450,6 @@ fn process_url(
     if !dom.scripts.is_empty() {
         info!("[CPU] Running {} scripts from {url}", dom.scripts.len());
         let scripts = dom.scripts.clone();
-        let mut js = cpu::js_engine::JsEngine::new();
 
         // Fetch external scripts
         let mut external_code = std::collections::HashMap::new();
@@ -491,14 +490,8 @@ fn process_url(
             }
         }
 
-        if external_code.is_empty() {
-            if let Err(e) = js.execute_scripts_with_externals(&mut dom, &scripts, &std::collections::HashMap::new(), url) {
-                warn!("[CPU] JS execution error: {e}");
-            }
-        } else {
-            if let Err(e) = js.execute_scripts_with_externals(&mut dom, &scripts, &external_code, url) {
-                warn!("[CPU] JS execution error: {e}");
-            }
+        if let Err(e) = js.execute_scripts_with_externals(&mut dom, &scripts, &external_code, url) {
+            warn!("[CPU] JS execution error: {e}");
         }
     }
 

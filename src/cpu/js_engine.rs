@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use boa_engine::{
-    Context, JsArgs, JsResult, JsValue, Source,
+    Context, JsArgs, JsError, JsResult, JsValue, Source,
     js_string,
     object::ObjectInitializer,
     property::Attribute,
@@ -28,31 +28,49 @@ use log::{info, warn, error};
 use super::dom::{DomTree, ScriptInfo, ScriptSource};
 
 // ═══════════════════════════════════════════════════════════════════
-// Copy-safe raw pointers for Boa closures (requires Copy trait)
-// SAFETY: All pointers are valid for the entire duration of execute_scripts()
+// Copy-safe raw pointers for Boa closures (requires Copy + Send + Sync traits)
+//
+// SAFETY INVARIANTS (audited 2026-03-13):
+// 1. LIFETIME: All pointers are created from &mut references in execute_scripts()
+//    and the Boa Context (which holds all closures) is stack-local and dropped
+//    before the references go out of scope. No use-after-free is possible.
+// 2. THREADING: Send+Sync are implemented only to satisfy Boa's from_copy_closure
+//    trait bounds. Boa's Context is single-threaded — no closures cross thread
+//    boundaries. These impls are a lie to the compiler but safe in practice.
+// 3. ALIASING: get_mut() creates &mut from shared &self. This is technically UB
+//    under Rust's aliasing rules, but Boa executes closures synchronously one at
+//    a time, so at any given moment only one reference exists. No miscompilation
+//    has been observed. A future refactor to RefCell would eliminate this concern.
+// 4. NO DATA RACES: Single-threaded execution (no spawn/tokio/Arc in this file).
 // ═══════════════════════════════════════════════════════════════════
 
 #[derive(Clone, Copy)]
 struct DomPtr(*mut DomTree);
+// SAFETY: Boa requires Send+Sync for from_copy_closure. Never actually sent across threads.
 unsafe impl Send for DomPtr {}
 unsafe impl Sync for DomPtr {}
 
 impl DomPtr {
     fn new(dom: &mut DomTree) -> Self { Self(dom as *mut DomTree) }
+    /// SAFETY: Caller must ensure pointer is valid and no &mut exists concurrently.
     unsafe fn get(&self) -> &DomTree { &*self.0 }
+    /// SAFETY: Caller must ensure pointer is valid and no other & or &mut exists.
     #[allow(clippy::mut_from_ref)]
     unsafe fn get_mut(&self) -> &mut DomTree { &mut *self.0 }
 }
 
-/// Copy-safe pointer to localStorage (HashMap<String,String>).
+/// Copy-safe pointer to storage HashMap. Same safety invariants as DomPtr.
 #[derive(Clone, Copy)]
 struct StoragePtr(*mut HashMap<String, String>);
+// SAFETY: Same rationale as DomPtr — never crosses thread boundaries.
 unsafe impl Send for StoragePtr {}
 unsafe impl Sync for StoragePtr {}
 
 impl StoragePtr {
     fn new(store: &mut HashMap<String, String>) -> Self { Self(store as *mut _) }
+    /// SAFETY: Caller must ensure pointer is valid and no &mut exists concurrently.
     unsafe fn get(&self) -> &HashMap<String, String> { &*self.0 }
+    /// SAFETY: Caller must ensure pointer is valid and no other & or &mut exists.
     #[allow(clippy::mut_from_ref)]
     unsafe fn get_mut(&self) -> &mut HashMap<String, String> { &mut *self.0 }
 }
@@ -63,13 +81,15 @@ impl StoragePtr {
 
 /// JavaScript engine for executing page scripts against a DOM tree.
 pub struct JsEngine {
-    _max_execution_ms: u64,
-    /// Persistent localStorage across page loads (in-memory).
-    local_storage: HashMap<String, String>,
-    /// Persistent sessionStorage (in-memory, cleared on "browser close").
-    session_storage: HashMap<String, String>,
-    /// In-memory cookie jar (name=value pairs).
-    cookies: HashMap<String, String>,
+    max_execution_ms: u64,
+    /// Persistent localStorage across page loads, keyed by origin (scheme+host+port).
+    local_storage: HashMap<String, HashMap<String, String>>,
+    /// Persistent sessionStorage, keyed by origin (cleared on "browser close").
+    session_storage: HashMap<String, HashMap<String, String>>,
+    /// In-memory cookie jar, keyed by origin (scheme+host+port) for same-origin isolation.
+    cookies: HashMap<String, HashMap<String, String>>,
+    /// Instant when this engine was created (for performance.now()).
+    start_time: std::time::Instant,
 }
 
 impl JsEngine {
@@ -79,10 +99,11 @@ impl JsEngine {
             .and_then(|s| s.parse().ok())
             .unwrap_or(5000);
         Self {
-            _max_execution_ms: max_ms,
+            max_execution_ms: max_ms,
             local_storage: HashMap::new(),
             session_storage: HashMap::new(),
             cookies: HashMap::new(),
+            start_time: std::time::Instant::now(),
         }
     }
 
@@ -109,9 +130,13 @@ impl JsEngine {
               scripts.len(), inline_count, scripts.len() - inline_count);
 
         let dom_ptr = DomPtr::new(dom);
-        let ls_ptr = StoragePtr::new(&mut self.local_storage);
-        let ss_ptr = StoragePtr::new(&mut self.session_storage);
-        let ck_ptr = StoragePtr::new(&mut self.cookies);
+        let origin = origin_from_url(page_url);
+        let ls = self.local_storage.entry(origin.clone()).or_default();
+        let ls_ptr = StoragePtr::new(ls);
+        let ss = self.session_storage.entry(origin.clone()).or_default();
+        let ss_ptr = StoragePtr::new(ss);
+        let ck = self.cookies.entry(origin.clone()).or_default();
+        let ck_ptr = StoragePtr::new(ck);
 
         let mut context = Context::default();
 
@@ -122,7 +147,7 @@ impl JsEngine {
         register_dom_traversal(&mut context, dom_ptr);
         register_class_list(&mut context, dom_ptr);
         register_window_location(&mut context, page_url);
-        register_window_stubs(&mut context);
+        register_window_stubs(&mut context, self.start_time);
         register_timer_stubs(&mut context);
         register_storage(&mut context, ls_ptr, "localStorage");
         register_storage(&mut context, ss_ptr, "sessionStorage");
@@ -138,14 +163,23 @@ impl JsEngine {
         // ── Phase 4: Element wrapper (MUST be last — wraps all __nb_* into DOM objects) ──
         register_element_wrapper(&mut context);
 
-        // ── Run scripts ──
-        run_scripts(&mut context, scripts, external_scripts);
+        // ── Run scripts (with timeout enforcement) ──
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(self.max_execution_ms);
+        run_scripts(&mut context, scripts, external_scripts, deadline);
 
         // ── Fire DOMContentLoaded + load after all scripts execute ──
-        fire_lifecycle_events(&mut context);
+        if std::time::Instant::now() < deadline {
+            fire_lifecycle_events(&mut context);
+        } else {
+            warn!("[JS] Skipping lifecycle events — execution timeout exceeded");
+        }
 
         // ── Drain setTimeout(fn, 0) queue ──
-        drain_timer_queue(&mut context);
+        if std::time::Instant::now() < deadline {
+            drain_timer_queue(&mut context);
+        } else {
+            warn!("[JS] Skipping timer drain — execution timeout exceeded");
+        }
 
         Ok(())
     }
@@ -155,8 +189,15 @@ fn run_scripts(
     context: &mut Context,
     scripts: &[ScriptInfo],
     external_scripts: &HashMap<String, String>,
+    deadline: std::time::Instant,
 ) {
     for (i, script) in scripts.iter().enumerate() {
+        // SECURITY: Enforce execution timeout across all scripts
+        if std::time::Instant::now() >= deadline {
+            warn!("[JS] Execution timeout reached — skipping remaining {} scripts", scripts.len() - i);
+            break;
+        }
+
         if script.script_type.as_deref() == Some("module") {
             info!("[JS] Skipping module script #{}", i);
             continue;
@@ -293,7 +334,7 @@ fn register_document(ctx: &mut Context, dom: DomPtr) {
                 let cls = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
                 let d = unsafe { dom.get() };
                 let results: Vec<usize> = d.nodes.iter().filter_map(|n| {
-                    if n.attrs.get("class").map_or(false, |c| c.split_whitespace().any(|x| x == cls)) {
+                    if n.attrs.get("class").is_some_and(|c| c.split_whitespace().any(|x| x == cls)) {
                         Some(n.id)
                     } else { None }
                 }).collect();
@@ -305,14 +346,31 @@ fn register_document(ctx: &mut Context, dom: DomPtr) {
         )
         .function(
             NativeFunction::from_copy_closure(move |_, args, ctx| {
-                let _ns = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-                let text = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+                let text = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
                 let d = unsafe { dom.get_mut() };
                 let id = d.create_element("#text");
                 d.set_text_content(id, &text);
                 Ok(JsValue::from(id as i32))
             }),
             js_string!("createTextNode"), 1,
+        )
+        .function(
+            NativeFunction::from_copy_closure(move |_, args, ctx| {
+                let text = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+                let d = unsafe { dom.get_mut() };
+                let id = d.create_element("#comment");
+                d.set_text_content(id, &text);
+                Ok(JsValue::from(id as i32))
+            }),
+            js_string!("createComment"), 1,
+        )
+        .function(
+            NativeFunction::from_copy_closure(move |_, _args, _ctx| {
+                let d = unsafe { dom.get_mut() };
+                let id = d.create_element("#document-fragment");
+                Ok(JsValue::from(id as i32))
+            }),
+            js_string!("createDocumentFragment"), 0,
         )
         .property(js_string!("readyState"), js_string!("complete"), Attribute::all())
         .property(js_string!("contentType"), js_string!("text/html"), Attribute::all())
@@ -339,7 +397,7 @@ fn register_document(ctx: &mut Context, dom: DomPtr) {
         "document.body = {}; document.head = {}; document.documentElement = 0;",
         body_id, head_id
     );
-    let _ = ctx.eval(Source::from_bytes(setup.as_bytes()));
+    if let Err(e) = ctx.eval(Source::from_bytes(setup.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -410,7 +468,7 @@ fn register_element_helpers(ctx: &mut Context, dom: DomPtr) {
             let nid = args.get_or_undefined(0).to_i32(ctx)? as usize;
             let key = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
             let d = unsafe { dom.get() };
-            let has = d.nodes.get(nid).map_or(false, |n| n.attrs.contains_key(&key));
+            let has = d.nodes.get(nid).is_some_and(|n| n.attrs.contains_key(&key));
             Ok(JsValue::from(has))
         }),
     ).expect("hasAttribute");
@@ -495,7 +553,7 @@ fn register_element_helpers(ctx: &mut Context, dom: DomPtr) {
     ctx.register_global_builtin_callable(js_string!("__nb_cloneNode"), 2,
         NativeFunction::from_copy_closure(move |_, args, ctx| {
             let nid = args.get_or_undefined(0).to_i32(ctx)? as usize;
-            let _deep = args.get_or_undefined(1).to_boolean();
+            let deep = args.get_or_undefined(1).to_boolean();
             let d = unsafe { dom.get_mut() };
             if let Some(src) = d.nodes.get(nid).cloned() {
                 let new_id = d.nodes.len();
@@ -505,9 +563,33 @@ fn register_element_helpers(ctx: &mut Context, dom: DomPtr) {
                     attrs: src.attrs,
                     text: src.text,
                     parent: None,
-                    children: Vec::new(), // shallow clone by default
+                    children: Vec::new(),
                     depth: 0,
                 });
+                if deep {
+                    fn deep_clone(d: &mut super::dom::DomTree, src_id: usize, new_parent_id: usize) {
+                        let src_children: Vec<usize> = d.nodes.get(src_id)
+                            .map(|n| n.children.clone()).unwrap_or_default();
+                        for child_id in src_children {
+                            if let Some(child) = d.nodes.get(child_id).cloned() {
+                                let clone_id = d.nodes.len();
+                                let depth = d.nodes[new_parent_id].depth + 1;
+                                d.nodes.push(super::dom::DomNode {
+                                    id: clone_id,
+                                    tag: child.tag,
+                                    attrs: child.attrs,
+                                    text: child.text,
+                                    parent: Some(new_parent_id),
+                                    children: Vec::new(),
+                                    depth,
+                                });
+                                d.nodes[new_parent_id].children.push(clone_id);
+                                deep_clone(d, child_id, clone_id);
+                            }
+                        }
+                    }
+                    deep_clone(d, nid, new_id);
+                }
                 Ok(JsValue::from(new_id as i32))
             } else {
                 Ok(JsValue::null())
@@ -542,11 +624,20 @@ fn reconstruct_node(dom: &DomTree, node_id: usize, out: &mut String) {
             out.push(' ');
             out.push_str(k);
             out.push_str("=\"");
-            out.push_str(v);
+            // SECURITY: Escape attribute values to prevent XSS via attribute injection
+            for ch in v.chars() {
+                match ch {
+                    '"' => out.push_str("&quot;"),
+                    '&' => out.push_str("&amp;"),
+                    '<' => out.push_str("&lt;"),
+                    '>' => out.push_str("&gt;"),
+                    _ => out.push(ch),
+                }
+            }
             out.push('"');
         }
         out.push('>');
-        if !node.text.is_empty() && node.children.is_empty() {
+        if !node.text.is_empty() {
             out.push_str(&node.text);
         }
         for &child_id in &node.children {
@@ -736,8 +827,8 @@ fn register_class_list(ctx: &mut Context, dom: DomPtr) {
             let nid = args.get_or_undefined(0).to_i32(ctx)? as usize;
             let cls = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
             let d = unsafe { dom.get() };
-            let has = d.nodes.get(nid).map_or(false, |n| {
-                n.attrs.get("class").map_or(false, |c| c.split_whitespace().any(|x| x == cls))
+            let has = d.nodes.get(nid).is_some_and(|n| {
+                n.attrs.get("class").is_some_and(|c| c.split_whitespace().any(|x| x == cls))
             });
             Ok(JsValue::from(has))
         }),
@@ -745,6 +836,19 @@ fn register_class_list(ctx: &mut Context, dom: DomPtr) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+/// Extract origin (scheme + host + port) from a URL for storage isolation.
+/// Returns a fallback key for invalid or empty URLs so tests still work.
+fn origin_from_url(url: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(url) {
+        format!("{}://{}{}", parsed.scheme(),
+                parsed.host_str().unwrap_or("localhost"),
+                parsed.port().map(|p| format!(":{p}")).unwrap_or_default())
+    } else {
+        // Fallback for empty URLs (e.g. unit tests calling execute_scripts)
+        String::from("__default__")
+    }
+}
+
 // localStorage / sessionStorage
 // ═══════════════════════════════════════════════════════════════════
 
@@ -803,6 +907,21 @@ fn register_storage(ctx: &mut Context, store: StoragePtr, name: &str) {
 
     ctx.register_global_property(js_string!(name.to_string()), storage, Attribute::all())
         .expect(name);
+
+    // Register a helper to get storage length, then define .length as a getter
+    let len_fn_name = format!("__nb_{}_length", name);
+    ctx.register_global_builtin_callable(js_string!(len_fn_name.clone()), 0,
+        NativeFunction::from_copy_closure(move |_, _, _| {
+            let s = unsafe { store.get() };
+            Ok(JsValue::from(s.len() as i32))
+        }),
+    ).expect("storage_length");
+
+    let length_js = format!(
+        r#"Object.defineProperty({name}, "length", {{ get: function() {{ return {len_fn_name}(); }}, enumerable: true, configurable: true }});"#,
+        name = name, len_fn_name = len_fn_name,
+    );
+    if let Err(e) = ctx.eval(Source::from_bytes(length_js.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -818,12 +937,78 @@ fn register_fetch_api(ctx: &mut Context) {
     ).expect("fetch");
 
     // Helper: __nb_fetch_id tracks multiple concurrent fetch results
-    let _ = ctx.eval(Source::from_bytes(b"var __nb_fetch_id = 0; var __nb_fetch_bodies = {};"));
+    if let Err(e) = ctx.eval(Source::from_bytes(b"var __nb_fetch_id = 0; var __nb_fetch_bodies = {};")) { log::warn!("[JS] eval failed: {e:?}"); }
 }
+
+/// SECURITY: Check if a URL is safe for JS fetch (block private IPs, file://, etc.)
+fn is_fetch_url_allowed(url: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
+
+    // Only allow http and https schemes
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => return Err(format!("Blocked scheme: {scheme}:// — only http(s) allowed")),
+    }
+
+    // Block private/internal IPs to prevent SSRF
+    if let Some(host) = parsed.host_str() {
+        let host_lower = host.to_lowercase();
+        // Block localhost variants
+        if host_lower == "localhost" || host_lower == "127.0.0.1" || host_lower == "::1"
+            || host_lower == "[::1]" || host_lower == "0.0.0.0"
+        {
+            return Err(format!("Blocked: access to localhost ({host}) is not allowed"));
+        }
+        // Block metadata services (AWS/GCP/Azure)
+        if host_lower == "169.254.169.254" || host_lower == "metadata.google.internal" {
+            return Err(format!("Blocked: access to cloud metadata service ({host})"));
+        }
+        // Block private IP ranges (10.x, 172.16-31.x, 192.168.x)
+        if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+            if ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
+                return Err(format!("Blocked: private/reserved IP ({ip})"));
+            }
+        }
+        if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+            if ip.is_loopback() || ip.is_unspecified() {
+                return Err(format!("Blocked: loopback/reserved IPv6 ({ip})"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Max response body size for JS fetch (2 MB)
+const JS_FETCH_MAX_BODY: usize = 2 * 1024 * 1024;
 
 fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let url = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
     info!("[JS fetch] {}", url);
+
+    // SECURITY: Validate URL before making request
+    if let Err(reason) = is_fetch_url_allowed(&url) {
+        warn!("[JS fetch] BLOCKED: {reason}");
+        // Return a rejected-style response
+        let err_js = format!(
+            r#"(function() {{
+                var r = {{ ok: false, status: 0, statusText: "Blocked", _body: "",
+                    text: function() {{ return Promise.resolve(""); }},
+                    json: function() {{ return Promise.reject(new TypeError("{}")); }},
+                    headers: {{ get: function() {{ return null; }} }},
+                    clone: function() {{ return Object.assign({{}}, this); }}
+                }};
+                r.then = function(f,rej) {{ if(rej) rej(new TypeError("{}")); return {{ then: function(){{return this;}}, catch: function(f){{if(f)f(new TypeError("{}"));return this;}}, finally: function(f){{if(f)f();return this;}} }}; }};
+                r.catch = function(f) {{ return r.then(null, f); }};
+                r.finally = function(f) {{ if(f)f(); return r; }};
+                return r;
+            }})()"#,
+            reason.replace('"', "\\\""),
+            reason.replace('"', "\\\""),
+            reason.replace('"', "\\\""),
+        );
+        return ctx.eval(Source::from_bytes(err_js.as_bytes()))
+            .map_err(|e| JsError::from_opaque(JsValue::from(js_string!(format!("fetch blocked: {e}")))));
+    }
 
     let mut method = "GET".to_string();
     let mut body: Option<String> = None;
@@ -892,8 +1077,13 @@ fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
         match response {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                let ok = status >= 200 && status < 300;
-                let body_text = resp.into_body().read_to_string().unwrap_or_default();
+                let ok = (200..300).contains(&status);
+                let mut body_text = resp.into_body().read_to_string().unwrap_or_default();
+                // SECURITY: Limit response body size to prevent memory exhaustion
+                if body_text.len() > JS_FETCH_MAX_BODY {
+                    log::warn!("[JS fetch] Response truncated from {} to {} bytes", body_text.len(), JS_FETCH_MAX_BODY);
+                    body_text.truncate(JS_FETCH_MAX_BODY);
+                }
                 (ok, status, body_text, String::new())
             }
             Err(e) => (false, 0u16, String::new(), format!("{e}")),
@@ -917,14 +1107,11 @@ fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
     ).expect("fetch body store");
 
     // Increment fetch ID and store body keyed by ID for concurrent fetches
-    let store_js = format!(
-        r#"__nb_fetch_id++; __nb_fetch_bodies[__nb_fetch_id] = __nb_last_fetch_body;"#
-    );
-    let _ = ctx.eval(Source::from_bytes(store_js.as_bytes()));
+    let store_js = r#"__nb_fetch_id++; __nb_fetch_bodies[__nb_fetch_id] = __nb_last_fetch_body;"#.to_string();
+    if let Err(e) = ctx.eval(Source::from_bytes(store_js.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 
     // Build response object — text() and json() read from __nb_last_fetch_body
     // We store _body directly on the response object for JS access
-    let _escaped_body = body_text.replace('\\', "\\\\").replace('`', "\\`").replace("${", "\\${");
     let response_js = format!(
         r#"(function() {{
             var _fid = __nb_fetch_id;
@@ -933,11 +1120,22 @@ fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
                 status: {status},
                 statusText: "{status_text}",
                 _body: __nb_fetch_bodies[_fid] || "",
-                text: function() {{ return this._body; }},
-                json: function() {{ try {{ return JSON.parse(this._body); }} catch(e) {{ return null; }} }},
+                text: function() {{ var b = this._body; return Promise.resolve(b); }},
+                json: function() {{ var b = this._body; try {{ return Promise.resolve(JSON.parse(b)); }} catch(e) {{ return Promise.reject(e); }} }},
                 headers: {{ get: function(name) {{ return null; }} }},
                 clone: function() {{ return Object.assign({{}}, this); }}
             }};
+            _resp.then = function(onFulfilled, onRejected) {{
+                try {{
+                    var result = onFulfilled ? onFulfilled(_resp) : _resp;
+                    return {{ then: function(f) {{ if(f) try {{ f(result); }} catch(e2) {{}} return this; }}, catch: function() {{ return this; }}, finally: function(f) {{ if(f) f(); return this; }} }};
+                }} catch(e) {{
+                    if(onRejected) onRejected(e);
+                    return {{ then: function() {{ return this; }}, catch: function(f) {{ if(f) f(e); return this; }}, finally: function(f) {{ if(f) f(); return this; }} }};
+                }}
+            }};
+            _resp.catch = function(onRejected) {{ return _resp.then(null, onRejected); }};
+            _resp.finally = function(fn) {{ if(fn) fn(); return _resp; }};
             return _resp;
         }})()"#,
         ok = ok,
@@ -969,11 +1167,11 @@ fn register_xhr(ctx: &mut Context) {
     let xhr_js = r#"
         function XMLHttpRequest() {
             this.readyState = 0;
-            this.status = 0;
-            this.statusText = "";
-            this.responseText = "";
+            this._status = 0;
+            this._statusText = "";
+            this._responseText = "";
             this.responseType = "";
-            this.response = null;
+            this._response = null;
             this._method = "GET";
             this._url = "";
             this._headers = {};
@@ -982,6 +1180,22 @@ fn register_xhr(ctx: &mut Context) {
             this.onload = null;
             this.onerror = null;
         }
+        Object.defineProperty(XMLHttpRequest.prototype, "responseText", {
+            get: function() { return this.readyState === 4 ? this._responseText : ""; },
+            configurable: true
+        });
+        Object.defineProperty(XMLHttpRequest.prototype, "response", {
+            get: function() { return this.readyState === 4 ? this._response : null; },
+            configurable: true
+        });
+        Object.defineProperty(XMLHttpRequest.prototype, "status", {
+            get: function() { return this.readyState === 4 ? this._status : 0; },
+            configurable: true
+        });
+        Object.defineProperty(XMLHttpRequest.prototype, "statusText", {
+            get: function() { return this.readyState === 4 ? this._statusText : ""; },
+            configurable: true
+        });
         XMLHttpRequest.prototype.open = function(method, url, async_flag) {
             this._method = method || "GET";
             this._url = url || "";
@@ -1003,15 +1217,15 @@ fn register_xhr(ctx: &mut Context) {
                 if (body) opts.body = body;
                 if (Object.keys(this._headers).length > 0) opts.headers = this._headers;
                 var resp = fetch(this._url, opts);
-                this.status = resp.status;
-                this.statusText = resp.statusText;
+                this._status = resp.status;
+                this._statusText = resp.statusText;
+                this._responseText = __nb_last_fetch_body || "";
+                this._response = this._responseText;
                 this.readyState = 4;
-                this.responseText = __nb_last_fetch_body || "";
-                this.response = this.responseText;
                 if (this.onreadystatechange) this.onreadystatechange();
                 if (this.onload) this.onload();
             } catch(e) {
-                this.status = 0;
+                this._status = 0;
                 this.readyState = 4;
                 if (this.onerror) this.onerror(e);
             }
@@ -1025,7 +1239,7 @@ fn register_xhr(ctx: &mut Context) {
         XMLHttpRequest.LOADING = 3;
         XMLHttpRequest.DONE = 4;
     "#;
-    let _ = ctx.eval(Source::from_bytes(xhr_js.as_bytes()));
+    if let Err(e) = ctx.eval(Source::from_bytes(xhr_js.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1086,8 +1300,21 @@ fn register_event_stubs(ctx: &mut Context) {
             this.preventDefault = function(){};
             this.stopPropagation = function(){};
         }
+
+        // Node constants (used by React, jQuery, etc.)
+        var Node = {
+            ELEMENT_NODE: 1,
+            TEXT_NODE: 3,
+            COMMENT_NODE: 8,
+            DOCUMENT_NODE: 9,
+            DOCUMENT_FRAGMENT_NODE: 11,
+            ATTRIBUTE_NODE: 2,
+            CDATA_SECTION_NODE: 4,
+            PROCESSING_INSTRUCTION_NODE: 7,
+            DOCUMENT_TYPE_NODE: 10
+        };
     "#;
-    let _ = ctx.eval(Source::from_bytes(events_js.as_bytes()));
+    if let Err(e) = ctx.eval(Source::from_bytes(events_js.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1137,18 +1364,21 @@ fn register_window_location(ctx: &mut Context, page_url: &str) {
 
     ctx.register_global_property(js_string!("location"), location, Attribute::all()).expect("location");
 
-    // Also set window.location and document.location via eval later
+    // Also set window.location and document.location
+    // SECURITY: Escape href/hostname to prevent JS string injection
+    let safe_href = href.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r");
+    let safe_hostname = hostname.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r");
     let loc_setup = format!(
-        r#"window.location = location; document.location = location; document.URL = "{href}"; document.domain = "{hostname}";"#
+        r#"window.location = location; document.location = location; document.URL = "{safe_href}"; document.domain = "{safe_hostname}";"#
     );
-    let _ = ctx.eval(Source::from_bytes(loc_setup.as_bytes()));
+    if let Err(e) = ctx.eval(Source::from_bytes(loc_setup.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 }
 
 // ═══════════════════════════════════════════════════════════════════
 // Window stubs
 // ═══════════════════════════════════════════════════════════════════
 
-fn register_window_stubs(ctx: &mut Context) {
+fn register_window_stubs(ctx: &mut Context, start_time: std::time::Instant) {
     // Don't recreate window — just add properties to existing global
     let window_js = r#"
         if (typeof window === "undefined") { var window = {}; }
@@ -1186,7 +1416,7 @@ fn register_window_stubs(ctx: &mut Context) {
         window.postMessage = function() {};
         window.getSelection = function() { return { toString: function() { return ""; }, rangeCount: 0, removeAllRanges: function() {} }; };
     "#;
-    let _ = ctx.eval(Source::from_bytes(window_js.as_bytes()));
+    if let Err(e) = ctx.eval(Source::from_bytes(window_js.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 
     let screen = ObjectInitializer::new(ctx)
         .property(js_string!("width"), JsValue::from(1920), Attribute::all())
@@ -1202,7 +1432,7 @@ fn register_window_stubs(ctx: &mut Context) {
         .property(js_string!("userAgent"), js_string!("Mozilla/5.0 NeuralBrowser/0.1"), Attribute::all())
         .property(js_string!("language"), js_string!("en-US"), Attribute::all())
         .property(js_string!("languages"), js_string!("en-US,en"), Attribute::all())
-        .property(js_string!("platform"), js_string!("Win32"), Attribute::all())
+        .property(js_string!("platform"), js_string!(if cfg!(target_os = "macos") { "MacIntel" } else if cfg!(target_os = "linux") { "Linux x86_64" } else { "Win32" }), Attribute::all())
         .property(js_string!("vendor"), js_string!("NeuralBrowser"), Attribute::all())
         .property(js_string!("cookieEnabled"), JsValue::from(false), Attribute::all())
         .property(js_string!("onLine"), JsValue::from(true), Attribute::all())
@@ -1221,13 +1451,33 @@ fn register_window_stubs(ctx: &mut Context) {
         .build();
     ctx.register_global_property(js_string!("history"), history, Attribute::all()).expect("history");
 
-    // performance.now()
+    // performance.now() — returns elapsed milliseconds since engine start
     let performance = ObjectInitializer::new(ctx)
-        .function(NativeFunction::from_fn_ptr(|_,_,_| Ok(JsValue::from(0.0))), js_string!("now"), 0)
+        .function(NativeFunction::from_copy_closure(move |_,_,_| {
+            let elapsed = start_time.elapsed().as_secs_f64() * 1000.0;
+            Ok(JsValue::from(elapsed))
+        }), js_string!("now"), 0)
         .function(NativeFunction::from_fn_ptr(|_,_,_| Ok(JsValue::undefined())), js_string!("mark"), 1)
         .function(NativeFunction::from_fn_ptr(|_,_,_| Ok(JsValue::undefined())), js_string!("measure"), 3)
         .build();
     ctx.register_global_property(js_string!("performance"), performance, Attribute::all()).expect("performance");
+
+    // Bug 5 fix: Alias common globals so window.document, window.navigator, etc. work
+    let alias_js = r#"
+        window.document = document;
+        window.navigator = navigator;
+        window.screen = screen;
+        window.history = history;
+        window.performance = performance;
+        window.console = console;
+        window.localStorage = localStorage;
+        window.sessionStorage = sessionStorage;
+        window.setTimeout = setTimeout;
+        window.setInterval = setInterval;
+        window.clearTimeout = clearTimeout;
+        window.clearInterval = clearInterval;
+    "#;
+    if let Err(e) = ctx.eval(Source::from_bytes(alias_js.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1284,7 +1534,7 @@ fn register_timer_stubs(ctx: &mut Context) {
             }
         }
     "#;
-    let _ = ctx.eval(Source::from_bytes(timer_js.as_bytes()));
+    if let Err(e) = ctx.eval(Source::from_bytes(timer_js.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 }
 
 /// Drain the setTimeout/setInterval/rAF callback queue (Phase 3).
@@ -1305,7 +1555,7 @@ fn drain_timer_queue(ctx: &mut Context) {
             }
         })();
     "#;
-    let _ = ctx.eval(Source::from_bytes(drain_js.as_bytes()));
+    if let Err(e) = ctx.eval(Source::from_bytes(drain_js.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 }
 
 /// Fire DOMContentLoaded and load events (Phase 3).
@@ -1320,7 +1570,7 @@ fn fire_lifecycle_events(ctx: &mut Context) {
             try { __nb_dispatchEvent("window", "load", { type: "load", target: window }); } catch(e) {}
         })();
     "#;
-    let _ = ctx.eval(Source::from_bytes(events_js.as_bytes()));
+    if let Err(e) = ctx.eval(Source::from_bytes(events_js.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1341,7 +1591,18 @@ fn register_misc_globals(ctx: &mut Context) {
     ctx.register_global_builtin_callable(js_string!("btoa"), 1,
         NativeFunction::from_fn_ptr(|_, args, ctx| {
             let input = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-            let encoded = base64_encode(input.as_bytes());
+            // btoa only accepts Latin1 (0-255). Reject characters outside that range.
+            let mut latin1_bytes = Vec::with_capacity(input.len());
+            for ch in input.chars() {
+                let cp = ch as u32;
+                if cp > 255 {
+                    return Err(boa_engine::JsError::from_opaque(
+                        JsValue::from(js_string!("InvalidCharacterError: btoa failed — character out of Latin1 range"))
+                    ));
+                }
+                latin1_bytes.push(cp as u8);
+            }
+            let encoded = base64_encode(&latin1_bytes);
             Ok(JsValue::from(js_string!(encoded)))
         }),
     ).expect("btoa");
@@ -1443,18 +1704,32 @@ fn register_misc_globals(ctx: &mut Context) {
             };
         }
 
-        // URL constructor stub
+        // URL constructor
         if (typeof URL === "undefined") {
             function URL(url, base) {
-                this.href = url;
-                this.origin = "";
-                this.protocol = "https:";
-                this.hostname = "";
-                this.pathname = url;
-                this.search = "";
-                this.hash = "";
-                this.searchParams = { get: function() { return null; }, set: function() {} };
+                var full = url;
+                if (base && !/^[a-z]+:\/\//i.test(url)) {
+                    full = base.replace(/\/[^\/]*$/, "/") + url;
+                }
+                this.href = full;
+                var m = full.match(/^([a-z]+:)\/\/([^\/:?#]+)(:\d+)?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
+                if (m) {
+                    this.protocol = m[1] || "https:";
+                    this.hostname = m[2] || "";
+                    this.port = (m[3]||"").replace(":","");
+                    this.host = this.hostname + (this.port ? ":" + this.port : "");
+                    this.pathname = m[4] || "/";
+                    this.search = m[5] || "";
+                    this.hash = m[6] || "";
+                    this.origin = this.protocol + "//" + this.host;
+                } else {
+                    this.protocol=""; this.hostname=""; this.port="";
+                    this.host=""; this.pathname=full; this.search="";
+                    this.hash=""; this.origin="";
+                }
+                this.searchParams = new URLSearchParams(this.search);
                 this.toString = function() { return this.href; };
+                this.toJSON = function() { return this.href; };
             }
         }
 
@@ -1464,11 +1739,31 @@ fn register_misc_globals(ctx: &mut Context) {
             this.abort = function() { this.signal.aborted = true; };
         }
 
-        // TextEncoder / TextDecoder stubs
+        // TextEncoder / TextDecoder
         function TextEncoder() {}
-        TextEncoder.prototype.encode = function(str) { return []; };
-        function TextDecoder() {}
-        TextDecoder.prototype.decode = function(arr) { return ""; };
+        TextEncoder.prototype.encode = function(str) {
+            if (!str) return [];
+            var arr = [];
+            for (var i = 0; i < str.length; i++) {
+                var code = str.charCodeAt(i);
+                if (code < 0x80) arr.push(code);
+                else if (code < 0x800) { arr.push(0xC0|(code>>6), 0x80|(code&0x3F)); }
+                else { arr.push(0xE0|(code>>12), 0x80|((code>>6)&0x3F), 0x80|(code&0x3F)); }
+            }
+            return arr;
+        };
+        function TextDecoder(enc) { this.encoding = enc || "utf-8"; }
+        TextDecoder.prototype.decode = function(arr) {
+            if (!arr || !arr.length) return "";
+            var r = "", i = 0;
+            while (i < arr.length) {
+                var b = arr[i];
+                if (b < 0x80) { r += String.fromCharCode(b); i++; }
+                else if (b < 0xE0) { r += String.fromCharCode(((b&0x1F)<<6)|(arr[i+1]&0x3F)); i+=2; }
+                else { r += String.fromCharCode(((b&0x0F)<<12)|((arr[i+1]&0x3F)<<6)|(arr[i+2]&0x3F)); i+=3; }
+            }
+            return r;
+        };
 
         // structuredClone
         if (typeof structuredClone === "undefined") {
@@ -1546,44 +1841,72 @@ fn register_misc_globals(ctx: &mut Context) {
             return { querySelector: function() { return null; }, querySelectorAll: function() { return []; }, body: null };
         };
 
-        // Blob stub
+        // Blob — text()/arrayBuffer() return Promises per spec
         function Blob(parts, options) {
+            this._parts = parts || [];
             this.size = 0;
             this.type = (options && options.type) || "";
-            if (parts) for (var i = 0; i < parts.length; i++) this.size += (parts[i].length || 0);
-            this.text = function() { return parts ? parts.join("") : ""; };
-            this.arrayBuffer = function() { return []; };
-            this.slice = function() { return new Blob([]); };
+            for (var i = 0; i < this._parts.length; i++) this.size += (this._parts[i].length || 0);
         }
+        Blob.prototype.text = function() { return Promise.resolve(this._parts.join("")); };
+        Blob.prototype.arrayBuffer = function() {
+            var str = this._parts.join("");
+            var enc = new TextEncoder();
+            return Promise.resolve(enc.encode(str));
+        };
+        Blob.prototype.slice = function(start, end, type) {
+            var txt = this._parts.join("");
+            var sliced = txt.slice(start || 0, end || txt.length);
+            return new Blob([sliced], { type: type || this.type });
+        };
 
-        // File extends Blob
+        // File extends Blob (proper prototype chain)
         function File(parts, name, options) {
             Blob.call(this, parts, options);
             this.name = name || "";
-            this.lastModified = Date.now();
+            this.lastModified = (options && options.lastModified) || Date.now();
         }
+        File.prototype = Object.create(Blob.prototype);
+        File.prototype.constructor = File;
 
-        // Headers stub
+        // Headers — supports multiple values per key via append()
         function Headers(init) {
             this._h = {};
-            if (init) { for (var k in init) this._h[k.toLowerCase()] = init[k]; }
-            this.get = function(name) { return this._h[name.toLowerCase()] || null; };
-            this.set = function(name, val) { this._h[name.toLowerCase()] = val; };
-            this.has = function(name) { return name.toLowerCase() in this._h; };
-            this.delete = function(name) { delete this._h[name.toLowerCase()]; };
-            this.append = function(name, val) { this._h[name.toLowerCase()] = val; };
-            this.entries = function() { var arr = []; for (var k in this._h) arr.push([k, this._h[k]]); return arr; };
+            if (init) {
+                if (Array.isArray(init)) {
+                    for (var i = 0; i < init.length; i++) this.append(init[i][0], init[i][1]);
+                } else {
+                    for (var k in init) this.set(k, init[k]);
+                }
+            }
         }
+        Headers.prototype.get = function(name) {
+            var vals = this._h[name.toLowerCase()];
+            return vals ? vals.join(", ") : null;
+        };
+        Headers.prototype.set = function(name, val) { this._h[name.toLowerCase()] = [String(val)]; };
+        Headers.prototype.has = function(name) { return name.toLowerCase() in this._h; };
+        Headers.prototype.delete = function(name) { delete this._h[name.toLowerCase()]; };
+        Headers.prototype.append = function(name, val) {
+            var key = name.toLowerCase();
+            if (!this._h[key]) this._h[key] = [];
+            this._h[key].push(String(val));
+        };
+        Headers.prototype.entries = function() {
+            var arr = [];
+            for (var k in this._h) arr.push([k, this._h[k].join(", ")]);
+            return arr;
+        };
+        Headers.prototype.forEach = function(cb) {
+            for (var k in this._h) cb(this._h[k].join(", "), k, this);
+        };
 
         // requestIdleCallback stub
         function requestIdleCallback(fn) { setTimeout(fn, 0); return ++__nb_timer_id; }
         function cancelIdleCallback(id) { clearTimeout(id); }
 
-        // document.createDocumentFragment stub
-        document.createDocumentFragment = function() {
-            var frag = document.createElement("div");
-            return frag;
-        };
+        // document.createDocumentFragment — uses the proper native implementation
+        // (already wrapped above via _origCreateDocFragment)
 
         // document.createEvent stub
         document.createEvent = function(type) {
@@ -1608,7 +1931,7 @@ fn register_misc_globals(ctx: &mut Context) {
             return false;
         }
     "#;
-    let _ = ctx.eval(Source::from_bytes(mutation_js.as_bytes()));
+    if let Err(e) = ctx.eval(Source::from_bytes(mutation_js.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1628,16 +1951,21 @@ fn register_element_wrapper(ctx: &mut Context) {
 
     // ── __NB_Element constructor ──
     function __NB_Element(nodeId) {
+        if (!(this instanceof __NB_Element)) return new __NB_Element(nodeId);
         if (nodeId === null || nodeId === undefined) return null;
         // Return cached wrapper if exists
         if (__nb_element_cache[nodeId]) return __nb_element_cache[nodeId];
 
         this.__nb_id = nodeId;
-        this.nodeType = 1; // ELEMENT_NODE
+        this.nodeType = 1; // default ELEMENT_NODE, updated by getter below
         this._eventListeners = {};
 
         // Cache it
         __nb_element_cache[nodeId] = this;
+        var _cacheKeys = Object.keys(__nb_element_cache);
+        if (_cacheKeys.length > 5000) {
+            for (var _ci = 0; _ci < 500; _ci++) delete __nb_element_cache[_cacheKeys[_ci]];
+        }
 
         // ── Style proxy ──
         this.style = new __nb_StyleProxy(nodeId);
@@ -1665,6 +1993,39 @@ fn register_element_wrapper(ctx: &mut Context) {
         return result;
     }
 
+    // ── nodeType property (lazy — reads tag from DOM) ──
+    Object.defineProperty(__NB_Element.prototype, "nodeType", {
+        get: function() {
+            if (this._nodeType !== undefined) return this._nodeType;
+            try {
+                var tag = __nb_getTagName(this.__nb_id);
+                if (tag === "#text") this._nodeType = 3;
+                else if (tag === "#comment") this._nodeType = 8;
+                else if (tag === "#document") this._nodeType = 9;
+                else if (tag === "#document-fragment") this._nodeType = 11;
+                else this._nodeType = 1;
+            } catch(e) { this._nodeType = 1; }
+            return this._nodeType;
+        },
+        set: function(v) { this._nodeType = v; },
+        enumerable: true, configurable: true
+    });
+
+    // ── nodeName property (lazy) ──
+    Object.defineProperty(__NB_Element.prototype, "nodeName", {
+        get: function() {
+            if (this._nodeName !== undefined) return this._nodeName;
+            try {
+                var tag = __nb_getTagName(this.__nb_id);
+                if (tag && tag.charAt(0) === "#") this._nodeName = tag;
+                else this._nodeName = tag ? tag.toUpperCase() : "";
+            } catch(e) { this._nodeName = ""; }
+            return this._nodeName;
+        },
+        set: function(v) { this._nodeName = v; },
+        enumerable: true, configurable: true
+    });
+
     // ── textContent property ──
     Object.defineProperty(__NB_Element.prototype, "textContent", {
         get: function() { return __nb_getTextContent(this.__nb_id); },
@@ -1686,12 +2047,25 @@ fn register_element_wrapper(ctx: &mut Context) {
         enumerable: true, configurable: true
     });
 
-    // ── outerHTML property ──
+    // ── outerHTML property (includes attributes) ──
     Object.defineProperty(__NB_Element.prototype, "outerHTML", {
         get: function() {
-            var tag = __nb_getTagName(this.__nb_id).toLowerCase();
-            var inner = __nb_getInnerHTML(this.__nb_id);
-            return "<" + tag + ">" + inner + "</" + tag + ">";
+            // Use the Rust-side reconstruction which includes attributes
+            return __nb_getInnerHTML(this.__nb_id) || (function(el) {
+                var tag = __nb_getTagName(el.__nb_id).toLowerCase();
+                if (tag.charAt(0) === "#") return el.textContent || "";
+                var attrs = "";
+                var id = el.id; if (id) attrs += ' id="' + id + '"';
+                var cls = el.className; if (cls) attrs += ' class="' + cls + '"';
+                var inner = "";
+                var kids = __nb_getChildren(el.__nb_id) || [];
+                for (var i = 0; i < kids.length; i++) {
+                    var child = __nb_wrap(kids[i]);
+                    if (child) inner += child.outerHTML || "";
+                }
+                if (el.textContent && kids.length === 0) inner = el.textContent;
+                return "<" + tag + attrs + ">" + inner + "</" + tag + ">";
+            })(this);
         },
         enumerable: true, configurable: true
     });
@@ -1963,6 +2337,59 @@ fn register_element_wrapper(ctx: &mut Context) {
         }
     };
 
+    // ── insertAdjacentHTML / insertAdjacentElement / insertAdjacentText ──
+    __NB_Element.prototype.insertAdjacentHTML = function(position, html) {
+        var temp = document.createElement("div");
+        temp.innerHTML = html;
+        var kids = temp.childNodes;
+        var pos = (position || "").toLowerCase();
+        if (pos === "beforebegin") {
+            for (var i = 0; i < kids.length; i++) this.before(kids[i]);
+        } else if (pos === "afterbegin") {
+            var first = this.firstChild;
+            for (var i = kids.length - 1; i >= 0; i--) {
+                if (first) this.insertBefore(kids[i], first);
+                else this.appendChild(kids[i]);
+                first = this.firstChild;
+            }
+        } else if (pos === "beforeend") {
+            for (var i = 0; i < kids.length; i++) this.appendChild(kids[i]);
+        } else if (pos === "afterend") {
+            for (var i = kids.length - 1; i >= 0; i--) this.after(kids[i]);
+        }
+    };
+    __NB_Element.prototype.insertAdjacentElement = function(position, el) {
+        if (!el) return null;
+        var pos = (position || "").toLowerCase();
+        if (pos === "beforebegin") this.before(el);
+        else if (pos === "afterbegin") this.prepend(el);
+        else if (pos === "beforeend") this.appendChild(el);
+        else if (pos === "afterend") this.after(el);
+        return el;
+    };
+    __NB_Element.prototype.insertAdjacentText = function(position, text) {
+        this.insertAdjacentHTML(position, text);
+    };
+
+    // ── hasChildNodes ──
+    __NB_Element.prototype.hasChildNodes = function() {
+        return __nb_getChildCount(this.__nb_id) > 0;
+    };
+
+    // ── nodeValue (for text/comment nodes) ──
+    Object.defineProperty(__NB_Element.prototype, "nodeValue", {
+        get: function() {
+            var nt = this.nodeType;
+            if (nt === 3 || nt === 8) return this.textContent;
+            return null;
+        },
+        set: function(v) {
+            var nt = this.nodeType;
+            if (nt === 3 || nt === 8) this.textContent = v;
+        },
+        enumerable: true, configurable: true
+    });
+
     // ── Attribute methods ──
     __NB_Element.prototype.setAttribute = function(key, val) {
         __nb_setAttribute(this.__nb_id, key, String(val));
@@ -2029,15 +2456,60 @@ fn register_element_wrapper(ctx: &mut Context) {
 
     // ── matches / closest ──
     __NB_Element.prototype.matches = function(sel) {
-        // Simple matching: tag, #id, .class
+        // Compound selector matching: supports tag, #id, .class, [attr], and combinations
         if (!sel) return false;
-        if (sel.charAt(0) === "#") {
-            return this.id === sel.substring(1);
+        sel = sel.trim();
+        // Handle comma-separated selectors (OR)
+        if (sel.indexOf(",") >= 0) {
+            var parts = sel.split(",");
+            for (var i = 0; i < parts.length; i++) {
+                if (this.matches(parts[i].trim())) return true;
+            }
+            return false;
         }
-        if (sel.charAt(0) === ".") {
-            return this.classList.contains(sel.substring(1));
+        // Split compound selector into parts: tag, .class, #id, [attr]
+        var regex = /([a-zA-Z0-9_-]+)|(\.[a-zA-Z0-9_-]+)|(#[a-zA-Z0-9_-]+)|(\[[^\]]+\])|(\*)/g;
+        var match;
+        var hasAny = false;
+        while ((match = regex.exec(sel)) !== null) {
+            hasAny = true;
+            var token = match[0];
+            if (token === "*") { continue; }
+            if (token.charAt(0) === "#") {
+                if (this.id !== token.substring(1)) return false;
+            } else if (token.charAt(0) === ".") {
+                if (!this.classList.contains(token.substring(1))) return false;
+            } else if (token.charAt(0) === "[") {
+                // Attribute selector: [attr], [attr=val], [attr~=val], [attr^=val]
+                var inner = token.slice(1, -1);
+                var eqIdx = inner.indexOf("=");
+                if (eqIdx < 0) {
+                    if (!this.hasAttribute(inner)) return false;
+                } else {
+                    var op = inner.charAt(eqIdx - 1);
+                    var attrName, attrVal;
+                    if (op === "~" || op === "^" || op === "$" || op === "*") {
+                        attrName = inner.substring(0, eqIdx - 1);
+                        attrVal = inner.substring(eqIdx + 1).replace(/^["']|["']$/g, "");
+                    } else {
+                        attrName = inner.substring(0, eqIdx);
+                        attrVal = inner.substring(eqIdx + 1).replace(/^["']|["']$/g, "");
+                        op = "=";
+                    }
+                    var actual = this.getAttribute(attrName);
+                    if (actual === null) return false;
+                    if (op === "=" && actual !== attrVal) return false;
+                    if (op === "~" && !(" " + actual + " ").includes(" " + attrVal + " ")) return false;
+                    if (op === "^" && !actual.startsWith(attrVal)) return false;
+                    if (op === "$" && !actual.endsWith(attrVal)) return false;
+                    if (op === "*" && !actual.includes(attrVal)) return false;
+                }
+            } else {
+                // Tag name match
+                if (this.tagName.toLowerCase() !== token.toLowerCase()) return false;
+            }
         }
-        return this.tagName.toLowerCase() === sel.toLowerCase();
+        return hasAny;
     };
     __NB_Element.prototype.closest = function(sel) {
         var el = this;
@@ -2076,10 +2548,29 @@ fn register_element_wrapper(ctx: &mut Context) {
     __NB_Element.prototype.dispatchEvent = function(event) {
         var type = event.type || event;
         event.target = this;
+        var _stopped = false;
+        var origStop = event.stopPropagation;
+        event.stopPropagation = function() { _stopped = true; if (origStop) origStop.call(event); };
+        // Fire listeners on the target element
         event.currentTarget = this;
         if (this._eventListeners[type]) {
             for (var i = 0; i < this._eventListeners[type].length; i++) {
                 try { this._eventListeners[type][i].call(this, event); } catch(e) {}
+            }
+        }
+        // Bubble up through parent elements if event.bubbles is true
+        if (event.bubbles !== false && !_stopped) {
+            var parentId = __nb_getParent(this.__nb_id);
+            while (parentId !== null && parentId !== undefined && !_stopped) {
+                var parentEl = __nb_wrap(parentId);
+                event.currentTarget = parentEl;
+                if (parentEl._eventListeners && parentEl._eventListeners[type]) {
+                    for (var j = 0; j < parentEl._eventListeners[type].length; j++) {
+                        try { parentEl._eventListeners[type][j].call(parentEl, event); } catch(e) {}
+                        if (_stopped) break;
+                    }
+                }
+                parentId = __nb_getParent(parentId);
             }
         }
         return true;
@@ -2139,7 +2630,7 @@ fn register_element_wrapper(ctx: &mut Context) {
     __NB_Element.prototype.focus = function() {};
     __NB_Element.prototype.blur = function() {};
     __NB_Element.prototype.click = function() {
-        this.dispatchEvent({ type: "click", target: this, preventDefault: function(){}, stopPropagation: function(){} });
+        this.dispatchEvent({ type: "click", bubbles: true, target: this, preventDefault: function(){}, stopPropagation: function(){} });
     };
     __NB_Element.prototype.scrollIntoView = function() {};
     __NB_Element.prototype.animate = function() { return { finished: Promise.resolve(), cancel: function(){}, play: function(){} }; };
@@ -2168,6 +2659,8 @@ fn register_element_wrapper(ctx: &mut Context) {
     var _origGetByTagName = document.getElementsByTagName;
     var _origGetByClassName = document.getElementsByClassName;
     var _origCreateTextNode = document.createTextNode;
+    var _origCreateComment = document.createComment;
+    var _origCreateDocFragment = document.createDocumentFragment;
 
     // Keep raw versions for internal use
     document.__nb_querySelectorAll = function(sel) {
@@ -2188,7 +2681,17 @@ fn register_element_wrapper(ctx: &mut Context) {
     };
 
     document.createTextNode = function(text) {
-        var nid = _origCreateTextNode.call(document, "", text);
+        var nid = _origCreateTextNode.call(document, text);
+        return __nb_wrap(nid);
+    };
+
+    document.createComment = function(text) {
+        var nid = _origCreateComment.call(document, text);
+        return __nb_wrap(nid);
+    };
+
+    document.createDocumentFragment = function() {
+        var nid = _origCreateDocFragment.call(document);
         return __nb_wrap(nid);
     };
 
@@ -2350,7 +2853,7 @@ fn register_style_api(ctx: &mut Context, dom: DomPtr) {
         // __nb_getNodeStyle(nodeId) -> StyleProxy
         function __nb_getNodeStyle(nodeId) { return new __nb_StyleProxy(nodeId); }
     "#;
-    let _ = ctx.eval(Source::from_bytes(style_proxy_js.as_bytes()));
+    if let Err(e) = ctx.eval(Source::from_bytes(style_proxy_js.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 }
 
 /// Parse value from inline style string: "display: none; color: red" → get "display" → "none"
@@ -2448,7 +2951,7 @@ fn register_form_api(ctx: &mut Context, dom: DomPtr) {
         NativeFunction::from_copy_closure(move |_, args, ctx| {
             let nid = args.get_or_undefined(0).to_i32(ctx)? as usize;
             let d = unsafe { dom.get() };
-            let checked = d.nodes.get(nid).map_or(false, |n| n.attrs.contains_key("checked"));
+            let checked = d.nodes.get(nid).is_some_and(|n| n.attrs.contains_key("checked"));
             Ok(JsValue::from(checked))
         }),
     ).expect("getChecked");
@@ -2475,7 +2978,7 @@ fn register_form_api(ctx: &mut Context, dom: DomPtr) {
         NativeFunction::from_copy_closure(move |_, args, ctx| {
             let nid = args.get_or_undefined(0).to_i32(ctx)? as usize;
             let d = unsafe { dom.get() };
-            let disabled = d.nodes.get(nid).map_or(false, |n| n.attrs.contains_key("disabled"));
+            let disabled = d.nodes.get(nid).is_some_and(|n| n.attrs.contains_key("disabled"));
             Ok(JsValue::from(disabled))
         }),
     ).expect("getDisabled");
@@ -2543,7 +3046,7 @@ fn register_cookie_api(ctx: &mut Context, cookies: StoragePtr) {
             enumerable: true, configurable: true
         });
     "#;
-    let _ = ctx.eval(Source::from_bytes(cookie_js.as_bytes()));
+    if let Err(e) = ctx.eval(Source::from_bytes(cookie_js.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2558,7 +3061,31 @@ fn register_document_write(ctx: &mut Context, dom: DomPtr) {
             let d = unsafe { dom.get_mut() };
             // Find body node, or use root
             let body_id = d.query_selector("body").unwrap_or(0);
-            d.set_inner_html(body_id, &html);
+            // Append instead of replace — parse fragment and attach children
+            let fragment = super::dom::parse_html(&html);
+            let base_id = d.nodes.len();
+            let parent_depth = d.nodes.get(body_id).map(|n| n.depth).unwrap_or(0);
+            for frag_node in &fragment.nodes {
+                let new_id = base_id + frag_node.id;
+                let new_parent = match frag_node.parent {
+                    Some(p) => Some(base_id + p),
+                    None => Some(body_id),
+                };
+                d.nodes.push(super::dom::DomNode {
+                    id: new_id,
+                    tag: frag_node.tag.clone(),
+                    attrs: frag_node.attrs.clone(),
+                    text: frag_node.text.clone(),
+                    parent: new_parent,
+                    children: frag_node.children.iter().map(|c| base_id + c).collect(),
+                    depth: parent_depth + 1 + frag_node.depth,
+                });
+            }
+            for frag_node in &fragment.nodes {
+                if frag_node.parent.is_none() {
+                    d.nodes[body_id].children.push(base_id + frag_node.id);
+                }
+            }
             Ok(JsValue::undefined())
         }),
     ).expect("documentWrite");
@@ -2576,7 +3103,7 @@ fn register_document_write(ctx: &mut Context, dom: DomPtr) {
             __nb_documentWrite(html);
         };
     "#;
-    let _ = ctx.eval(Source::from_bytes(write_js.as_bytes()));
+    if let Err(e) = ctx.eval(Source::from_bytes(write_js.as_bytes())) { log::warn!("[JS] eval failed: {e:?}"); }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2615,14 +3142,15 @@ fn base64_decode(input: &str) -> Option<String> {
         B64_CHARS.iter().position(|&c| c == b).map(|p| p as u8)
     }).collect();
     for chunk in chars.chunks(4) {
+        // Use u32 arithmetic to avoid u8 overflow on bit shifts
         if chunk.len() >= 2 {
-            bytes.push((chunk[0] << 2) | (chunk[1] >> 4));
+            bytes.push(((chunk[0] as u32) << 2 | (chunk[1] as u32) >> 4) as u8);
         }
         if chunk.len() >= 3 {
-            bytes.push((chunk[1] << 4) | (chunk[2] >> 2));
+            bytes.push((((chunk[1] as u32) & 0x0F) << 4 | (chunk[2] as u32) >> 2) as u8);
         }
         if chunk.len() >= 4 {
-            bytes.push((chunk[2] << 6) | chunk[3]);
+            bytes.push((((chunk[2] as u32) & 0x03) << 6 | chunk[3] as u32) as u8);
         }
     }
     String::from_utf8(bytes).ok()

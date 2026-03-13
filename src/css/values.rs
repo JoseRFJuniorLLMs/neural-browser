@@ -288,6 +288,7 @@ fn hue_to_rgb(p: f32, q: f32, mut t: f32) -> f32 {
 
 /// A CSS length value with its unit.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Default)]
 pub enum CssLength {
     /// Pixels (absolute)
     Px(f32),
@@ -308,6 +309,7 @@ pub enum CssLength {
     /// auto
     Auto,
     /// No value specified (use default/inherit)
+    #[default]
     None,
 }
 
@@ -356,16 +358,13 @@ impl CssLength {
     }
 }
 
-impl Default for CssLength {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 /// CSS display property values.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Default)]
 pub enum CssDisplay {
     Block,
+    #[default]
     Inline,
     InlineBlock,
     Flex,
@@ -415,11 +414,6 @@ impl CssDisplay {
     }
 }
 
-impl Default for CssDisplay {
-    fn default() -> Self {
-        Self::Inline // HTML default; overridden by user-agent stylesheet
-    }
-}
 
 /// CSS position property.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]

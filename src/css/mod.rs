@@ -16,5 +16,7 @@ pub mod selector;
 pub mod cascade;
 
 // Re-exports used by NPU (css cascade) and GPU (layout styling)
+#[allow(unused_imports)]
 pub use cascade::{ComputedStyle, StyledNode};
+#[allow(unused_imports)]
 pub use values::CssDisplay;

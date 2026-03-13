@@ -25,7 +25,7 @@ pub fn matches_selector(selector: &Selector, node: &DomNode, tree: &DomTree) -> 
     // Check the subject node matches all simple selectors
     if let Some(nid) = current_node_id {
         if let Some(n) = tree.nodes.get(nid) {
-            if !matches_compound(&simple_parts, n) {
+            if !matches_compound_in_tree(&simple_parts, n, Some(tree)) {
                 return false;
             }
         } else {
@@ -57,7 +57,7 @@ pub fn matches_selector(selector: &Selector, node: &DomNode, tree: &DomTree) -> 
                 let mut ancestor_id = current_node_id.and_then(|id| tree.nodes.get(id)?.parent);
                 while let Some(aid) = ancestor_id {
                     if let Some(ancestor) = tree.nodes.get(aid) {
-                        if matches_compound(&next_simple, ancestor) {
+                        if matches_compound_in_tree(&next_simple, ancestor, Some(tree)) {
                             current_node_id = Some(aid);
                             found = true;
                             break;
@@ -76,7 +76,7 @@ pub fn matches_selector(selector: &Selector, node: &DomNode, tree: &DomTree) -> 
                 let parent_id = current_node_id.and_then(|id| tree.nodes.get(id)?.parent);
                 if let Some(pid) = parent_id {
                     if let Some(parent) = tree.nodes.get(pid) {
-                        if !matches_compound(&next_simple, parent) {
+                        if !matches_compound_in_tree(&next_simple, parent, Some(tree)) {
                             return false;
                         }
                         current_node_id = Some(pid);
@@ -90,7 +90,7 @@ pub fn matches_selector(selector: &Selector, node: &DomNode, tree: &DomTree) -> 
             Combinator::NextSibling => {
                 // Previous sibling must match
                 if let Some(prev) = get_previous_sibling(current_node_id.unwrap_or(0), tree) {
-                    if !matches_compound(&next_simple, prev) {
+                    if !matches_compound_in_tree(&next_simple, prev, Some(tree)) {
                         return false;
                     }
                     current_node_id = Some(prev.id);
@@ -103,7 +103,7 @@ pub fn matches_selector(selector: &Selector, node: &DomNode, tree: &DomTree) -> 
                 let mut found = false;
                 let mut sibling = get_previous_sibling(current_node_id.unwrap_or(0), tree);
                 while let Some(s) = sibling {
-                    if matches_compound(&next_simple, s) {
+                    if matches_compound_in_tree(&next_simple, s, Some(tree)) {
                         current_node_id = Some(s.id);
                         found = true;
                         break;
@@ -122,8 +122,13 @@ pub fn matches_selector(selector: &Selector, node: &DomNode, tree: &DomTree) -> 
 
 /// Match a compound selector (list of simple selectors) against a node.
 fn matches_compound(parts: &[&SelectorPart], node: &DomNode) -> bool {
+    matches_compound_in_tree(parts, node, None)
+}
+
+/// Match a compound selector against a node, with optional tree context for structural pseudo-classes.
+fn matches_compound_in_tree(parts: &[&SelectorPart], node: &DomNode, tree: Option<&DomTree>) -> bool {
     for part in parts {
-        if !matches_simple(part, node) {
+        if !matches_simple(part, node, tree) {
             return false;
         }
     }
@@ -131,7 +136,7 @@ fn matches_compound(parts: &[&SelectorPart], node: &DomNode) -> bool {
 }
 
 /// Match a single simple selector against a node.
-fn matches_simple(part: &SelectorPart, node: &DomNode) -> bool {
+fn matches_simple(part: &SelectorPart, node: &DomNode, tree: Option<&DomTree>) -> bool {
     match part {
         SelectorPart::Universal => true,
         SelectorPart::Tag(tag) => node.tag == *tag,
@@ -179,14 +184,41 @@ fn matches_simple(part: &SelectorPart, node: &DomNode) -> bool {
                 }
                 "first-child" => {
                     // True if node is the first child of its parent
-                    // We'd need tree context; for now, approximate
-                    node.depth > 0 // placeholder
+                    if let Some(t) = tree {
+                        if let Some(parent_id) = node.parent {
+                            if let Some(parent) = t.nodes.get(parent_id) {
+                                parent.children.first() == Some(&node.id)
+                            } else {
+                                false
+                            }
+                        } else {
+                            // No parent means it's a root — treat as first child
+                            true
+                        }
+                    } else {
+                        // No tree context available; conservatively match
+                        true
+                    }
                 }
                 "root" => node.depth == 0 && node.tag == "html",
                 "empty" => node.text.is_empty() && node.children.is_empty(),
                 "not" => {
-                    // :not() inversion — would need to parse inner selector
-                    // For now, always true (matches if not-condition can't be evaluated)
+                    // :not() inversion — parse inner selector and negate
+                    if let Some(args) = _args {
+                        let inner_css = format!("{} {{}}", args);
+                        let inner_sheet = super::parser::parse_stylesheet(&inner_css);
+                        if let Some(rule) = inner_sheet.rules.first() {
+                            if let Some(inner_sel) = rule.selectors.first() {
+                                if let Some(t) = tree {
+                                    return !matches_selector(inner_sel, node, t);
+                                }
+                                // No tree context: match the compound parts without tree
+                                let parts: Vec<&SelectorPart> = inner_sel.parts.iter().collect();
+                                return !matches_compound(&parts, node);
+                            }
+                        }
+                    }
+                    // If no args or parse failed, default to true (match)
                     true
                 }
                 _ => true, // Unknown pseudo-classes match by default
@@ -201,7 +233,7 @@ fn matches_simple(part: &SelectorPart, node: &DomNode) -> bool {
 }
 
 /// Get the previous sibling of a node in the DOM tree.
-fn get_previous_sibling<'a>(node_id: usize, tree: &'a DomTree) -> Option<&'a DomNode> {
+fn get_previous_sibling(node_id: usize, tree: &DomTree) -> Option<&DomNode> {
     let node = tree.nodes.get(node_id)?;
     let parent_id = node.parent?;
     let parent = tree.nodes.get(parent_id)?;

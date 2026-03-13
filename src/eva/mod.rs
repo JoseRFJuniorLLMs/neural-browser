@@ -235,7 +235,7 @@ impl AiClient {
             .unwrap_or_else(|_| r#"{"response":"Read error."}"#.into());
 
         Ok(extract_json_field(&body_str, "response")
-            .unwrap_or_else(|| body_str))
+            .unwrap_or(body_str))
     }
 
     // ── Claude provider (Anthropic API) ──
@@ -285,7 +285,7 @@ impl AiClient {
 
         // Parse Claude response: {"content":[{"type":"text","text":"..."}]}
         extract_json_field(&body_str, "text")
-            .map(|t| Ok(t))
+            .map(Ok)
             .unwrap_or_else(|| Ok(body_str))
     }
 
@@ -333,7 +333,7 @@ impl AiClient {
 
         // Parse Gemini response: {"candidates":[{"content":{"parts":[{"text":"..."}]}}]}
         extract_json_field(&body_str, "text")
-            .map(|t| Ok(t))
+            .map(Ok)
             .unwrap_or_else(|| Ok(body_str))
     }
 
@@ -381,7 +381,7 @@ impl AiClient {
 
         // Parse OpenAI response: {"choices":[{"message":{"content":"..."}}]}
         extract_json_field(&body_str, "content")
-            .map(|t| Ok(t))
+            .map(Ok)
             .unwrap_or_else(|| Ok(body_str))
     }
 }
@@ -404,36 +404,46 @@ fn escape_json(s: &str) -> String {
 }
 
 /// Extract a string field from a JSON object (simple parser, no serde needed).
+/// Scans all occurrences of the field name to find one used as a key (followed by ':').
 fn extract_json_field(json: &str, field: &str) -> Option<String> {
     let pattern = format!("\"{}\"", field);
-    let pos = json.find(&pattern)?;
-    let after_key = &json[pos + pattern.len()..];
+    let mut search_start = 0;
 
-    let after_colon = after_key.trim_start();
-    let after_colon = after_colon.strip_prefix(':')?;
-    let after_colon = after_colon.trim_start();
-    let after_colon = after_colon.strip_prefix('"')?;
+    while let Some(rel_pos) = json[search_start..].find(&pattern) {
+        let pos = search_start + rel_pos;
+        let after_key = &json[pos + pattern.len()..];
 
-    let mut result = String::new();
-    let mut chars = after_colon.chars();
-    loop {
-        match chars.next() {
-            None => break,
-            Some('\\') => match chars.next() {
-                Some('n') => result.push('\n'),
-                Some('r') => result.push('\r'),
-                Some('t') => result.push('\t'),
-                Some('"') => result.push('"'),
-                Some('\\') => result.push('\\'),
-                Some(c) => { result.push('\\'); result.push(c); }
-                None => break,
-            },
-            Some('"') => break,
-            Some(c) => result.push(c),
+        let trimmed = after_key.trim_start();
+        if let Some(after_colon) = trimmed.strip_prefix(':') {
+            let after_colon = after_colon.trim_start();
+            if let Some(after_quote) = after_colon.strip_prefix('"') {
+                let mut result = String::new();
+                let mut chars = after_quote.chars();
+                loop {
+                    match chars.next() {
+                        None => break,
+                        Some('\\') => match chars.next() {
+                            Some('n') => result.push('\n'),
+                            Some('r') => result.push('\r'),
+                            Some('t') => result.push('\t'),
+                            Some('"') => result.push('"'),
+                            Some('\\') => result.push('\\'),
+                            Some(c) => { result.push('\\'); result.push(c); }
+                            None => break,
+                        },
+                        Some('"') => break,
+                        Some(c) => result.push(c),
+                    }
+                }
+                return Some(result);
+            }
         }
+
+        // This occurrence was a value, not a key — skip past it and try the next one
+        search_start = pos + pattern.len();
     }
 
-    Some(result)
+    None
 }
 
 /// Convert ureq errors to friendly messages.
@@ -498,6 +508,14 @@ mod tests {
     fn test_extract_json_field_with_escapes() {
         let json = r#"{"response":"Line 1\nLine 2"}"#;
         assert_eq!(extract_json_field(json, "response"), Some("Line 1\nLine 2".into()));
+    }
+
+    #[test]
+    fn test_extract_claude_response_text_field() {
+        // Claude API returns "text" both as a value (for "type") and as a key.
+        // The parser must skip the value occurrence and find the key occurrence.
+        let json = r#"{"content":[{"type":"text","text":"Hello from Claude!"}]}"#;
+        assert_eq!(extract_json_field(json, "text"), Some("Hello from Claude!".into()));
     }
 
     #[test]

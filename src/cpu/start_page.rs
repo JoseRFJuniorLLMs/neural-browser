@@ -31,8 +31,12 @@ pub fn start_page_html() -> &'static str {
         <li>Alt+Left / Alt+Right — Back / Forward</li>
         <li>Page Up / Page Down — Scroll by page</li>
         <li>Home / End — Scroll to top / bottom</li>
-        <li>Ctrl+E / F2 — Toggle EVA AI panel</li>
-        <li>Ctrl+S — Ask EVA to summarize current page</li>
+        <li>Ctrl+E / F2 — Toggle AI assistant panel</li>
+        <li>Tab (in panel) — Switch AI provider (EVA → Claude → Gemini → GPT-4)</li>
+        <li>Ctrl+S — Ask AI to summarize current page</li>
+        <li>Ctrl+D — Reading mode (high-relevance content only + AI summary)</li>
+        <li>Ctrl+T — Translate page to Portuguese</li>
+        <li>Ctrl+Shift+V (in panel) — Voice response via EVA</li>
     </ul>
 
     <h2>Try These Pages</h2>
@@ -53,6 +57,16 @@ pub fn start_page_html() -> &'static str {
         <li>NPU detects the page language</li>
         <li>GPU computes layout and renders text via glyphon</li>
     </ol>
+
+    <h2>AI Features</h2>
+    <ul>
+        <li><strong>Multi-AI</strong> — EVA, Claude, Gemini, GPT-4 (Tab to switch in panel)</li>
+        <li><strong>Smart Search</strong> — Type a question in the URL bar, AI answers directly</li>
+        <li><strong>Reading Mode</strong> — Ctrl+D strips noise, shows only high-relevance content</li>
+        <li><strong>Auto-Translate</strong> — Ctrl+T translates page via active AI provider</li>
+        <li><strong>Voice Response</strong> — Ctrl+Shift+V: EVA reads the last AI response aloud</li>
+        <li><strong>Proactive Insights</strong> — When AI panel is open, auto-suggests questions about the page</li>
+    </ul>
 
     <p>Press F6 to enter a URL and start browsing.</p>
 </main>

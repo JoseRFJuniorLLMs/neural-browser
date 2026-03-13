@@ -53,22 +53,49 @@ pub enum PipelineMsg {
     // NPU -> CPU: prefetch suggestion
     Prefetch(String),
 
-    // ── EVA messages ──
+    // ── AI assistant messages ──
 
-    // GPU -> CPU: user asks EVA a question
+    // GPU -> CPU: user asks AI a question
     EvaQuery {
         message: String,
         page_context: String,
+        provider: eva::AiProvider,
     },
 
-    // CPU -> GPU: EVA response
+    // CPU -> GPU: AI response
     EvaResponse {
+        text: String,
+        provider: eva::AiProvider,
+    },
+
+    // GPU -> CPU: ask AI to summarize current page
+    EvaSummarize {
+        content: String,
+        provider: eva::AiProvider,
+    },
+
+    // GPU -> CPU: request voice response from EVA
+    EvaVoice {
         text: String,
     },
 
-    // GPU -> CPU: ask EVA to summarize current page
-    EvaSummarize {
+    // GPU -> CPU: smart search (natural language query sent to AI instead of Google)
+    SmartSearch {
+        query: String,
+        provider: eva::AiProvider,
+    },
+
+    // GPU -> CPU: request page translation
+    TranslatePage {
         content: String,
+        target_lang: String,
+        provider: eva::AiProvider,
+    },
+
+    // GPU -> CPU: request proactive insights for the page
+    ProactiveInsights {
+        content: String,
+        provider: eva::AiProvider,
     },
 }
 
@@ -92,7 +119,7 @@ fn main() -> Result<()> {
     let (eva_resp_tx, eva_resp_rx) = channel::bounded::<PipelineMsg>(8);
 
     // ── NPU engine (spawn on dedicated thread) ──
-    let _npu_ui_tx = ui_tx.clone();
+    let npu_prefetch_tx = ui_tx.clone(); // for sending prefetch suggestions to CPU
     let npu_handle = std::thread::Builder::new()
         .name("npu-engine".into())
         .spawn(move || {
@@ -111,6 +138,16 @@ fn main() -> Result<()> {
                         info!("[NPU] Processing: {url}");
                         match engine.process_page(&url, &html, &dom) {
                             Ok(result) => {
+                                // Send prefetch suggestions to CPU thread
+                                for prefetch_url in &result.prefetch_urls {
+                                    let _ = npu_prefetch_tx.send(
+                                        PipelineMsg::Prefetch(prefetch_url.clone())
+                                    );
+                                }
+                                if !result.prefetch_urls.is_empty() {
+                                    info!("[NPU] Sent {} prefetch suggestions", result.prefetch_urls.len());
+                                }
+
                                 let _ = npu_to_gpu_tx.send(PipelineMsg::ContentReady {
                                     url,
                                     blocks: result.blocks,
@@ -146,9 +183,9 @@ fn main() -> Result<()> {
     let cpu_handle = std::thread::Builder::new()
         .name("cpu-network".into())
         .spawn(move || {
-            info!("[CPU] Thread started -- networking + parsing + history + EVA");
+            info!("[CPU] Thread started -- networking + parsing + history + AI");
             let net = cpu::network::NetworkEngine::new();
-            let eva_client = eva::EvaClient::new();
+            let ai_client = std::sync::Arc::new(eva::AiClient::new());
 
             // ── Browser history stacks ──
             let mut back_stack: Vec<String> = Vec::new();
@@ -248,21 +285,81 @@ fn main() -> Result<()> {
                             Ok(m) => m,
                             Err(_) => break, // channel closed
                         };
+                        // All AI queries spawn on separate threads to avoid
+                        // blocking the CPU thread (navigation events keep flowing)
                         match msg {
-                            PipelineMsg::EvaQuery { message, page_context } => {
-                                info!("[CPU] EVA query received");
-                                let response = eva_client.ask(&message, &page_context)
-                                    .unwrap_or_else(|e| format!("EVA error: {e}"));
-                                let _ = cpu_eva_resp_tx.send(PipelineMsg::EvaResponse {
-                                    text: response,
+                            PipelineMsg::EvaQuery { message, page_context, provider } => {
+                                info!("[CPU] AI query → spawning thread ({})", provider.name());
+                                let client = ai_client.clone();
+                                let tx = cpu_eva_resp_tx.clone();
+                                std::thread::spawn(move || {
+                                    let response = client.ask(provider, &message, &page_context)
+                                        .unwrap_or_else(|e| format!("{} error: {e}", provider.name()));
+                                    let _ = tx.send(PipelineMsg::EvaResponse { text: response, provider });
                                 });
                             }
-                            PipelineMsg::EvaSummarize { content } => {
-                                info!("[CPU] EVA summarize requested");
-                                let response = eva_client.summarize_page(&content)
-                                    .unwrap_or_else(|e| format!("EVA error: {e}"));
-                                let _ = cpu_eva_resp_tx.send(PipelineMsg::EvaResponse {
-                                    text: response,
+                            PipelineMsg::EvaSummarize { content, provider } => {
+                                info!("[CPU] AI summarize → spawning thread ({})", provider.name());
+                                let client = ai_client.clone();
+                                let tx = cpu_eva_resp_tx.clone();
+                                std::thread::spawn(move || {
+                                    let response = client.summarize(provider, &content)
+                                        .unwrap_or_else(|e| format!("{} error: {e}", provider.name()));
+                                    let _ = tx.send(PipelineMsg::EvaResponse { text: response, provider });
+                                });
+                            }
+                            PipelineMsg::EvaVoice { text } => {
+                                info!("[CPU] Voice → spawning thread");
+                                let client = ai_client.clone();
+                                let tx = cpu_eva_resp_tx.clone();
+                                std::thread::spawn(move || {
+                                    let response = client.request_voice(&text)
+                                        .unwrap_or_else(|e| format!("Voice error: {e}"));
+                                    let _ = tx.send(PipelineMsg::EvaResponse {
+                                        text: response, provider: eva::AiProvider::Eva,
+                                    });
+                                });
+                            }
+                            PipelineMsg::SmartSearch { query, provider } => {
+                                info!("[CPU] Smart search → spawning thread");
+                                let client = ai_client.clone();
+                                let tx = cpu_eva_resp_tx.clone();
+                                std::thread::spawn(move || {
+                                    let prompt = format!("Answer this question concisely and directly: {}", query);
+                                    let response = client.ask(provider, &prompt, "")
+                                        .unwrap_or_else(|e| format!("Search error: {e}"));
+                                    let _ = tx.send(PipelineMsg::EvaResponse { text: response, provider });
+                                });
+                            }
+                            PipelineMsg::TranslatePage { content, target_lang, provider } => {
+                                info!("[CPU] Translate → spawning thread");
+                                let client = ai_client.clone();
+                                let tx = cpu_eva_resp_tx.clone();
+                                std::thread::spawn(move || {
+                                    let prompt = format!(
+                                        "Translate the following text to {}. Only output the translation, no explanations:\n\n{}",
+                                        target_lang, content
+                                    );
+                                    let response = client.ask(provider, &prompt, "")
+                                        .unwrap_or_else(|e| format!("Translation error: {e}"));
+                                    let _ = tx.send(PipelineMsg::EvaResponse {
+                                        text: format!("📝 Translation ({target_lang}):\n{response}"),
+                                        provider,
+                                    });
+                                });
+                            }
+                            PipelineMsg::ProactiveInsights { content, provider } => {
+                                info!("[CPU] Insights → spawning thread");
+                                let client = ai_client.clone();
+                                let tx = cpu_eva_resp_tx.clone();
+                                std::thread::spawn(move || {
+                                    let prompt = "Based on this page content, suggest exactly 3 interesting questions the reader might want to explore. Format as a numbered list. Be concise.";
+                                    let response = client.ask(provider, prompt, &content)
+                                        .unwrap_or_else(|e| format!("Insights error: {e}"));
+                                    let _ = tx.send(PipelineMsg::EvaResponse {
+                                        text: format!("💡 You might want to know:\n{response}"),
+                                        provider,
+                                    });
                                 });
                             }
                             _ => {}

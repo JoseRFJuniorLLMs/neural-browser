@@ -372,20 +372,11 @@ impl WgpuRenderer {
                         Some(lbox.height.max(line_h * 2.0)),
                     );
 
-                    // For links, add underline prefix character
-                    let display_text;
                     let is_link = lbox.href.is_some();
-                    if is_link {
-                        // Show underlined text by using combining underline
-                        display_text = text.clone();
-                    } else {
-                        display_text = text.clone();
-                    }
-
                     let weight = if *bold { Weight::BOLD } else { Weight::NORMAL };
                     buf.set_text(
                         &mut self.font_system,
-                        &display_text,
+                        text, // pass reference directly — no clone needed
                         Attrs::new().family(Family::SansSerif).weight(weight),
                         Shaping::Advanced,
                     );
@@ -735,10 +726,12 @@ impl WgpuRenderer {
             GlyphonColor::rgb(90, 90, 110),
         ));
 
-        // ── EVA panel header ──
+        // ── AI panel header — shows current provider ──
+        let provider_name = eva_panel.provider.name();
+        let header_text = format!("  {}  [Tab: switch] [Esc: close]", provider_name);
         let mut header_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(16.0, 22.0));
         header_buf.set_size(&mut self.font_system, Some(panel_width - 20.0), Some(30.0));
-        header_buf.set_text(&mut self.font_system, "  EVA  [Esc to close]",
+        header_buf.set_text(&mut self.font_system, &header_text,
             Attrs::new().family(Family::SansSerif).weight(Weight::BOLD), Shaping::Advanced);
         header_buf.shape_until_scroll(&mut self.font_system, false);
         buffers.push((header_buf, panel_x + 10.0, 8.0,
@@ -769,12 +762,19 @@ impl WgpuRenderer {
             if cursor_y > msg_bottom { break; }
 
             let (color, prefix) = match msg.role {
-                Role::User => (GlyphonColor::rgb(180, 220, 255), "You: "),
-                Role::Eva  => (GlyphonColor::rgb(150, 255, 180), "EVA: "),
-                Role::System => (GlyphonColor::rgb(130, 130, 150), ""),
+                Role::User => (GlyphonColor::rgb(180, 220, 255), "You".to_string()),
+                Role::Ai   => {
+                    let name = msg.provider.map(|p| p.name()).unwrap_or("AI");
+                    (GlyphonColor::rgb(150, 255, 180), name.to_string())
+                }
+                Role::System => (GlyphonColor::rgb(130, 130, 150), String::new()),
             };
             let align_x = panel_x + 10.0;
-            let display = format!("{prefix}{}", msg.text);
+            let display = if prefix.is_empty() {
+                msg.text.clone()
+            } else {
+                format!("{prefix}: {}", msg.text)
+            };
             let msg_width = panel_width - 30.0;
             let font_size = 13.0;
             let line_h = font_size * 1.5;

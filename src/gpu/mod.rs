@@ -63,6 +63,13 @@ struct GpuApp {
     eva_resp_rx: Receiver<PipelineMsg>,
     // Collected page text for EVA context
     page_text_cache: String,
+    // Reading mode active (shows only high-relevance content)
+    reading_mode: bool,
+    // Page language detected by NPU (future: auto-translate, NietzscheDB metadata)
+    #[allow(dead_code)]
+    page_language: Option<String>,
+    // Whether proactive insights have been sent for current page
+    insights_sent_for_url: Option<String>,
 }
 
 impl GpuApp {
@@ -101,6 +108,9 @@ impl GpuApp {
             eva_tx,
             eva_resp_rx,
             page_text_cache: String::new(),
+            reading_mode: false,
+            page_language: None,
+            insights_sent_for_url: None,
         }
     }
 
@@ -125,8 +135,14 @@ impl GpuApp {
                     self.content = blocks;
                     self.scroll_y = 0.0;
                     self.loading = false;
+                    self.reading_mode = false;
                     self.layout_dirty = true;
                     got_content = true;
+
+                    // Auto-trigger proactive insights if panel is open
+                    if self.eva_panel.visible && !self.page_text_cache.is_empty() {
+                        self.send_proactive_insights();
+                    }
                 }
                 _ => {}
             }
@@ -134,14 +150,14 @@ impl GpuApp {
         got_content
     }
 
-    /// Check for EVA responses from the CPU thread.
+    /// Check for AI responses from the CPU thread.
     fn check_eva_messages(&mut self) -> bool {
         let mut got_response = false;
         while let Ok(msg) = self.eva_resp_rx.try_recv() {
             match msg {
-                PipelineMsg::EvaResponse { text } => {
-                    info!("[GPU] EVA response received ({} chars)", text.len());
-                    self.eva_panel.add_eva_response(text);
+                PipelineMsg::EvaResponse { text, provider } => {
+                    info!("[GPU] {} response received ({} chars)", provider.name(), text.len());
+                    self.eva_panel.add_ai_response(text, provider);
                     got_response = true;
                 }
                 _ => {}
@@ -150,26 +166,116 @@ impl GpuApp {
         got_response
     }
 
-    /// Send a message to EVA via the CPU thread.
+    /// Send a message to the current AI provider via the CPU thread.
     fn send_eva_query(&mut self, message: String) {
+        let provider = self.eva_panel.provider;
         self.eva_panel.add_user_message(message.clone());
         self.eva_panel.set_loading(true);
         let _ = self.eva_tx.send(PipelineMsg::EvaQuery {
             message,
             page_context: self.page_text_cache.clone(),
+            provider,
         });
     }
 
-    /// Ask EVA to summarize the current page.
+    /// Ask the current AI provider to summarize the current page.
     fn send_eva_summarize(&mut self) {
         if self.page_text_cache.is_empty() {
             return;
         }
+        let provider = self.eva_panel.provider;
         self.eva_panel.visible = true;
-        self.eva_panel.add_user_message("Summarize this page".into());
+        self.eva_panel.add_user_message(format!("Summarize this page [{}]", provider.name()));
         self.eva_panel.set_loading(true);
         let _ = self.eva_tx.send(PipelineMsg::EvaSummarize {
             content: self.page_text_cache.clone(),
+            provider,
+        });
+    }
+
+    /// Request EVA to speak the last AI response via voice.
+    fn send_voice_request(&mut self) {
+        // Find the last AI response
+        let last_text = self.eva_panel.messages.iter().rev()
+            .find(|m| m.role == crate::eva::panel::Role::Ai)
+            .map(|m| m.text.clone());
+        if let Some(text) = last_text {
+            let _ = self.eva_tx.send(PipelineMsg::EvaVoice { text });
+        }
+    }
+
+    /// Detect if input is a natural language question (smart search).
+    fn is_natural_question(input: &str) -> bool {
+        let lower = input.to_lowercase();
+        let question_starters = [
+            "what is", "what are", "who is", "who are", "how to", "how do",
+            "why is", "why do", "when is", "when did", "where is", "where do",
+            "can you", "could you", "explain", "tell me", "define",
+            // Portuguese
+            "o que é", "o que são", "quem é", "como fazer", "como funciona",
+            "por que", "porque", "quando", "onde", "explica", "me diz",
+            "qual é", "quais são",
+            // Spanish
+            "qué es", "cómo", "por qué", "quién es", "dónde",
+        ];
+        question_starters.iter().any(|q| lower.starts_with(q))
+            || (lower.ends_with('?') && lower.contains(' '))
+    }
+
+    /// Toggle reading mode (filter to high-relevance content only).
+    fn toggle_reading_mode(&mut self) {
+        self.reading_mode = !self.reading_mode;
+        if self.reading_mode {
+            // Filter content to high-relevance blocks only
+            let original = self.content.clone();
+            self.content = original.into_iter()
+                .filter(|b| b.relevance > 0.6 || matches!(b.kind, crate::npu::BlockKind::Heading { .. }))
+                .collect();
+            // Request AI summary at top of reading mode
+            if !self.page_text_cache.is_empty() {
+                self.send_eva_summarize();
+            }
+            info!("[UI] Reading mode ON — {} blocks shown", self.content.len());
+        } else {
+            // Reload page to restore full content
+            let url = self.url_bar.clone();
+            self.navigate(&url);
+            info!("[UI] Reading mode OFF — reloading full page");
+        }
+        self.layout_dirty = true;
+        self.request_redraw();
+    }
+
+    /// Request translation of current page content.
+    fn send_translate_request(&mut self, target_lang: &str) {
+        if self.page_text_cache.is_empty() {
+            return;
+        }
+        let provider = self.eva_panel.provider;
+        self.eva_panel.visible = true;
+        self.eva_panel.add_user_message(format!("Translate page to {target_lang}"));
+        self.eva_panel.set_loading(true);
+        let _ = self.eva_tx.send(PipelineMsg::TranslatePage {
+            content: self.page_text_cache.clone(),
+            target_lang: target_lang.to_string(),
+            provider,
+        });
+    }
+
+    /// Send proactive insights request (auto-generated questions about the page).
+    fn send_proactive_insights(&mut self) {
+        if self.page_text_cache.is_empty() {
+            return;
+        }
+        // Only send once per page
+        if self.insights_sent_for_url.as_deref() == Some(&self.url_bar) {
+            return;
+        }
+        self.insights_sent_for_url = Some(self.url_bar.clone());
+        let provider = self.eva_panel.provider;
+        let _ = self.eva_tx.send(PipelineMsg::ProactiveInsights {
+            content: self.page_text_cache.clone(),
+            provider,
         });
     }
 
@@ -234,6 +340,22 @@ impl GpuApp {
     }
 
     fn navigate(&mut self, input: &str) {
+        // Smart Search: detect natural language questions → send to AI
+        if Self::is_natural_question(input) {
+            info!("[UI] Smart search detected: {input}");
+            let provider = self.eva_panel.provider;
+            self.eva_panel.visible = true;
+            self.eva_panel.add_user_message(format!("🔍 {input}"));
+            self.eva_panel.set_loading(true);
+            let _ = self.eva_tx.send(PipelineMsg::SmartSearch {
+                query: input.to_string(),
+                provider,
+            });
+            self.url_editing = false;
+            self.request_redraw();
+            return;
+        }
+
         let url = self.normalize_input(input);
         info!("[UI] Navigate to: {url}");
         self.loading = true;
@@ -278,29 +400,44 @@ impl GpuApp {
         }
     }
 
-    /// Recompute layout from current content + scroll position.
+    /// Recompute layout from current content (scroll-independent).
+    /// Layout positions are in document-space; scroll is applied at render time.
     fn recompute_layout(&mut self) {
         let viewport_width = self.renderer.as_ref()
             .map(|r| r.size().0 as f32)
             .unwrap_or(1200.0);
         self.cached_layout = layout::compute_layout(
             &self.content,
-            self.scroll_y,
+            0.0, // scroll not used in layout anymore
             viewport_width,
             &self.theme,
         );
         self.layout_dirty = false;
     }
 
+    /// Get layout boxes with scroll offset applied (for rendering).
+    fn scrolled_layout(&self) -> Vec<layout::LayoutBox> {
+        self.cached_layout.iter().map(|b| {
+            let mut scrolled = b.clone();
+            // Don't scroll the URL bar background (first element, y=0)
+            if b.y > 0.0 || b.height > 40.0 {
+                scrolled.y -= self.scroll_y;
+            }
+            scrolled
+        }).collect()
+    }
+
     /// Find which link (if any) is under the given screen coordinates.
+    /// Layout is in document-space, so we add scroll_y to screen Y to get document Y.
     fn hit_test_link(&self, x: f32, y: f32) -> Option<String> {
+        let doc_y = y + self.scroll_y; // convert screen Y to document Y
         for lbox in &self.cached_layout {
             if let Some(href) = &lbox.href {
                 if x >= lbox.x
                     && x <= lbox.x + lbox.width
-                    && y >= lbox.y
-                    && y <= lbox.y + lbox.height
-                    && y > 40.0
+                    && doc_y >= lbox.y
+                    && doc_y <= lbox.y + lbox.height
+                    && y > 40.0 // still screen-space check for URL bar
                 {
                     return Some(href.clone());
                 }
@@ -412,9 +549,11 @@ impl ApplicationHandler for GpuApp {
                     url_editing: self.url_editing,
                     url_input: &self.url_input,
                 };
+                // Apply scroll offset to get viewport-space positions
+                let scrolled = self.scrolled_layout();
                 if let Some(renderer) = &mut self.renderer {
                     if let Err(e) = renderer.render_with_eva(
-                        &self.cached_layout,
+                        &scrolled,
                         &ctx,
                         &self.eva_panel,
                     ) {
@@ -422,8 +561,9 @@ impl ApplicationHandler for GpuApp {
                     }
                 }
 
-                // Keep redrawing while loading (for animation) or EVA panel open
-                if self.loading || self.eva_panel.visible {
+                // Keep redrawing while loading or EVA is waiting for response
+                // (NOT when panel is just visible and idle — saves GPU)
+                if self.loading || self.eva_panel.is_loading {
                     self.request_redraw();
                 }
             }
@@ -484,7 +624,7 @@ impl ApplicationHandler for GpuApp {
                         .unwrap_or(800.0);
                     let max_scroll = (max_y - viewport_h + 100.0).max(0.0);
                     self.scroll_y = self.scroll_y.min(max_scroll);
-                    self.layout_dirty = true;
+                    // No layout_dirty — scroll is applied at render time
                     self.request_redraw();
                 }
             }
@@ -516,20 +656,37 @@ impl ApplicationHandler for GpuApp {
                         self.request_redraw();
                         return;
                     }
-                    // Ctrl+S = ask EVA to summarize page
+                    // Ctrl+S = ask AI to summarize page
                     Key::Character(ch) if ctrl && ch.as_str() == "s" => {
                         self.send_eva_summarize();
+                        self.request_redraw();
+                        return;
+                    }
+                    // Ctrl+D = toggle reading mode (high-relevance content only)
+                    Key::Character(ch) if ctrl && ch.as_str() == "d" => {
+                        self.toggle_reading_mode();
+                        return;
+                    }
+                    // Ctrl+T = translate page to Portuguese
+                    Key::Character(ch) if ctrl && ch.as_str() == "t" => {
+                        self.send_translate_request("Portuguese");
                         self.request_redraw();
                         return;
                     }
                     _ => {}
                 }
 
-                // ── EVA panel focused: route input to EVA ──
+                // ── AI panel focused: route input to panel ──
                 if self.eva_panel.is_focused() {
                     match &event.logical_key {
                         Key::Named(NamedKey::Escape) => {
                             self.eva_panel.toggle(); // close panel
+                            self.request_redraw();
+                        }
+                        // Tab = cycle AI provider (EVA → Claude → Gemini → GPT-4)
+                        Key::Named(NamedKey::Tab) => {
+                            self.eva_panel.cycle_provider();
+                            info!("[UI] AI provider switched to: {}", self.eva_panel.provider_name());
                             self.request_redraw();
                         }
                         Key::Named(NamedKey::Enter) => {
@@ -544,8 +701,12 @@ impl ApplicationHandler for GpuApp {
                             self.request_redraw();
                         }
                         Key::Character(ch) => {
-                            // Don't capture Ctrl shortcuts in EVA input
-                            if !ctrl {
+                            // Ctrl+Shift+V = request voice response
+                            if ctrl && ch.as_str() == "V" {
+                                self.send_voice_request();
+                                self.request_redraw();
+                            } else if !ctrl {
+                                // Normal character input
                                 for c in ch.chars() {
                                     self.eva_panel.input_char(c);
                                 }
@@ -554,7 +715,7 @@ impl ApplicationHandler for GpuApp {
                         }
                         _ => {}
                     }
-                    return; // EVA panel consumes all input when focused
+                    return; // AI panel consumes all input when focused
                 }
 
                 // ── Normal browser keyboard handling ──
@@ -649,20 +810,17 @@ impl ApplicationHandler for GpuApp {
                             self.request_redraw();
                         }
                     }
-                    // Page Up / Page Down
+                    // Page Up / Page Down — no layout recalc needed (scroll-only)
                     Key::Named(NamedKey::PageDown) => {
                         self.scroll_y += 600.0;
-                        self.layout_dirty = true;
                         self.request_redraw();
                     }
                     Key::Named(NamedKey::PageUp) => {
                         self.scroll_y = (self.scroll_y - 600.0).max(0.0);
-                        self.layout_dirty = true;
                         self.request_redraw();
                     }
                     Key::Named(NamedKey::Home) => {
                         self.scroll_y = 0.0;
-                        self.layout_dirty = true;
                         self.request_redraw();
                     }
                     Key::Named(NamedKey::End) => {
@@ -674,7 +832,6 @@ impl ApplicationHandler for GpuApp {
                             .map(|r| r.size().1 as f32)
                             .unwrap_or(800.0);
                         self.scroll_y = (max_y - viewport_h + 60.0).max(0.0);
-                        self.layout_dirty = true;
                         self.request_redraw();
                     }
                     _ => {}
@@ -703,7 +860,9 @@ impl ApplicationHandler for GpuApp {
 }
 
 /// Simple URL percent-encoding for search queries.
+/// Uses lookup table instead of format!() per byte for zero-allocation encoding.
 fn urlencoding_simple(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         match b {
@@ -713,7 +872,8 @@ fn urlencoding_simple(s: &str) -> String {
             b' ' => out.push('+'),
             _ => {
                 out.push('%');
-                out.push_str(&format!("{:02X}", b));
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xF) as usize] as char);
             }
         }
     }

@@ -552,7 +552,13 @@ impl ContentExtractor {
                 }
             }
         }
-        text.trim().to_string()
+        // Only allocate new string if trimming actually removes something
+        let trimmed = text.trim();
+        if trimmed.len() == text.len() {
+            text
+        } else {
+            trimmed.to_string()
+        }
     }
 
     /// Find the main content area of the page.

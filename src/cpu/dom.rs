@@ -312,39 +312,49 @@ fn collapse_whitespace(s: &str) -> String {
 
 /// Decode common HTML entities: named (&amp; etc.), decimal (&#NNN;), hex (&#xHH;).
 fn decode_entities(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
+    // Fast path: no entities at all
+    if !s.contains('&') {
+        return s.to_string();
+    }
 
-    while i < len {
-        if chars[i] == '&' {
-            let start = i;
-            i += 1;
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '&' {
             let mut entity = String::new();
-            while i < len && chars[i] != ';' && (i - start) < 12 {
-                entity.push(chars[i]);
-                i += 1;
+            let mut found_semi = false;
+            // Collect up to 12 chars until ';' or limit
+            for _ in 0..12 {
+                match chars.peek() {
+                    Some(&';') => {
+                        chars.next(); // consume ';'
+                        found_semi = true;
+                        break;
+                    }
+                    Some(_) => {
+                        entity.push(chars.next().unwrap());
+                    }
+                    None => break,
+                }
             }
-            if i < len && chars[i] == ';' {
-                i += 1; // consume ';'
+            if found_semi {
                 if let Some(decoded) = resolve_entity(&entity) {
                     result.push(decoded);
                     continue;
                 }
-            }
-            // Not a valid entity -- output literally
-            result.push('&');
-            result.push_str(&entity);
-            // If we consumed the semicolon but failed to resolve, put it back
-            if i <= len && i > start + 1 + entity.len() {
+                // Not a known entity — output literally
+                result.push('&');
+                result.push_str(&entity);
                 result.push(';');
+            } else {
+                result.push('&');
+                result.push_str(&entity);
             }
             continue;
         }
 
-        result.push(chars[i]);
-        i += 1;
+        result.push(ch);
     }
 
     result
@@ -397,10 +407,15 @@ fn resolve_entity(entity: &str) -> Option<char> {
 
 /// Case-insensitive search for a substring in a haystack.
 /// Returns the byte offset of the match start, or None.
+/// Zero-allocation: compares byte-by-byte without lowercasing the entire haystack.
 fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
-    let needle_lower = needle.to_lowercase();
-    let haystack_lower = haystack.to_lowercase();
-    haystack_lower.find(&needle_lower)
+    let needle_bytes: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
+    if needle_bytes.is_empty() {
+        return Some(0);
+    }
+    haystack.as_bytes()
+        .windows(needle_bytes.len())
+        .position(|w| w.iter().zip(&needle_bytes).all(|(a, b)| a.to_ascii_lowercase() == *b))
 }
 
 /// Parse HTML attributes from a string like: class="foo" id="bar" href="..."

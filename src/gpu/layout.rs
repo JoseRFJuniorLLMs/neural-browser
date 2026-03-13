@@ -60,10 +60,12 @@ fn estimate_lines(text: &str, width: f32, font_size: f32) -> f32 {
 }
 
 /// Compute layout for all content blocks.
-/// Returns a list of positioned LayoutBoxes ready for GPU rendering.
+/// Returns a list of positioned LayoutBoxes in DOCUMENT coordinates (scroll-independent).
+/// The scroll offset is applied at render time, not here — so layout only needs
+/// recomputation on content change or viewport resize, NOT on scroll.
 pub fn compute_layout(
     blocks: &[ContentBlock],
-    scroll_y: f32,
+    _scroll_y: f32, // DEPRECATED: scroll applied at render time now
     viewport_width: f32,
     theme: &Theme,
 ) -> Vec<LayoutBox> {
@@ -84,11 +86,8 @@ pub fn compute_layout(
         href: None,
     });
 
-    // URL text is set by caller
+    // Content starts below URL bar — positions are in document space
     let mut cursor_y: f32 = 50.0;
-
-    // Apply scroll offset
-    cursor_y -= scroll_y;
 
     for block in blocks {
         // Skip low-relevance content

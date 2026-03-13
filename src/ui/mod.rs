@@ -20,6 +20,10 @@ pub struct Theme {
     pub url_bar_border: [f32; 4],
     pub separator: [f32; 4],
     pub loading: [f32; 4],
+    pub toolbar_bg: [f32; 4],
+    pub button_bg: [f32; 4],
+    pub button_hover: [f32; 4],
+    pub button_text: [f32; 4],
 }
 
 impl Default for Theme {
@@ -38,6 +42,10 @@ impl Default for Theme {
             url_bar_border: [0.3, 0.3, 0.35, 1.0],
             separator: [0.25, 0.25, 0.28, 1.0],
             loading: [0.4, 0.7, 1.0, 1.0],
+            toolbar_bg: [0.12, 0.12, 0.15, 1.0],
+            button_bg: [0.18, 0.18, 0.22, 1.0],
+            button_hover: [0.25, 0.25, 0.30, 1.0],
+            button_text: [0.75, 0.75, 0.80, 1.0],
         }
     }
 }

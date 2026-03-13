@@ -287,7 +287,7 @@ mod tests {
             depth: 0,
             relevance: 0.5,
             children: Vec::new(),
-            image_data: None,
+            image_data: None, node_id: None, computed_style: None,
         }
     }
 

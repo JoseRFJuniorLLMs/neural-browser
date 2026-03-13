@@ -26,6 +26,8 @@ const TIMEOUT_GLOBAL: Duration = Duration::from_secs(45);
 pub struct NetworkEngine {
     agent: ureq::Agent,
     prefetch_cache: Mutex<HashMap<String, String>>,
+    /// Cache for fetched image bytes (URL -> raw bytes). Up to 50 entries.
+    image_cache: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl NetworkEngine {
@@ -49,6 +51,7 @@ impl NetworkEngine {
         Self {
             agent,
             prefetch_cache: Mutex::new(HashMap::new()),
+            image_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -147,8 +150,21 @@ impl NetworkEngine {
     /// Maximum image download size (5 MB).
     const MAX_IMAGE_SIZE: usize = 5 * 1024 * 1024;
 
+    /// Maximum image cache entries.
+    const MAX_IMAGE_CACHE_ENTRIES: usize = 50;
+
     /// Fetch image bytes from a URL. Returns raw bytes on success.
+    /// Checks the image cache first; on miss, fetches from network and caches.
     pub fn fetch_image(&self, url: &str) -> Result<Vec<u8>> {
+        // Check image cache
+        {
+            let cache = self.image_cache.lock();
+            if let Some(bytes) = cache.get(url) {
+                info!("[CPU:NET] Image cache hit for {url}");
+                return Ok(bytes.clone());
+            }
+        }
+
         info!("[CPU:NET] Fetching image {url}");
         let resp = self.agent.get(url)
             .header("Accept", "image/*,*/*")
@@ -185,6 +201,18 @@ impl NetworkEngine {
                     break;
                 }
             }
+        }
+
+        // Cache the result
+        {
+            let mut cache = self.image_cache.lock();
+            if cache.len() >= Self::MAX_IMAGE_CACHE_ENTRIES {
+                // Evict oldest entry
+                if let Some(first_key) = cache.keys().next().cloned() {
+                    cache.remove(&first_key);
+                }
+            }
+            cache.insert(url.to_string(), bytes.clone());
         }
 
         Ok(bytes)

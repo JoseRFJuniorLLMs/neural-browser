@@ -25,10 +25,34 @@ pub struct DomNode {
     pub depth: usize,
 }
 
+/// Where a script comes from.
+#[derive(Debug, Clone)]
+pub enum ScriptSource {
+    /// Inline script content embedded in `<script>...</script>`.
+    Inline(String),
+    /// External script loaded via `<script src="...">`.
+    External(String),
+}
+
+/// A script found during HTML parsing.
+#[derive(Debug, Clone)]
+pub struct ScriptInfo {
+    /// The source of this script (inline code or external URL).
+    pub source: ScriptSource,
+    /// The `type` attribute, if any (e.g. "module", "text/javascript").
+    pub script_type: Option<String>,
+    /// Whether this script has `defer` attribute.
+    pub defer: bool,
+    /// Whether this script has `async` attribute.
+    pub is_async: bool,
+}
+
 /// Flat DOM tree -- array of nodes, root is index 0.
 #[derive(Debug, Clone)]
 pub struct DomTree {
     pub nodes: Vec<DomNode>,
+    /// Scripts collected during parsing (in document order).
+    pub scripts: Vec<ScriptInfo>,
 }
 
 impl DomTree {
@@ -69,6 +93,235 @@ impl DomTree {
             .filter_map(|n| n.attrs.get("src").map(|s| s.as_str()))
             .collect()
     }
+
+    // ── Mutable DOM APIs (for JavaScript engine) ──
+
+    /// Create a new detached element node. Returns its node ID.
+    pub fn create_element(&mut self, tag: &str) -> usize {
+        let id = self.nodes.len();
+        self.nodes.push(DomNode {
+            id,
+            tag: tag.to_lowercase(),
+            attrs: HashMap::new(),
+            text: String::new(),
+            parent: None,
+            children: Vec::new(),
+            depth: 0,
+        });
+        id
+    }
+
+    /// Check if `potential_ancestor` is an ancestor of `node` by walking up the parent chain.
+    fn is_ancestor(&self, potential_ancestor: usize, node: usize) -> bool {
+        let mut current = Some(node);
+        while let Some(id) = current {
+            if id == potential_ancestor { return true; }
+            current = self.nodes.get(id).and_then(|n| n.parent);
+        }
+        false
+    }
+
+    /// Append `child` as the last child of `parent`. Updates depth recursively.
+    pub fn append_child(&mut self, parent_id: usize, child_id: usize) -> bool {
+        if parent_id >= self.nodes.len() || child_id >= self.nodes.len() {
+            return false;
+        }
+        // Guard against self-append
+        if parent_id == child_id {
+            return false;
+        }
+        // Guard against cycles: child must not be an ancestor of parent
+        if self.is_ancestor(child_id, parent_id) {
+            return false;
+        }
+        // Remove from old parent if any
+        if let Some(old_parent) = self.nodes[child_id].parent {
+            if old_parent < self.nodes.len() {
+                self.nodes[old_parent].children.retain(|&c| c != child_id);
+            }
+        }
+        self.nodes[parent_id].children.push(child_id);
+        self.nodes[child_id].parent = Some(parent_id);
+        let new_depth = self.nodes[parent_id].depth + 1;
+        self.update_depth(child_id, new_depth);
+        true
+    }
+
+    /// Remove `child` from `parent`.
+    pub fn remove_child(&mut self, parent_id: usize, child_id: usize) -> bool {
+        if parent_id >= self.nodes.len() || child_id >= self.nodes.len() {
+            return false;
+        }
+        let before = self.nodes[parent_id].children.len();
+        self.nodes[parent_id].children.retain(|&c| c != child_id);
+        if self.nodes[parent_id].children.len() < before {
+            self.nodes[child_id].parent = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set an attribute on a node.
+    pub fn set_attribute(&mut self, node_id: usize, key: &str, value: &str) -> bool {
+        if let Some(node) = self.nodes.get_mut(node_id) {
+            node.attrs.insert(key.to_string(), value.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get an attribute value from a node.
+    pub fn get_attribute(&self, node_id: usize, key: &str) -> Option<&str> {
+        self.nodes.get(node_id)?.attrs.get(key).map(|s| s.as_str())
+    }
+
+    /// Set the text content of a node (replaces existing text).
+    pub fn set_text_content(&mut self, node_id: usize, text: &str) -> bool {
+        if let Some(node) = self.nodes.get_mut(node_id) {
+            node.text = text.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set innerHTML on a node: re-parses HTML and attaches children.
+    pub fn set_inner_html(&mut self, node_id: usize, html: &str) -> bool {
+        if node_id >= self.nodes.len() {
+            return false;
+        }
+        // Detach old children before clearing
+        let old_children: Vec<usize> = self.nodes[node_id].children.clone();
+        for &old_child in &old_children {
+            if old_child < self.nodes.len() {
+                self.nodes[old_child].parent = None;
+            }
+        }
+        self.nodes[node_id].children.clear();
+        self.nodes[node_id].text.clear();
+
+        // Parse the HTML fragment
+        let fragment = parse_html(html);
+        let base_id = self.nodes.len();
+        let parent_depth = self.nodes[node_id].depth;
+
+        // Copy fragment nodes, remapping IDs
+        for frag_node in &fragment.nodes {
+            let new_id = base_id + frag_node.id;
+            let new_parent = match frag_node.parent {
+                Some(p) => Some(base_id + p),
+                None => Some(node_id), // top-level fragment nodes become children of target
+            };
+            self.nodes.push(DomNode {
+                id: new_id,
+                tag: frag_node.tag.clone(),
+                attrs: frag_node.attrs.clone(),
+                text: frag_node.text.clone(),
+                parent: new_parent,
+                children: frag_node.children.iter().map(|c| base_id + c).collect(),
+                depth: parent_depth + 1 + frag_node.depth,
+            });
+        }
+
+        // Attach top-level fragment nodes as children
+        for frag_node in &fragment.nodes {
+            if frag_node.parent.is_none() {
+                self.nodes[node_id].children.push(base_id + frag_node.id);
+            }
+        }
+
+        true
+    }
+
+    /// Find a node by its `id` attribute.
+    pub fn get_element_by_id(&self, id_value: &str) -> Option<usize> {
+        self.nodes.iter().find_map(|n| {
+            if n.attrs.get("id").map(|s| s.as_str()) == Some(id_value) {
+                Some(n.id)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Simple query_selector: supports tag, #id, .class, and combinations.
+    pub fn query_selector(&self, selector: &str) -> Option<usize> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return None;
+        }
+
+        // #id selector
+        if let Some(id_val) = selector.strip_prefix('#') {
+            return self.get_element_by_id(id_val);
+        }
+
+        // .class selector
+        if let Some(class_val) = selector.strip_prefix('.') {
+            return self.nodes.iter().find_map(|n| {
+                if n.attrs.get("class").map_or(false, |c| {
+                    c.split_whitespace().any(|cls| cls == class_val)
+                }) {
+                    Some(n.id)
+                } else {
+                    None
+                }
+            });
+        }
+
+        // Tag selector
+        let tag = selector.to_lowercase();
+        self.nodes.iter().find_map(|n| {
+            if n.tag == tag {
+                Some(n.id)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Query all matching elements (simple selectors only).
+    pub fn query_selector_all(&self, selector: &str) -> Vec<usize> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Vec::new();
+        }
+
+        if let Some(id_val) = selector.strip_prefix('#') {
+            return self.get_element_by_id(id_val).into_iter().collect();
+        }
+
+        if let Some(class_val) = selector.strip_prefix('.') {
+            return self.nodes.iter().filter_map(|n| {
+                if n.attrs.get("class").map_or(false, |c| {
+                    c.split_whitespace().any(|cls| cls == class_val)
+                }) {
+                    Some(n.id)
+                } else {
+                    None
+                }
+            }).collect();
+        }
+
+        let tag = selector.to_lowercase();
+        self.nodes.iter().filter_map(|n| {
+            if n.tag == tag { Some(n.id) } else { None }
+        }).collect()
+    }
+
+    /// Recursively update depth of a node and its children.
+    fn update_depth(&mut self, node_id: usize, new_depth: usize) {
+        if node_id >= self.nodes.len() {
+            return;
+        }
+        self.nodes[node_id].depth = new_depth;
+        let children: Vec<usize> = self.nodes[node_id].children.clone();
+        for child in children {
+            self.update_depth(child, new_depth + 1);
+        }
+    }
 }
 
 /// Tags whose content should be completely skipped (not added as text).
@@ -89,6 +342,7 @@ const MAX_DOM_NODES: usize = 100_000;
 /// Parse raw HTML into a flat DomTree.
 pub fn parse_html(html: &str) -> DomTree {
     let mut nodes = Vec::new();
+    let mut scripts = Vec::new();
     let mut stack: Vec<usize> = Vec::new(); // parent stack
 
     let bytes = html.as_bytes();
@@ -155,19 +409,26 @@ pub fn parse_html(html: &str) -> DomTree {
 
             if tag_content.starts_with('/') {
                 // ── Closing tag ──
-                let closing_tag = tag_content[1..].trim().to_lowercase();
-                // Pop until we find the matching tag
-                while let Some(parent_id) = stack.last() {
-                    if nodes[*parent_id].tag == closing_tag {
-                        stack.pop();
-                        break;
-                    } else {
-                        stack.pop(); // Auto-close mismatched tags
-                    }
+                let closing_tag = tag_content[1..].trim().split_whitespace()
+                    .next().unwrap_or("").to_lowercase();
+                // Find the matching tag in the stack
+                if let Some(match_pos) = stack.iter().rposition(|&id| nodes[id].tag == closing_tag) {
+                    // Pop from the top down to and including the match
+                    stack.truncate(match_pos);
                 }
+                // If no match found, ignore the closing tag entirely
             } else {
                 // ── Opening tag ──
-                let self_closing = tag_content.ends_with('/');
+                let self_closing = tag_content.ends_with('/') && {
+                    // Only treat as self-closing if the trailing / is outside quotes
+                    let mut in_q = false;
+                    let mut last_outside_slash = false;
+                    for c in tag_content.chars() {
+                        if c == '"' || c == '\'' { in_q = !in_q; }
+                        last_outside_slash = !in_q && c == '/';
+                    }
+                    last_outside_slash
+                };
                 let content = if self_closing {
                     &tag_content[..tag_content.len() - 1]
                 } else {
@@ -205,20 +466,50 @@ pub fn parse_html(html: &str) -> DomTree {
 
                 let is_void = VOID_ELEMENTS.contains(&tag_name.as_str());
 
-                // If this is a raw-text element (script/style), skip all content
+                // If this is a raw-text element (script/style), capture content
                 // until the matching closing tag.
                 if !is_void && RAW_TEXT_TAGS.contains(&tag_name.as_str()) {
-                    let close_tag = format!("</{tag_name}");
+                    let close_tag = format!("</{tag_name}>");
+                    let script_content;
                     if let Some(found) = find_case_insensitive(&html[pos..], &close_tag) {
-                        pos += found;
-                        // Skip past the '>'
-                        while pos < len && bytes[pos] != b'>' {
-                            pos += 1;
-                        }
-                        if pos < len {
-                            pos += 1; // skip '>'
-                        }
+                        script_content = &html[pos..pos + found];
+                        pos += found + close_tag.len();
+                    } else {
+                        // No closing tag found — consume rest as raw content
+                        script_content = &html[pos..];
+                        pos = len;
                     }
+
+                    // Capture script info
+                    if tag_name == "script" {
+                        let src_attr = nodes.last()
+                            .and_then(|n: &DomNode| n.attrs.get("src").cloned());
+                        let type_attr = nodes.last()
+                            .and_then(|n: &DomNode| n.attrs.get("type").cloned());
+                        let defer = nodes.last()
+                            .map_or(false, |n| n.attrs.contains_key("defer"));
+                        let is_async = nodes.last()
+                            .map_or(false, |n| n.attrs.contains_key("async"));
+
+                        let source = if let Some(src) = src_attr {
+                            ScriptSource::External(src)
+                        } else {
+                            let trimmed = script_content.trim();
+                            if trimmed.is_empty() {
+                                // Skip empty inline scripts entirely
+                                continue;
+                            }
+                            ScriptSource::Inline(trimmed.to_string())
+                        };
+
+                        scripts.push(ScriptInfo {
+                            source,
+                            script_type: type_attr,
+                            defer,
+                            is_async,
+                        });
+                    }
+
                     // Do NOT push to stack -- we already consumed the close tag
                     continue;
                 }
@@ -242,7 +533,7 @@ pub fn parse_html(html: &str) -> DomTree {
     // Flush any remaining text
     flush_text(&mut current_text, &mut nodes, &stack);
 
-    DomTree { nodes }
+    DomTree { nodes, scripts }
 }
 
 /// Flush accumulated text, decode entities, collapse whitespace, attach to parent.
@@ -324,8 +615,8 @@ fn decode_entities(s: &str) -> String {
         if ch == '&' {
             let mut entity = String::new();
             let mut found_semi = false;
-            // Collect up to 12 chars until ';' or limit
-            for _ in 0..12 {
+            // Collect up to 32 chars until ';' or limit
+            for _ in 0..32 {
                 match chars.peek() {
                     Some(&';') => {
                         chars.next(); // consume ';'
@@ -366,9 +657,11 @@ fn resolve_entity(entity: &str) -> Option<char> {
     if let Some(rest) = entity.strip_prefix('#') {
         if let Some(hex) = rest.strip_prefix('x').or_else(|| rest.strip_prefix('X')) {
             let code = u32::from_str_radix(hex, 16).ok()?;
+            if code == 0 { return Some('\u{FFFD}'); }
             return char::from_u32(code);
         } else {
             let code: u32 = rest.parse().ok()?;
+            if code == 0 { return Some('\u{FFFD}'); }
             return char::from_u32(code);
         }
     }
@@ -401,6 +694,73 @@ fn resolve_entity(entity: &str) -> Option<char> {
         "pound" => Some('\u{00A3}'),
         "yen" => Some('\u{00A5}'),
         "cent" => Some('\u{00A2}'),
+        "ensp" => Some('\u{2002}'),
+        "emsp" => Some('\u{2003}'),
+        "thinsp" => Some('\u{2009}'),
+        "zwnj" => Some('\u{200C}'),
+        "zwj" => Some('\u{200D}'),
+        "lrm" => Some('\u{200E}'),
+        "rlm" => Some('\u{200F}'),
+        "iexcl" => Some('\u{00A1}'),
+        "iquest" => Some('\u{00BF}'),
+        "frac14" => Some('\u{00BC}'),
+        "frac12" => Some('\u{00BD}'),
+        "frac34" => Some('\u{00BE}'),
+        "sup1" => Some('\u{00B9}'),
+        "sup2" => Some('\u{00B2}'),
+        "sup3" => Some('\u{00B3}'),
+        "plusmn" => Some('\u{00B1}'),
+        "micro" => Some('\u{00B5}'),
+        "para" => Some('\u{00B6}'),
+        "sect" => Some('\u{00A7}'),
+        "uml" => Some('\u{00A8}'),
+        "macr" => Some('\u{00AF}'),
+        "acute" => Some('\u{00B4}'),
+        "cedil" => Some('\u{00B8}'),
+        "ordf" => Some('\u{00AA}'),
+        "ordm" => Some('\u{00BA}'),
+        "not" => Some('\u{00AC}'),
+        "shy" => Some('\u{00AD}'),
+        "middot" => Some('\u{00B7}'),
+        "larr" => Some('\u{2190}'),
+        "uarr" => Some('\u{2191}'),
+        "rarr" => Some('\u{2192}'),
+        "darr" => Some('\u{2193}'),
+        "hearts" => Some('\u{2665}'),
+        "diams" => Some('\u{2666}'),
+        "spades" => Some('\u{2660}'),
+        "clubs" => Some('\u{2663}'),
+        "permil" => Some('\u{2030}'),
+        "infin" => Some('\u{221E}'),
+        "ne" => Some('\u{2260}'),
+        "le" => Some('\u{2264}'),
+        "ge" => Some('\u{2265}'),
+        "sum" => Some('\u{2211}'),
+        "prod" => Some('\u{220F}'),
+        "radic" => Some('\u{221A}'),
+        "empty" => Some('\u{2205}'),
+        "exist" => Some('\u{2203}'),
+        "forall" => Some('\u{2200}'),
+        "part" => Some('\u{2202}'),
+        "nabla" => Some('\u{2207}'),
+        "isin" => Some('\u{2208}'),
+        "notin" => Some('\u{2209}'),
+        "sub" => Some('\u{2282}'),
+        "sup" => Some('\u{2283}'),
+        "cap" => Some('\u{2229}'),
+        "cup" => Some('\u{222A}'),
+        "and" => Some('\u{2227}'),
+        "or" => Some('\u{2228}'),
+        "there4" => Some('\u{2234}'),
+        "sim" => Some('\u{223C}'),
+        "cong" => Some('\u{2245}'),
+        "asymp" => Some('\u{2248}'),
+        "equiv" => Some('\u{2261}'),
+        "oplus" => Some('\u{2295}'),
+        "otimes" => Some('\u{2297}'),
+        "loz" => Some('\u{25CA}'),
+        "circ" => Some('\u{02C6}'),
+        "tilde" => Some('\u{02DC}'),
         _ => None,
     }
 }
@@ -738,5 +1098,133 @@ mod tests {
         let ps = dom.by_tag("p");
         assert_eq!(ps.len(), 1);
         assert_eq!(ps[0].text, "Real");
+    }
+
+    // ── Script collection tests ──
+
+    #[test]
+    fn test_script_collection_inline() {
+        let html = r#"<script>var x = 42;</script><p>Hello</p>"#;
+        let dom = parse_html(html);
+        assert_eq!(dom.scripts.len(), 1);
+        match &dom.scripts[0].source {
+            ScriptSource::Inline(code) => assert!(code.contains("var x = 42")),
+            _ => panic!("Expected inline script"),
+        }
+    }
+
+    #[test]
+    fn test_script_collection_external() {
+        let html = r#"<script src="app.js"></script><p>Hello</p>"#;
+        let dom = parse_html(html);
+        assert_eq!(dom.scripts.len(), 1);
+        match &dom.scripts[0].source {
+            ScriptSource::External(url) => assert_eq!(url, "app.js"),
+            _ => panic!("Expected external script"),
+        }
+    }
+
+    #[test]
+    fn test_script_collection_multiple() {
+        let html = r#"<script>var a=1;</script><script src="b.js" defer></script><script>var c=3;</script>"#;
+        let dom = parse_html(html);
+        assert_eq!(dom.scripts.len(), 3);
+        assert!(dom.scripts[1].defer);
+    }
+
+    #[test]
+    fn test_script_async_attr() {
+        let html = r#"<script async src="analytics.js"></script>"#;
+        let dom = parse_html(html);
+        assert_eq!(dom.scripts.len(), 1);
+        assert!(dom.scripts[0].is_async);
+    }
+
+    // ── Mutable DOM tests ──
+
+    #[test]
+    fn test_create_element() {
+        let mut dom = parse_html("<div></div>");
+        let id = dom.create_element("span");
+        assert_eq!(dom.nodes[id].tag, "span");
+        assert!(dom.nodes[id].parent.is_none());
+    }
+
+    #[test]
+    fn test_append_child() {
+        let mut dom = parse_html("<div></div>");
+        let child = dom.create_element("p");
+        dom.append_child(0, child);
+        assert_eq!(dom.nodes[0].children.len(), 1);
+        assert_eq!(dom.nodes[child].parent, Some(0));
+        assert_eq!(dom.nodes[child].depth, 1);
+    }
+
+    #[test]
+    fn test_remove_child() {
+        let mut dom = parse_html("<div><p>Text</p></div>");
+        let p_id = dom.query_selector("p").unwrap();
+        let div_id = 0;
+        assert!(dom.remove_child(div_id, p_id));
+        assert!(!dom.nodes[div_id].children.contains(&p_id));
+        assert!(dom.nodes[p_id].parent.is_none());
+    }
+
+    #[test]
+    fn test_set_attribute() {
+        let mut dom = parse_html("<div></div>");
+        dom.set_attribute(0, "class", "container");
+        assert_eq!(dom.nodes[0].attrs.get("class").unwrap(), "container");
+    }
+
+    #[test]
+    fn test_set_text_content() {
+        let mut dom = parse_html("<p>Old</p>");
+        let p_id = dom.query_selector("p").unwrap();
+        dom.set_text_content(p_id, "New");
+        assert_eq!(dom.nodes[p_id].text, "New");
+    }
+
+    #[test]
+    fn test_get_element_by_id() {
+        let html = r#"<div id="main"><p id="intro">Hello</p></div>"#;
+        let dom = parse_html(html);
+        let id = dom.get_element_by_id("intro");
+        assert!(id.is_some());
+        assert_eq!(dom.nodes[id.unwrap()].tag, "p");
+    }
+
+    #[test]
+    fn test_query_selector_tag() {
+        let html = "<div><span>A</span><p>B</p></div>";
+        let dom = parse_html(html);
+        let p = dom.query_selector("p");
+        assert!(p.is_some());
+        assert_eq!(dom.nodes[p.unwrap()].text, "B");
+    }
+
+    #[test]
+    fn test_query_selector_class() {
+        let html = r#"<div class="a"><p class="target b">Hit</p></div>"#;
+        let dom = parse_html(html);
+        let hit = dom.query_selector(".target");
+        assert!(hit.is_some());
+        assert_eq!(dom.nodes[hit.unwrap()].text, "Hit");
+    }
+
+    #[test]
+    fn test_query_selector_all() {
+        let html = "<ul><li>A</li><li>B</li><li>C</li></ul>";
+        let dom = parse_html(html);
+        let lis = dom.query_selector_all("li");
+        assert_eq!(lis.len(), 3);
+    }
+
+    #[test]
+    fn test_set_inner_html() {
+        let mut dom = parse_html("<div id='box'></div>");
+        let box_id = dom.get_element_by_id("box").unwrap();
+        dom.set_inner_html(box_id, "<p>New content</p><span>More</span>");
+        assert!(dom.nodes[box_id].children.len() >= 2);
     }
 }

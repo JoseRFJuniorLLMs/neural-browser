@@ -17,6 +17,12 @@ glyphon = "0.8"              # GPU text rasterization
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 bytemuck = { version = "1", features = ["derive"] }
 
+# ── Clipboard ──
+arboard = "3"
+
+# ── CPU: JavaScript Engine ──
+boa_engine = "0.20"
+
 # ── Shared ──
 pollster = "0.4"
 crossbeam-channel = "0.5"

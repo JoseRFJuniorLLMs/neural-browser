@@ -75,6 +75,11 @@ pub struct ContentBlock {
     pub children: Vec<ContentBlock>,
     /// Decoded image data: (width, height, RGBA bytes). Populated by NPU image fetcher.
     pub image_data: Option<(u32, u32, Vec<u8>)>,
+    /// DOM node ID this block was extracted from (for CSS style mapping).
+    pub node_id: Option<usize>,
+    /// CSS computed style from the cascade engine (attached by NPU).
+    /// GPU layout uses this instead of hardcoded values when present.
+    pub computed_style: Option<Box<crate::css::cascade::ComputedStyle>>,
 }
 
 /// Content extractor — converts DOM to semantic blocks.
@@ -110,7 +115,7 @@ impl ContentExtractor {
                     depth: 0,
                     relevance: 1.0,
                     children: Vec::new(),
-                    image_data: None,
+                    image_data: None, node_id: Some(title.id), computed_style: None,
                 });
             }
         }
@@ -183,7 +188,7 @@ impl ContentExtractor {
                         depth: node.depth,
                         relevance: 0.5,
                         children: list_children,
-                        image_data: None,
+                        image_data: None, node_id: Some(node.id), computed_style: None,
                     });
                 }
             }
@@ -265,7 +270,27 @@ impl ContentExtractor {
                                 depth: child.depth,
                                 relevance: 0.5,
                                 children: nested_items,
-                                image_data: None,
+                                image_data: None, node_id: Some(child.id), computed_style: None,
+                            });
+                        }
+                    }
+                    "a" => {
+                        // Preserve link hrefs inside list items as child Link blocks
+                        let href = child.attrs.get("href").cloned().unwrap_or_default();
+                        let link_text = child.text.clone();
+                        if !link_text.is_empty() {
+                            // Also accumulate text for the parent ListItem
+                            if !text.is_empty() {
+                                text.push(' ');
+                            }
+                            text.push_str(&link_text);
+                            children.push(ContentBlock {
+                                kind: BlockKind::Link { href },
+                                text: link_text,
+                                depth: child.depth,
+                                relevance: 0.6,
+                                children: Vec::new(),
+                                image_data: None, node_id: Some(child.id), computed_style: None,
                             });
                         }
                     }
@@ -288,7 +313,7 @@ impl ContentExtractor {
             depth: node.depth,
             relevance: 0.5,
             children,
-            image_data: None,
+            image_data: None, node_id: Some(node.id), computed_style: None,
         }
     }
 
@@ -317,7 +342,7 @@ impl ContentExtractor {
                         depth: tr_node.depth,
                         relevance: 0.6,
                         children: Vec::new(),
-                        image_data: None,
+                        image_data: None, node_id: Some(*tr_id), computed_style: None,
                     });
                 }
             }
@@ -340,7 +365,7 @@ impl ContentExtractor {
             depth: table_node.depth,
             relevance: 0.7,
             children: row_blocks,
-            image_data: None,
+            image_data: None, node_id: Some(table_node.id), computed_style: None,
         })
     }
 
@@ -360,7 +385,7 @@ impl ContentExtractor {
                                 depth: child.depth,
                                 relevance: 0.7,
                                 children: Vec::new(),
-                                image_data: None,
+                                image_data: None, node_id: Some(child_id), computed_style: None,
                             });
                         }
                     }
@@ -373,7 +398,7 @@ impl ContentExtractor {
                                 depth: child.depth,
                                 relevance: 0.6,
                                 children: Vec::new(),
-                                image_data: None,
+                                image_data: None, node_id: Some(child_id), computed_style: None,
                             });
                         }
                     }
@@ -392,7 +417,7 @@ impl ContentExtractor {
             depth: dl_node.depth,
             relevance: 0.6,
             children,
-            image_data: None,
+            image_data: None, node_id: Some(dl_node.id), computed_style: None,
         })
     }
 
@@ -414,7 +439,7 @@ impl ContentExtractor {
                             depth: child.depth,
                             relevance: 0.7,
                             children: Vec::new(),
-                            image_data: None,
+                            image_data: None, node_id: Some(child_id), computed_style: None,
                         });
                     }
                     "figcaption" => {
@@ -425,7 +450,7 @@ impl ContentExtractor {
                             depth: child.depth,
                             relevance: 0.7,
                             children: Vec::new(),
-                            image_data: None,
+                            image_data: None, node_id: Some(child_id), computed_style: None,
                         });
                     }
                     _ => {}
@@ -443,7 +468,7 @@ impl ContentExtractor {
             depth: fig_node.depth,
             relevance: 0.7,
             children,
-            image_data: None,
+            image_data: None, node_id: Some(fig_node.id), computed_style: None,
         })
     }
 
@@ -463,7 +488,7 @@ impl ContentExtractor {
                         depth: child.depth,
                         relevance: 0.7,
                         children: Vec::new(),
-                        image_data: None,
+                        image_data: None, node_id: Some(child_id), computed_style: None,
                     });
                 } else {
                     // Content inside details
@@ -482,7 +507,7 @@ impl ContentExtractor {
             depth: details_node.depth,
             relevance: 0.5,
             children,
-            image_data: None,
+            image_data: None, node_id: Some(details_node.id), computed_style: None,
         })
     }
 
@@ -509,7 +534,7 @@ impl ContentExtractor {
             depth: form_node.depth,
             relevance: 0.4,
             children: Vec::new(),
-            image_data: None,
+            image_data: None, node_id: Some(form_node.id), computed_style: None,
         })
     }
 
@@ -708,9 +733,34 @@ impl ContentExtractor {
                 src: node.attrs.get("src").cloned().unwrap_or_default(),
                 alt: node.attrs.get("alt").cloned().unwrap_or_default(),
             },
-            "a" => BlockKind::Link {
-                href: node.attrs.get("href").cloned().unwrap_or_default(),
-            },
+            "a" => {
+                let href = node.attrs.get("href").cloned().unwrap_or_default();
+                // If <a> has no text, check for child <img> and use alt text
+                if node.text.is_empty() {
+                    let mut img_alt = None;
+                    for &child_id in &node.children {
+                        if let Some(child) = dom.nodes.get(child_id) {
+                            if child.tag == "img" {
+                                img_alt = Some(child.attrs.get("alt")
+                                    .cloned()
+                                    .unwrap_or_else(|| "[image link]".to_string()));
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(alt) = img_alt {
+                        return Some(ContentBlock {
+                            kind: BlockKind::Link { href },
+                            text: alt,
+                            depth: node.depth,
+                            relevance: 0.5,
+                            children: Vec::new(),
+                            image_data: None, node_id: Some(node.id), computed_style: None,
+                        });
+                    }
+                }
+                BlockKind::Link { href }
+            }
             "hr" => BlockKind::Separator,
             "nav" => BlockKind::Navigation,
             "footer" => BlockKind::Boilerplate,
@@ -732,7 +782,7 @@ impl ContentExtractor {
             depth: node.depth,
             relevance: 0.5, // default, will be scored
             children: Vec::new(),
-            image_data: None,
+            image_data: None, node_id: Some(node.id), computed_style: None,
         })
     }
 
@@ -1040,5 +1090,44 @@ mod tests {
         let paras: Vec<_> = blocks.iter().filter(|b| matches!(b.kind, BlockKind::Paragraph)).collect();
         assert_eq!(paras.len(), 1);
         assert_eq!(paras[0].text, "Visible");
+    }
+
+    // ── Link resolution bug fix tests ──
+
+    #[test]
+    fn test_link_inside_list_item_preserved() {
+        let blocks = extract(r#"<ul><li><a href="https://example.com">Example Link</a></li></ul>"#);
+        let list = blocks.iter().find(|b| matches!(b.kind, BlockKind::List { .. }));
+        assert!(list.is_some(), "Should find a list block");
+        let list = list.unwrap();
+        assert!(!list.children.is_empty(), "List should have children");
+        let li = &list.children[0];
+        assert_eq!(li.text, "Example Link");
+        // The li should have a child Link block with the href
+        let has_link = li.children.iter().any(|c| {
+            matches!(&c.kind, BlockKind::Link { href } if href == "https://example.com")
+        });
+        assert!(has_link, "List item should preserve child link with href");
+    }
+
+    #[test]
+    fn test_anchor_wrapping_img_uses_alt() {
+        let blocks = extract(r#"<a href="/home"><img src="logo.png" alt="Home Logo"></a>"#);
+        let link = blocks.iter().find(|b| matches!(&b.kind, BlockKind::Link { .. }));
+        assert!(link.is_some(), "Should create a Link block from <a> wrapping <img>");
+        let link = link.unwrap();
+        assert_eq!(link.text, "Home Logo");
+        if let BlockKind::Link { href } = &link.kind {
+            assert_eq!(href, "/home");
+        }
+    }
+
+    #[test]
+    fn test_anchor_wrapping_img_no_alt_fallback() {
+        let blocks = extract(r#"<a href="/home"><img src="logo.png"></a>"#);
+        let link = blocks.iter().find(|b| matches!(&b.kind, BlockKind::Link { .. }));
+        assert!(link.is_some(), "Should create Link with fallback text for img without alt");
+        let link = link.unwrap();
+        assert_eq!(link.text, "[image link]");
     }
 }

@@ -17,6 +17,7 @@ mod ui;
 #[allow(dead_code)] // EVA integration is WIP
 mod eva;
 mod memory;
+mod css; // CSS engine — integrated into NPU→GPU pipeline
 
 use anyhow::Result;
 use crossbeam_channel as channel;
@@ -98,6 +99,12 @@ pub enum PipelineMsg {
         content: String,
         provider: eva::AiProvider,
     },
+
+    // GPU -> CPU: request image fetch
+    FetchImage { url: String },
+
+    // CPU -> GPU: fetched image bytes
+    ImageData { url: String, data: Vec<u8> },
 }
 
 fn main() -> Result<()> {
@@ -118,6 +125,9 @@ fn main() -> Result<()> {
     // EVA channel: GPU -> CPU (queries) and CPU -> GPU (responses)
     let (eva_tx, eva_rx) = channel::bounded::<PipelineMsg>(8);
     let (eva_resp_tx, eva_resp_rx) = channel::bounded::<PipelineMsg>(8);
+
+    // Image channel: CPU -> GPU (fetched image data)
+    let (img_tx, img_rx) = channel::bounded::<PipelineMsg>(8);
 
     // ── NPU engine (spawn on dedicated thread) ──
     let npu_prefetch_tx = ui_tx.clone(); // for sending prefetch suggestions to CPU
@@ -167,6 +177,8 @@ fn main() -> Result<()> {
                                         relevance: 1.0,
                                         children: Vec::new(),
                                         image_data: None,
+                                        node_id: None,
+                                        computed_style: None,
                                     }],
                                     ads_blocked: 0,
                                 });
@@ -182,6 +194,7 @@ fn main() -> Result<()> {
     let cpu_ui_rx = ui_rx;
     let cpu_eva_rx = eva_rx;
     let cpu_eva_resp_tx = eva_resp_tx;
+    let cpu_img_tx = img_tx;
     let cpu_handle = std::thread::Builder::new()
         .name("cpu-network".into())
         .spawn(move || {
@@ -195,24 +208,18 @@ fn main() -> Result<()> {
             // ── Browser history stacks ──
             let mut back_stack: Vec<String> = Vec::new();
             let mut forward_stack: Vec<String> = Vec::new();
+            let mut visited_urls: Vec<String> = Vec::new();
             // Navigate to start page or CLI-provided URL
             let mut current_url: Option<String> = match std::env::args().nth(1) {
                 Some(url) => {
-                    process_url(&net, &url, &cpu_to_npu_tx);
+                    visited_urls.push(url.clone());
+                    process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls);
                     Some(url)
                 }
                 None => {
-                    // Show built-in start page
-                    let url = cpu::start_page::START_PAGE_URL;
-                    let html = cpu::start_page::start_page_html().to_string();
-                    let dom = cpu::dom::parse_html(&html);
-                    info!("[CPU] Loaded start page ({} nodes)", dom.nodes.len());
-                    let _ = cpu_to_npu_tx.send(PipelineMsg::HtmlReady {
-                        url: url.to_string(),
-                        html,
-                        dom,
-                    });
-                    Some(url.to_string())
+                    let url = cpu::start_page::START_PAGE_URL.to_string();
+                    process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls);
+                    Some(url)
                 }
             };
 
@@ -231,12 +238,13 @@ fn main() -> Result<()> {
                                 if !url.starts_with("neural://") {
                                     semantic_memory.store_page(&url, "", "", "");
                                 }
+                                visited_urls.push(url.clone());
                                 if let Some(cur) = current_url.take() {
                                     back_stack.push(cur);
                                 }
                                 forward_stack.clear();
                                 current_url = Some(url.clone());
-                                process_url(&net, &url, &cpu_to_npu_tx);
+                                process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls);
                             }
                             PipelineMsg::Back => {
                                 if let Some(prev_url) = back_stack.pop() {
@@ -245,17 +253,7 @@ fn main() -> Result<()> {
                                         forward_stack.push(cur);
                                     }
                                     current_url = Some(prev_url.clone());
-                                    if prev_url == cpu::start_page::START_PAGE_URL {
-                                        let html = cpu::start_page::start_page_html().to_string();
-                                        let dom = cpu::dom::parse_html(&html);
-                                        let _ = cpu_to_npu_tx.send(PipelineMsg::HtmlReady {
-                                            url: prev_url,
-                                            html,
-                                            dom,
-                                        });
-                                    } else {
-                                        process_url(&net, &prev_url, &cpu_to_npu_tx);
-                                    }
+                                    process_url_or_internal(&net, &prev_url, &cpu_to_npu_tx, &visited_urls);
                                 } else {
                                     warn!("[CPU] No back history available");
                                 }
@@ -267,17 +265,7 @@ fn main() -> Result<()> {
                                         back_stack.push(cur);
                                     }
                                     current_url = Some(next_url.clone());
-                                    if next_url == cpu::start_page::START_PAGE_URL {
-                                        let html = cpu::start_page::start_page_html().to_string();
-                                        let dom = cpu::dom::parse_html(&html);
-                                        let _ = cpu_to_npu_tx.send(PipelineMsg::HtmlReady {
-                                            url: next_url,
-                                            html,
-                                            dom,
-                                        });
-                                    } else {
-                                        process_url(&net, &next_url, &cpu_to_npu_tx);
-                                    }
+                                    process_url_or_internal(&net, &next_url, &cpu_to_npu_tx, &visited_urls);
                                 } else {
                                     warn!("[CPU] No forward history available");
                                 }
@@ -285,6 +273,21 @@ fn main() -> Result<()> {
                             PipelineMsg::Prefetch(url) => {
                                 info!("[CPU] Prefetching: {url}");
                                 let _ = net.prefetch(&url);
+                            }
+                            PipelineMsg::FetchImage { url } => {
+                                info!("[CPU] Fetching image: {url}");
+                                match net.fetch_image(&url) {
+                                    Ok(data) => {
+                                        info!("[CPU] Image fetched: {} ({} bytes)", url, data.len());
+                                        let _ = cpu_img_tx.send(PipelineMsg::ImageData {
+                                            url,
+                                            data,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        warn!("[CPU] Image fetch failed for {url}: {e}");
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -380,7 +383,7 @@ fn main() -> Result<()> {
 
     // ── GPU rendering + window (must be on main thread) ──
     info!("[GPU] Starting render engine on main thread");
-    gpu::run_gpu_renderer(npu_to_gpu_rx, ui_tx, eva_tx, eva_resp_rx)?;
+    gpu::run_gpu_renderer(npu_to_gpu_rx, ui_tx, eva_tx, eva_resp_rx, img_rx)?;
 
     let _ = npu_handle.join();
     let _ = cpu_handle.join();
@@ -388,7 +391,44 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Route a URL: serve internal pages for `neural://` or fetch from network.
+fn process_url_or_internal(
+    net: &cpu::network::NetworkEngine,
+    url: &str,
+    tx: &channel::Sender<PipelineMsg>,
+    visited_urls: &[String],
+) {
+    // neural://start → start_page.rs
+    if url == cpu::start_page::START_PAGE_URL {
+        let html = cpu::start_page::start_page_html().to_string();
+        let dom = cpu::dom::parse_html(&html);
+        info!("[CPU] Loaded start page ({} nodes)", dom.nodes.len());
+        let _ = tx.send(PipelineMsg::HtmlReady {
+            url: url.to_string(),
+            html,
+            dom,
+        });
+        return;
+    }
+
+    // neural://settings, neural://history, neural://about, neural://files, etc.
+    if let Some(html) = cpu::internal_pages::generate_internal_page(url, visited_urls) {
+        let dom = cpu::dom::parse_html(&html);
+        info!("[CPU] Loaded internal page: {url} ({} nodes)", dom.nodes.len());
+        let _ = tx.send(PipelineMsg::HtmlReady {
+            url: url.to_string(),
+            html,
+            dom,
+        });
+        return;
+    }
+
+    // Regular HTTP(S) URL → network fetch
+    process_url(net, url, tx);
+}
+
 /// Fetch and parse a URL, sending the result to the NPU.
+/// Runs JavaScript scripts after parsing to modify the DOM before NPU processing.
 /// On failure, generates an error page instead of propagating the error.
 fn process_url(
     net: &cpu::network::NetworkEngine,
@@ -403,8 +443,64 @@ fn process_url(
         }
     };
 
-    let dom = cpu::dom::parse_html(&html);
+    let mut dom = cpu::dom::parse_html(&html);
     info!("[CPU] Parsed {} nodes from {url}", dom.nodes.len());
+
+    // ── Execute JavaScript ──
+    if !dom.scripts.is_empty() {
+        info!("[CPU] Running {} scripts from {url}", dom.scripts.len());
+        let scripts = dom.scripts.clone();
+        let mut js = cpu::js_engine::JsEngine::new();
+
+        // Fetch external scripts
+        let mut external_code = std::collections::HashMap::new();
+        for script in &scripts {
+            if let cpu::dom::ScriptSource::External(src_url) = &script.source {
+                // Resolve relative URLs
+                let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://") {
+                    src_url.clone()
+                } else if src_url.starts_with("//") {
+                    format!("https:{src_url}")
+                } else if src_url.starts_with('/') {
+                    // Absolute path — combine with origin
+                    if let Ok(parsed) = url::Url::parse(url) {
+                        format!("{}://{}{}", parsed.scheme(), parsed.host_str().unwrap_or(""), src_url)
+                    } else {
+                        continue;
+                    }
+                } else {
+                    // Relative path
+                    if let Ok(base) = url::Url::parse(url) {
+                        base.join(src_url).map(|u| u.to_string()).unwrap_or_default()
+                    } else {
+                        continue;
+                    }
+                };
+
+                if !full_url.is_empty() {
+                    match net.fetch(&full_url) {
+                        Ok(code) => {
+                            info!("[CPU] Fetched external script: {} ({} bytes)", src_url, code.len());
+                            external_code.insert(src_url.clone(), code);
+                        }
+                        Err(e) => {
+                            warn!("[CPU] Failed to fetch script {}: {e}", src_url);
+                        }
+                    }
+                }
+            }
+        }
+
+        if external_code.is_empty() {
+            if let Err(e) = js.execute_scripts_with_externals(&mut dom, &scripts, &std::collections::HashMap::new(), url) {
+                warn!("[CPU] JS execution error: {e}");
+            }
+        } else {
+            if let Err(e) = js.execute_scripts_with_externals(&mut dom, &scripts, &external_code, url) {
+                warn!("[CPU] JS execution error: {e}");
+            }
+        }
+    }
 
     if let Err(e) = tx.send(PipelineMsg::HtmlReady {
         url: url.to_string(),

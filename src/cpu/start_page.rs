@@ -29,14 +29,29 @@ pub fn start_page_html() -> &'static str {
         <li>Escape — Cancel URL editing</li>
         <li>F5 / Ctrl+R — Refresh the current page</li>
         <li>Alt+Left / Alt+Right — Back / Forward</li>
-        <li>Page Up / Page Down — Scroll by page</li>
+        <li>Page Up / Page Down / Space — Scroll by page (Shift+Space = up)</li>
+        <li>Arrow Up / Arrow Down — Scroll by line</li>
         <li>Home / End — Scroll to top / bottom</li>
+        <li>Ctrl+C — Copy URL to clipboard</li>
+        <li>Ctrl+V — Paste from clipboard</li>
+        <li>Ctrl+W — Close window</li>
         <li>Ctrl+E / F2 — Toggle AI assistant panel</li>
         <li>Tab (in panel) — Switch AI provider (EVA → Claude → Gemini → GPT-4)</li>
         <li>Ctrl+S — Ask AI to summarize current page</li>
         <li>Ctrl+D — Reading mode (high-relevance content only + AI summary)</li>
         <li>Ctrl+T — Translate page to Portuguese</li>
+        <li>Ctrl+Plus / Ctrl+Minus — Zoom in / out (30% to 300%)</li>
+        <li>Ctrl+0 — Reset zoom to 100%</li>
+        <li>Ctrl+Scroll — Zoom with mouse wheel</li>
+        <li>F11 — Toggle fullscreen</li>
         <li>Ctrl+Shift+V (in panel) — Voice response via EVA</li>
+    </ul>
+
+    <h2>Internal Pages</h2>
+    <ul>
+        <li><a href="neural://settings">neural://settings</a> — Browser settings and AI provider status</li>
+        <li><a href="neural://history">neural://history</a> — Browsing history this session</li>
+        <li><a href="neural://about">neural://about</a> — About Neural Browser</li>
     </ul>
 
     <h2>Try These Pages</h2>

@@ -9,9 +9,11 @@
 //! Also includes voice response via EVA's native audio model.
 
 pub mod panel;
+pub mod local_model;
 
 use anyhow::Result;
 use log::{info, warn};
+use parking_lot::Mutex;
 use std::time::Duration;
 use ureq::tls::{RootCerts, TlsConfig};
 
@@ -30,6 +32,7 @@ pub enum AiProvider {
     Claude,
     Gemini,
     Gpt4,
+    Local,
 }
 
 impl AiProvider {
@@ -39,6 +42,7 @@ impl AiProvider {
             AiProvider::Claude => "Claude",
             AiProvider::Gemini => "Gemini",
             AiProvider::Gpt4 => "GPT-4",
+            AiProvider::Local => "Local",
         }
     }
 
@@ -47,12 +51,19 @@ impl AiProvider {
             AiProvider::Eva => AiProvider::Claude,
             AiProvider::Claude => AiProvider::Gemini,
             AiProvider::Gemini => AiProvider::Gpt4,
-            AiProvider::Gpt4 => AiProvider::Eva,
+            AiProvider::Gpt4 => AiProvider::Local,
+            AiProvider::Local => AiProvider::Eva,
         }
     }
 }
 
-/// Multi-AI client — talks to EVA, Claude, Gemini, or GPT-4 via REST.
+impl std::fmt::Display for AiProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Multi-AI client — talks to EVA, Claude, Gemini, GPT-4 via REST, or runs local ONNX.
 pub struct AiClient {
     agent: ureq::Agent,
     eva_url: String,
@@ -61,6 +72,8 @@ pub struct AiClient {
     openai_key: Option<String>,
     // EVA voice endpoint
     eva_voice_url: String,
+    // Local ONNX model
+    local_model: parking_lot::Mutex<local_model::LocalModel>,
 }
 
 impl AiClient {
@@ -90,11 +103,15 @@ impl AiClient {
             .build()
             .new_agent();
 
+        let local = local_model::LocalModel::from_env();
+        let local_status = if local.model_available() { "model found" } else { "no model" };
+
         info!("[AI] Multi-AI client initialized:");
         info!("[AI]   EVA: {eva_url}");
         info!("[AI]   Claude: {}", if claude_key.is_some() { "configured" } else { "no key" });
         info!("[AI]   Gemini: {}", if gemini_key.is_some() { "configured" } else { "no key" });
         info!("[AI]   GPT-4: {}", if openai_key.is_some() { "configured" } else { "no key" });
+        info!("[AI]   Local ONNX: {local_status}");
 
         Self {
             agent,
@@ -103,6 +120,7 @@ impl AiClient {
             gemini_key,
             openai_key,
             eva_voice_url,
+            local_model: Mutex::new(local),
         }
     }
 
@@ -118,6 +136,9 @@ impl AiClient {
         if self.openai_key.is_some() {
             providers.push(AiProvider::Gpt4);
         }
+        if self.local_model.lock().model_available() {
+            providers.push(AiProvider::Local);
+        }
         providers
     }
 
@@ -129,6 +150,7 @@ impl AiClient {
             AiProvider::Claude => self.claude_request(message, page_context),
             AiProvider::Gemini => self.gemini_request(message, page_context),
             AiProvider::Gpt4 => self.gpt4_request(message, page_context),
+            AiProvider::Local => self.local_request(message, page_context),
         }
     }
 
@@ -159,6 +181,26 @@ impl AiClient {
                 }
             }
             Err(_) => Ok("Voice service unreachable.".into()),
+        }
+    }
+
+    // ── Local ONNX provider (NPU/GPU inference) ──
+
+    fn local_request(&self, message: &str, context: &str) -> Result<String> {
+        let prompt = if context.is_empty() {
+            message.to_string()
+        } else {
+            format!(
+                "Context:\n{}\n\nQuestion: {}",
+                truncate_context(context, 2000),
+                message,
+            )
+        };
+
+        let mut model = self.local_model.lock();
+        match model.generate(&prompt, None) {
+            Ok(response) => Ok(response),
+            Err(e) => Ok(format!("Local AI: {e}")),
         }
     }
 
@@ -463,7 +505,14 @@ mod tests {
         assert_eq!(AiProvider::Eva.next(), AiProvider::Claude);
         assert_eq!(AiProvider::Claude.next(), AiProvider::Gemini);
         assert_eq!(AiProvider::Gemini.next(), AiProvider::Gpt4);
-        assert_eq!(AiProvider::Gpt4.next(), AiProvider::Eva);
+        assert_eq!(AiProvider::Gpt4.next(), AiProvider::Local);
+        assert_eq!(AiProvider::Local.next(), AiProvider::Eva); // wraps
+    }
+
+    #[test]
+    fn test_provider_display() {
+        assert_eq!(format!("{}", AiProvider::Eva), "EVA");
+        assert_eq!(format!("{}", AiProvider::Local), "Local");
     }
 
     #[test]

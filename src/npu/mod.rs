@@ -83,7 +83,10 @@ impl NpuEngine {
             info!("[NPU] Blocked {ads_blocked} ad/tracker elements");
         }
 
-        // ── Step 2.5: Fetch and decode images (max 5 per page) ──
+        // ── Step 2.5: CSS cascade — compute styles from <style> tags + inline styles ──
+        self.apply_css_styles(&mut blocks, dom);
+
+        // ── Step 2.6: Fetch and decode images (max 5 per page) ──
         self.fetch_images(&mut blocks, url);
 
         // ── Step 3: Score links for smart prefetch ──
@@ -109,6 +112,66 @@ impl NpuEngine {
             language,
             prefetch_urls,
         })
+    }
+
+    /// Apply CSS computed styles to content blocks.
+    ///
+    /// Runs the full CSS cascade on the NPU thread:
+    /// 1. Extract <style> tags from DOM → parse into Stylesheets
+    /// 2. Extract inline style="" attributes
+    /// 3. Build style tree (cascade + inheritance + specificity)
+    /// 4. Map computed styles onto ContentBlocks by node_id
+    ///
+    /// After this step, GPU layout can use real CSS values (colors, fonts,
+    /// margins, display) instead of hardcoded heuristics.
+    fn apply_css_styles(&self, blocks: &mut [ContentBlock], dom: &DomTree) {
+        use crate::css::cascade::{extract_style_tags, extract_inline_styles, style_tree, StyledNode, ComputedStyle};
+        use crate::css::parser::parse_stylesheet;
+        use std::collections::HashMap;
+
+        // ── 1. Parse all <style> tags into stylesheets ──
+        let css_texts = extract_style_tags(dom);
+        let stylesheets: Vec<_> = css_texts.iter()
+            .map(|css| parse_stylesheet(css))
+            .collect();
+
+        // ── 2. Extract inline style="" attributes ──
+        let inline_styles = extract_inline_styles(dom);
+
+        // ── 3. Build full style tree (user-agent + page CSS + inline + cascade) ──
+        let styled_tree = style_tree(dom, &stylesheets, &inline_styles);
+
+        // ── 4. Flatten style tree into a lookup map: node_id → ComputedStyle ──
+        let mut style_map: HashMap<usize, ComputedStyle> = HashMap::new();
+        fn flatten_styles(nodes: &[StyledNode], map: &mut HashMap<usize, crate::css::cascade::ComputedStyle>) {
+            for sn in nodes {
+                map.insert(sn.node_id, sn.style.clone());
+                flatten_styles(&sn.children, map);
+            }
+        }
+        flatten_styles(&styled_tree, &mut style_map);
+
+        // ── 5. Attach computed styles to content blocks ──
+        fn attach_styles(blocks: &mut [ContentBlock], map: &HashMap<usize, ComputedStyle>) {
+            for block in blocks.iter_mut() {
+                if let Some(nid) = block.node_id {
+                    if let Some(style) = map.get(&nid) {
+                        block.computed_style = Some(Box::new(style.clone()));
+                    }
+                }
+                // Recurse into children (lists, tables, figures, etc.)
+                attach_styles(&mut block.children, map);
+            }
+        }
+        attach_styles(blocks, &style_map);
+
+        let styled_count = blocks.iter()
+            .filter(|b| b.computed_style.is_some())
+            .count();
+        if styled_count > 0 || !css_texts.is_empty() {
+            info!("[NPU] CSS cascade: {} stylesheets, {} inline styles, {}/{} blocks styled",
+                css_texts.len(), inline_styles.len(), styled_count, blocks.len());
+        }
     }
 
     /// Maximum number of images to fetch per page.
@@ -577,7 +640,7 @@ mod tests {
     #[test]
     fn test_empty_dom_returns_empty_result() {
         let mut engine = make_engine();
-        let dom = DomTree { nodes: Vec::new() };
+        let dom = DomTree { nodes: Vec::new(), scripts: Vec::new() };
         let result = engine.process_page("https://example.com", "", &dom).unwrap();
         assert!(result.blocks.is_empty());
         assert_eq!(result.ads_blocked, 0);
@@ -606,7 +669,7 @@ mod tests {
             depth: 0,
             relevance: 0.5,
             children: Vec::new(),
-            image_data: None,
+            image_data: None, node_id: None, computed_style: None,
         }];
         assert_eq!(engine.detect_language(&blocks), Some("en".into()));
     }
@@ -620,7 +683,7 @@ mod tests {
             depth: 0,
             relevance: 0.5,
             children: Vec::new(),
-            image_data: None,
+            image_data: None, node_id: None, computed_style: None,
         }];
         assert_eq!(engine.detect_language(&blocks), Some("pt".into()));
     }
@@ -634,7 +697,7 @@ mod tests {
             depth: 0,
             relevance: 0.5,
             children: Vec::new(),
-            image_data: None,
+            image_data: None, node_id: None, computed_style: None,
         }];
         assert_eq!(engine.detect_language(&blocks), Some("de".into()));
     }
@@ -648,7 +711,7 @@ mod tests {
             depth: 0,
             relevance: 0.5,
             children: Vec::new(),
-            image_data: None,
+            image_data: None, node_id: None, computed_style: None,
         }];
         assert_eq!(engine.detect_language(&blocks), None);
     }
@@ -711,7 +774,7 @@ mod tests {
     #[test]
     fn test_summary_from_paragraph() {
         let engine = make_engine();
-        let dom = DomTree { nodes: Vec::new() };
+        let dom = DomTree { nodes: Vec::new(), scripts: Vec::new() };
         let blocks = vec![
             ContentBlock {
                 kind: BlockKind::Heading { level: 1 },
@@ -719,7 +782,7 @@ mod tests {
                 depth: 0,
                 relevance: 0.9,
                 children: Vec::new(),
-                image_data: None,
+                image_data: None, node_id: None, computed_style: None,
             },
             ContentBlock {
                 kind: BlockKind::Paragraph,
@@ -727,7 +790,7 @@ mod tests {
                 depth: 0,
                 relevance: 0.7,
                 children: Vec::new(),
-                image_data: None,
+                image_data: None, node_id: None, computed_style: None,
             },
         ];
         let summary = engine.generate_summary(&blocks, "", &dom);

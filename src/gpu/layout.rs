@@ -32,8 +32,15 @@ pub enum LayoutKind {
         bold: bool,
         italic: bool,
     },
-    /// Image placeholder (actual decode happens in renderer)
+    /// Image placeholder (text fallback if no pixel data)
     Image { src: String, alt: String },
+    /// Decoded image with RGBA pixel data ready for GPU texture upload
+    DecodedImage {
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        alt: String,
+    },
     /// Horizontal separator line
     Separator,
     /// Code block with monospace font
@@ -53,7 +60,8 @@ fn estimate_lines(text: &str, width: f32, font_size: f32) -> f32 {
 
     let mut total_lines: f32 = 0.0;
     for line in text.split('\n') {
-        let line_len = line.len() as f32;
+        // Use char count, not byte length — CJK/emoji chars are multi-byte
+        let line_len = line.chars().count() as f32;
         total_lines += (line_len / chars_per_line).ceil().max(1.0);
     }
     total_lines.max(1.0)
@@ -224,38 +232,60 @@ pub fn compute_layout(
                 cursor_y += block_height + 14.0;
             }
             BlockKind::Image { src, alt } => {
-                let img_height = 300.0; // Placeholder height
+                if let Some((img_w, img_h, rgba)) = &block.image_data {
+                    // Calculate aspect-ratio-preserving dimensions
+                    let scale = (content_width / *img_w as f32).min(1.0);
+                    let display_w = (*img_w as f32 * scale).round();
+                    let display_h = (*img_h as f32 * scale).round();
 
-                layout.push(LayoutBox {
-                    x: margin_x,
-                    y: cursor_y,
-                    width: content_width,
-                    height: img_height,
-                    kind: LayoutKind::Image {
-                        src: src.clone(),
-                        alt: alt.clone(),
-                    },
-                    href: None,
-                });
-
-                if !alt.is_empty() {
                     layout.push(LayoutBox {
                         x: margin_x,
-                        y: cursor_y + img_height + 4.0,
-                        width: content_width,
-                        height: 20.0,
-                        kind: LayoutKind::Text {
-                            text: alt.clone(),
-                            font_size: 12.0,
-                            color: theme.text_dim,
-                            bold: false,
-                            italic: true,
+                        y: cursor_y,
+                        width: display_w,
+                        height: display_h,
+                        kind: LayoutKind::DecodedImage {
+                            width: *img_w,
+                            height: *img_h,
+                            rgba: rgba.clone(),
+                            alt: alt.clone(),
                         },
                         href: None,
                     });
-                    cursor_y += img_height + 28.0;
+
+                    if !alt.is_empty() {
+                        layout.push(LayoutBox {
+                            x: margin_x,
+                            y: cursor_y + display_h + 4.0,
+                            width: content_width,
+                            height: 20.0,
+                            kind: LayoutKind::Text {
+                                text: alt.clone(),
+                                font_size: 12.0,
+                                color: theme.text_dim,
+                                bold: false,
+                                italic: true,
+                            },
+                            href: None,
+                        });
+                        cursor_y += display_h + 28.0;
+                    } else {
+                        cursor_y += display_h + 12.0;
+                    }
                 } else {
-                    cursor_y += img_height + 12.0;
+                    // Fallback: text placeholder
+                    let img_height = 30.0;
+                    layout.push(LayoutBox {
+                        x: margin_x,
+                        y: cursor_y,
+                        width: content_width,
+                        height: img_height,
+                        kind: LayoutKind::Image {
+                            src: src.clone(),
+                            alt: alt.clone(),
+                        },
+                        href: None,
+                    });
+                    cursor_y += img_height + 8.0;
                 }
             }
             BlockKind::List { ordered } => {
@@ -562,18 +592,38 @@ pub fn compute_layout(
                 for child in &block.children {
                     match &child.kind {
                         BlockKind::Image { src, alt } => {
-                            layout.push(LayoutBox {
-                                x: margin_x,
-                                y: cursor_y,
-                                width: content_width,
-                                height: 200.0,
-                                kind: LayoutKind::Image {
-                                    src: src.clone(),
-                                    alt: alt.clone(),
-                                },
-                                href: None,
-                            });
-                            cursor_y += 208.0;
+                            if let Some((img_w, img_h, rgba)) = &child.image_data {
+                                let scale = (content_width / *img_w as f32).min(1.0);
+                                let display_w = (*img_w as f32 * scale).round();
+                                let display_h = (*img_h as f32 * scale).round();
+                                layout.push(LayoutBox {
+                                    x: margin_x,
+                                    y: cursor_y,
+                                    width: display_w,
+                                    height: display_h,
+                                    kind: LayoutKind::DecodedImage {
+                                        width: *img_w,
+                                        height: *img_h,
+                                        rgba: rgba.clone(),
+                                        alt: alt.clone(),
+                                    },
+                                    href: None,
+                                });
+                                cursor_y += display_h + 8.0;
+                            } else {
+                                layout.push(LayoutBox {
+                                    x: margin_x,
+                                    y: cursor_y,
+                                    width: content_width,
+                                    height: 30.0,
+                                    kind: LayoutKind::Image {
+                                        src: src.clone(),
+                                        alt: alt.clone(),
+                                    },
+                                    href: None,
+                                });
+                                cursor_y += 38.0;
+                            }
                         }
                         BlockKind::FigCaption => {
                             let font_size = 12.0;

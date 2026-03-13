@@ -166,6 +166,7 @@ fn main() -> Result<()> {
                                         depth: 0,
                                         relevance: 1.0,
                                         children: Vec::new(),
+                                        image_data: None,
                                     }],
                                     ads_blocked: 0,
                                 });

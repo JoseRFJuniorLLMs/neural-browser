@@ -73,6 +73,8 @@ pub struct ContentBlock {
     pub relevance: f32,
     /// Children blocks (for nested structures like lists).
     pub children: Vec<ContentBlock>,
+    /// Decoded image data: (width, height, RGBA bytes). Populated by NPU image fetcher.
+    pub image_data: Option<(u32, u32, Vec<u8>)>,
 }
 
 /// Content extractor — converts DOM to semantic blocks.
@@ -108,6 +110,7 @@ impl ContentExtractor {
                     depth: 0,
                     relevance: 1.0,
                     children: Vec::new(),
+                    image_data: None,
                 });
             }
         }
@@ -257,6 +260,7 @@ impl ContentExtractor {
             depth: node.depth,
             relevance: 0.5,
             children,
+            image_data: None,
         }
     }
 
@@ -285,6 +289,7 @@ impl ContentExtractor {
                         depth: tr_node.depth,
                         relevance: 0.6,
                         children: Vec::new(),
+                        image_data: None,
                     });
                 }
             }
@@ -327,6 +332,7 @@ impl ContentExtractor {
                                 depth: child.depth,
                                 relevance: 0.7,
                                 children: Vec::new(),
+                                image_data: None,
                             });
                         }
                     }
@@ -339,6 +345,7 @@ impl ContentExtractor {
                                 depth: child.depth,
                                 relevance: 0.6,
                                 children: Vec::new(),
+                                image_data: None,
                             });
                         }
                     }
@@ -379,6 +386,7 @@ impl ContentExtractor {
                             depth: child.depth,
                             relevance: 0.7,
                             children: Vec::new(),
+                            image_data: None,
                         });
                     }
                     "figcaption" => {
@@ -389,6 +397,7 @@ impl ContentExtractor {
                             depth: child.depth,
                             relevance: 0.7,
                             children: Vec::new(),
+                            image_data: None,
                         });
                     }
                     _ => {}
@@ -426,6 +435,7 @@ impl ContentExtractor {
                         depth: child.depth,
                         relevance: 0.7,
                         children: Vec::new(),
+                        image_data: None,
                     });
                 } else {
                     // Content inside details
@@ -444,6 +454,7 @@ impl ContentExtractor {
             depth: details_node.depth,
             relevance: 0.5,
             children,
+            image_data: None,
         })
     }
 
@@ -470,6 +481,7 @@ impl ContentExtractor {
             depth: form_node.depth,
             relevance: 0.4,
             children: Vec::new(),
+            image_data: None,
         })
     }
 
@@ -675,6 +687,7 @@ impl ContentExtractor {
             depth: node.depth,
             relevance: 0.5, // default, will be scored
             children: Vec::new(),
+            image_data: None,
         })
     }
 

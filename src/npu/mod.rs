@@ -18,8 +18,9 @@ pub use content::{ContentBlock, BlockKind};
 pub use classifier::{Classification, ClassificationKind};
 
 use crate::cpu::dom::DomTree;
+use crate::cpu::network::NetworkEngine;
 use anyhow::Result;
-use log::info;
+use log::{info, warn};
 
 /// Result of NPU processing a page.
 #[allow(dead_code)] // Fields used by future pipeline stages (prefetch, summarization)
@@ -82,6 +83,9 @@ impl NpuEngine {
             info!("[NPU] Blocked {ads_blocked} ad/tracker elements");
         }
 
+        // ── Step 2.5: Fetch and decode images (max 5 per page) ──
+        self.fetch_images(&mut blocks, url);
+
         // ── Step 3: Score links for smart prefetch ──
         let prefetch_urls = self.score_links_for_prefetch(dom, url);
 
@@ -105,6 +109,102 @@ impl NpuEngine {
             language,
             prefetch_urls,
         })
+    }
+
+    /// Maximum number of images to fetch per page.
+    const MAX_IMAGES_PER_PAGE: usize = 5;
+
+    /// Fetch and decode images for Image blocks.
+    /// Resolves relative URLs, downloads bytes, decodes to RGBA pixels.
+    /// Stores decoded data in block.image_data. Capped at MAX_IMAGES_PER_PAGE.
+    fn fetch_images(&self, blocks: &mut [ContentBlock], page_url: &str) {
+        let net = NetworkEngine::new();
+        let base_url = url::Url::parse(page_url).ok();
+
+        let mut images_fetched: usize = 0;
+
+        // Process top-level blocks and their children (for figures)
+        for block in blocks.iter_mut() {
+            if images_fetched >= Self::MAX_IMAGES_PER_PAGE {
+                break;
+            }
+
+            match &block.kind {
+                BlockKind::Image { src, .. } => {
+                    if let Some(data) = self.try_fetch_and_decode_image(&net, src, &base_url) {
+                        block.image_data = Some(data);
+                        images_fetched += 1;
+                    }
+                }
+                BlockKind::Figure => {
+                    for child in block.children.iter_mut() {
+                        if images_fetched >= Self::MAX_IMAGES_PER_PAGE {
+                            break;
+                        }
+                        if let BlockKind::Image { src, .. } = &child.kind {
+                            if let Some(data) = self.try_fetch_and_decode_image(&net, src, &base_url) {
+                                child.image_data = Some(data);
+                                images_fetched += 1;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if images_fetched > 0 {
+            info!("[NPU] Fetched and decoded {images_fetched} images");
+        }
+    }
+
+    /// Try to resolve URL, fetch image bytes, and decode to RGBA pixels.
+    /// Returns (width, height, rgba_bytes) on success, None on failure.
+    fn try_fetch_and_decode_image(
+        &self,
+        net: &NetworkEngine,
+        src: &str,
+        base_url: &Option<url::Url>,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        // Skip data URIs and empty sources
+        if src.is_empty() || src.starts_with("data:") {
+            return None;
+        }
+
+        // Resolve relative URL
+        let resolved = if src.starts_with("http://") || src.starts_with("https://") {
+            src.to_string()
+        } else if let Some(base) = base_url {
+            match base.join(src) {
+                Ok(u) => u.to_string(),
+                Err(_) => return None,
+            }
+        } else {
+            return None;
+        };
+
+        // Fetch image bytes
+        let bytes = match net.fetch_image(&resolved) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("[NPU] Image fetch failed for {resolved}: {e}");
+                return None;
+            }
+        };
+
+        // Decode image to RGBA using the `image` crate
+        match image::load_from_memory(&bytes) {
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                let (w, h) = (rgba.width(), rgba.height());
+                info!("[NPU] Decoded image {w}x{h} from {resolved}");
+                Some((w, h, rgba.into_raw()))
+            }
+            Err(e) => {
+                warn!("[NPU] Image decode failed for {resolved}: {e}");
+                None
+            }
+        }
     }
 
     /// Score links by likelihood of user clicking them.
@@ -210,7 +310,9 @@ impl NpuEngine {
             }
 
             // ── Longer link text is often more meaningful than single words ──
-            if text.len() > 10 && text.len() < 100 {
+            // Use char count for proper CJK/emoji support
+            let text_chars = text.chars().count();
+            if text_chars > 10 && text_chars < 100 {
                 score += 0.1;
             }
 
@@ -504,6 +606,7 @@ mod tests {
             depth: 0,
             relevance: 0.5,
             children: Vec::new(),
+            image_data: None,
         }];
         assert_eq!(engine.detect_language(&blocks), Some("en".into()));
     }
@@ -517,6 +620,7 @@ mod tests {
             depth: 0,
             relevance: 0.5,
             children: Vec::new(),
+            image_data: None,
         }];
         assert_eq!(engine.detect_language(&blocks), Some("pt".into()));
     }
@@ -530,6 +634,7 @@ mod tests {
             depth: 0,
             relevance: 0.5,
             children: Vec::new(),
+            image_data: None,
         }];
         assert_eq!(engine.detect_language(&blocks), Some("de".into()));
     }
@@ -543,6 +648,7 @@ mod tests {
             depth: 0,
             relevance: 0.5,
             children: Vec::new(),
+            image_data: None,
         }];
         assert_eq!(engine.detect_language(&blocks), None);
     }
@@ -613,6 +719,7 @@ mod tests {
                 depth: 0,
                 relevance: 0.9,
                 children: Vec::new(),
+                image_data: None,
             },
             ContentBlock {
                 kind: BlockKind::Paragraph,
@@ -620,6 +727,7 @@ mod tests {
                 depth: 0,
                 relevance: 0.7,
                 children: Vec::new(),
+                image_data: None,
             },
         ];
         let summary = engine.generate_summary(&blocks, "", &dom);
@@ -643,5 +751,31 @@ mod tests {
         let result = truncate_summary(long, 40);
         assert!(result.len() < 50);
         assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_summary_utf8_multibyte() {
+        // CJK characters are 3 bytes each — must not panic on mid-char truncation
+        let cjk = "日本語のテキストを切り捨てるテスト文字列です";
+        let result = truncate_summary(cjk, 10);
+        assert!(result.ends_with("..."));
+
+        // Emoji (4 bytes each)
+        let emoji = "🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀";
+        let result = truncate_summary(emoji, 5);
+        assert!(result.ends_with("..."));
+
+        // Mixed ASCII + multi-byte
+        let mixed = "Hello 世界 こんにちは Rust 🦀";
+        let result = truncate_summary(mixed, 12);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_is_cjk() {
+        assert!(is_cjk('中'));
+        assert!(is_cjk('日'));
+        assert!(!is_cjk('A'));
+        assert!(!is_cjk('1'));
     }
 }

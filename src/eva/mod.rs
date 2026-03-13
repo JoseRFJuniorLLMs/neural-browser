@@ -474,4 +474,29 @@ mod tests {
         assert!(t.len() < 20);
         assert!(t.ends_with("..."));
     }
+
+    #[test]
+    fn test_truncate_log_utf8() {
+        // CJK (3 bytes per char) — must not panic on mid-char byte offset
+        let cjk = "日本語のテキスト表示テスト";
+        let result = truncate_log(cjk, 10);
+        assert!(result.len() <= 10 || result.len() <= cjk.len());
+
+        // Emoji (4 bytes per char)
+        let emoji = "🦀🔥🚀💻🧠";
+        let result = truncate_log(emoji, 5);
+        assert!(result.len() <= 5 || result.is_empty() || result.len() == 4);
+    }
+
+    #[test]
+    fn test_truncate_context_utf8() {
+        // Mixed multi-byte — must not panic
+        let mixed = "Olá 世界 こんにちは 🦀 Rust";
+        let result = truncate_context(mixed, 10);
+        assert!(result.ends_with("...") || result.len() <= 10);
+
+        let cjk = "日本語テキスト テスト 文字列";
+        let result = truncate_context(cjk, 15);
+        assert!(result.ends_with("..."));
+    }
 }

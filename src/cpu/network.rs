@@ -143,6 +143,52 @@ impl NetworkEngine {
         cache.insert(url.to_string(), html);
         Ok(())
     }
+
+    /// Maximum image download size (5 MB).
+    const MAX_IMAGE_SIZE: usize = 5 * 1024 * 1024;
+
+    /// Fetch image bytes from a URL. Returns raw bytes on success.
+    pub fn fetch_image(&self, url: &str) -> Result<Vec<u8>> {
+        info!("[CPU:NET] Fetching image {url}");
+        let resp = self.agent.get(url)
+            .header("Accept", "image/*,*/*")
+            .call()
+            .map_err(|e| {
+                warn!("[CPU:NET] Image fetch error for {url}: {e}");
+                anyhow::anyhow!("Image fetch failed: {}", friendly_error_message(&e))
+            })?;
+
+        let status: u16 = resp.status().into();
+        if status >= 400 {
+            return Err(anyhow::anyhow!("HTTP {status} for image {url}"));
+        }
+
+        let mut bytes = Vec::new();
+        let mut binding = resp.into_body();
+        let mut reader = binding.as_reader();
+        let mut buf = [0u8; 8192];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    bytes.extend_from_slice(&buf[..n]);
+                    if bytes.len() > Self::MAX_IMAGE_SIZE {
+                        warn!("[CPU:NET] Image exceeds {} bytes, aborting", Self::MAX_IMAGE_SIZE);
+                        return Err(anyhow::anyhow!("Image too large (>{} MB)", Self::MAX_IMAGE_SIZE / 1024 / 1024));
+                    }
+                }
+                Err(e) => {
+                    if bytes.is_empty() {
+                        return Err(anyhow::anyhow!("Failed to read image body: {e}"));
+                    }
+                    warn!("[CPU:NET] Image read error after {} bytes: {e}", bytes.len());
+                    break;
+                }
+            }
+        }
+
+        Ok(bytes)
+    }
 }
 
 /// Convert ureq errors into user-friendly messages.

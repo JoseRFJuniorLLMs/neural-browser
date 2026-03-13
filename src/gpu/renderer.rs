@@ -10,6 +10,7 @@ use super::layout::{LayoutBox, LayoutKind};
 use crate::eva::panel::{EvaPanel, Role};
 use crate::ui::Theme;
 use anyhow::Result;
+use wgpu::util::DeviceExt;
 use glyphon::{
     Attrs, Buffer as GlyphonBuffer, Cache, Color as GlyphonColor, Family, FontSystem, Metrics,
     Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
@@ -32,6 +33,14 @@ pub struct RenderContext<'a> {
     pub url_input: &'a str,
 }
 
+/// Vertex for image quad rendering.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct ImageVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
+}
+
 pub struct WgpuRenderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -44,6 +53,10 @@ pub struct WgpuRenderer {
     atlas: TextAtlas,
     viewport: Viewport,
     text_renderer: TextRenderer,
+    // Image rendering pipeline
+    image_pipeline: wgpu::RenderPipeline,
+    image_bind_group_layout: wgpu::BindGroupLayout,
+    image_sampler: wgpu::Sampler,
 }
 
 impl WgpuRenderer {
@@ -117,6 +130,103 @@ impl WgpuRenderer {
             None,
         );
 
+        // ── Image rendering pipeline ──
+        let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("image_shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("image_shader.wgsl").into(),
+            ),
+        });
+
+        let image_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("image_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let image_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("image_pipeline_layout"),
+                bind_group_layouts: &[&image_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let image_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("image_pipeline"),
+                layout: Some(&image_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &image_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<ImageVertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                offset: 0,
+                                shader_location: 0,
+                                format: wgpu::VertexFormat::Float32x2,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 8,
+                                shader_location: 1,
+                                format: wgpu::VertexFormat::Float32x2,
+                            },
+                        ],
+                    }],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &image_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
+        let image_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("image_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         Ok(Self {
             surface,
             device,
@@ -128,6 +238,9 @@ impl WgpuRenderer {
             atlas,
             viewport,
             text_renderer,
+            image_pipeline,
+            image_bind_group_layout,
+            image_sampler,
         })
     }
 
@@ -143,6 +256,95 @@ impl WgpuRenderer {
     /// Return current surface size.
     pub fn size(&self) -> (u32, u32) {
         self.size
+    }
+
+    /// Create a wgpu texture and bind group from decoded RGBA pixel data.
+    fn create_image_texture(
+        &self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> (wgpu::Texture, wgpu::BindGroup) {
+        let texture_size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("image_texture"),
+            size: texture_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            texture_size,
+        );
+
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("image_bind_group"),
+            layout: &self.image_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.image_sampler),
+                },
+            ],
+        });
+
+        (texture, bind_group)
+    }
+
+    /// Convert pixel coordinates to NDC (normalized device coordinates).
+    /// Screen (0,0) is top-left, NDC (-1,1) is top-left.
+    fn pixel_to_ndc(&self, x: f32, y: f32) -> [f32; 2] {
+        let (w, h) = self.size;
+        [
+            (x / w as f32) * 2.0 - 1.0,
+            1.0 - (y / h as f32) * 2.0,
+        ]
+    }
+
+    /// Build quad vertices for an image at the given pixel position and size.
+    fn build_image_quad(&self, x: f32, y: f32, w: f32, h: f32) -> [ImageVertex; 6] {
+        let tl = self.pixel_to_ndc(x, y);
+        let tr = self.pixel_to_ndc(x + w, y);
+        let bl = self.pixel_to_ndc(x, y + h);
+        let br = self.pixel_to_ndc(x + w, y + h);
+
+        [
+            // Triangle 1: TL, BL, TR
+            ImageVertex { position: tl, uv: [0.0, 0.0] },
+            ImageVertex { position: bl, uv: [0.0, 1.0] },
+            ImageVertex { position: tr, uv: [1.0, 0.0] },
+            // Triangle 2: TR, BL, BR
+            ImageVertex { position: tr, uv: [1.0, 0.0] },
+            ImageVertex { position: bl, uv: [0.0, 1.0] },
+            ImageVertex { position: br, uv: [1.0, 1.0] },
+        ]
     }
 
     /// Determine the color for a link box, considering hover and visited state.
@@ -524,6 +726,9 @@ impl WgpuRenderer {
                         GlyphonColor::rgb(120, 120, 140),
                     ));
                 }
+                LayoutKind::DecodedImage { .. } => {
+                    // Handled in image render pass below
+                }
                 _ => {}
             }
         }
@@ -568,6 +773,8 @@ impl WgpuRenderer {
             });
 
         let bg = ctx.theme.bg;
+
+        // ── Pass 1: Clear + render text (glyphon) ──
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
@@ -592,6 +799,58 @@ impl WgpuRenderer {
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .map_err(|e| anyhow::anyhow!("glyphon render: {e:?}"))?;
+        }
+
+        // ── Pass 2: Render decoded images as textured quads ──
+        // Collect image data to render (textures + vertex buffers)
+        let mut image_renders: Vec<(wgpu::Buffer, wgpu::BindGroup, wgpu::Texture)> = Vec::new();
+
+        for lbox in layout {
+            if let LayoutKind::DecodedImage { width: img_w, height: img_h, rgba, .. } = &lbox.kind {
+                // Skip if completely off-screen
+                let top = lbox.y;
+                let bottom = lbox.y + lbox.height;
+                if bottom < 40.0 || top > h as f32 {
+                    continue;
+                }
+
+                // Create GPU texture from RGBA data
+                let (texture, bind_group) = self.create_image_texture(*img_w, *img_h, rgba);
+
+                // Build quad vertices in NDC
+                let vertices = self.build_image_quad(lbox.x, lbox.y, lbox.width, lbox.height);
+                let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("image_vertex_buffer"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+
+                image_renders.push((vertex_buffer, bind_group, texture));
+            }
+        }
+
+        if !image_renders.is_empty() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("image_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load, // Don't clear — render on top of text
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            pass.set_pipeline(&self.image_pipeline);
+            for (vertex_buffer, bind_group, _texture) in &image_renders {
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.draw(0..6, 0..1);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -866,6 +1125,8 @@ impl WgpuRenderer {
             &wgpu::CommandEncoderDescriptor { label: Some("render_encoder_eva") });
 
         let bg = ctx.theme.bg;
+
+        // ── Pass 1: Clear + text ──
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass_eva"),
@@ -884,6 +1145,52 @@ impl WgpuRenderer {
             });
             self.text_renderer.render(&self.atlas, &self.viewport, &mut pass)
                 .map_err(|e| anyhow::anyhow!("glyphon render: {e:?}"))?;
+        }
+
+        // ── Pass 2: Images (clipped to left of EVA panel) ──
+        let mut image_renders: Vec<(wgpu::Buffer, wgpu::BindGroup, wgpu::Texture)> = Vec::new();
+
+        for lbox in layout {
+            if let LayoutKind::DecodedImage { width: img_w, height: img_h, rgba, .. } = &lbox.kind {
+                let top = lbox.y;
+                let bottom = lbox.y + lbox.height;
+                if bottom < 40.0 || top > h as f32 { continue; }
+                // Clip width to panel boundary
+                let clipped_w = lbox.width.min(panel_x - lbox.x);
+                if clipped_w <= 0.0 { continue; }
+
+                let (texture, bind_group) = self.create_image_texture(*img_w, *img_h, rgba);
+                let vertices = self.build_image_quad(lbox.x, lbox.y, clipped_w, lbox.height);
+                let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("image_vertex_buffer_eva"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                image_renders.push((vertex_buffer, bind_group, texture));
+            }
+        }
+
+        if !image_renders.is_empty() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("image_pass_eva"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view, resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            pass.set_pipeline(&self.image_pipeline);
+            for (vertex_buffer, bind_group, _texture) in &image_renders {
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.draw(0..6, 0..1);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

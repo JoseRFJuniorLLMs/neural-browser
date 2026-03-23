@@ -51,9 +51,9 @@ pub enum BlockKind {
     /// Summary element (clickable header for details)
     Summary,
     /// Form element (rendered as text description)
-    Form,
+    Form { action: String },
     /// Visual input field (text box rendered as a rounded rectangle)
-    InputField { placeholder: String, input_type: String },
+    InputField { placeholder: String, input_type: String, input_name: String },
     /// Group of buttons rendered side by side horizontally
     ButtonGroup,
     /// Horizontal group of inline elements (nav links, etc.)
@@ -561,8 +561,12 @@ impl ContentExtractor {
             });
         }
 
+        let action = form_node.attrs.get("action")
+            .cloned()
+            .unwrap_or_default();
+
         Some(ContentBlock {
-            kind: BlockKind::Form,
+            kind: BlockKind::Form { action },
             text: String::new(),
             depth: form_node.depth,
             relevance: 0.6,
@@ -603,10 +607,12 @@ impl ContentExtractor {
                     }
                     "hidden" => {} // skip
                     "checkbox" => {
+                        let name = node.attrs.get("name").cloned().unwrap_or_else(|| placeholder.clone());
                         inputs.push(ContentBlock {
                             kind: BlockKind::InputField {
                                 placeholder: format!("\u{2610} {}", placeholder),
                                 input_type: "checkbox".to_string(),
+                                input_name: name,
                             },
                             text: placeholder,
                             depth: node.depth,
@@ -616,10 +622,12 @@ impl ContentExtractor {
                         });
                     }
                     "radio" => {
+                        let name = node.attrs.get("name").cloned().unwrap_or_else(|| placeholder.clone());
                         inputs.push(ContentBlock {
                             kind: BlockKind::InputField {
                                 placeholder: format!("\u{25CB} {}", placeholder),
                                 input_type: "radio".to_string(),
+                                input_name: name,
                             },
                             text: placeholder,
                             depth: node.depth,
@@ -629,6 +637,7 @@ impl ContentExtractor {
                         });
                     }
                     "search" | "text" | "email" | "url" | "tel" | "number" | "password" => {
+                        let name = node.attrs.get("name").cloned().unwrap_or_else(|| placeholder.clone());
                         let ph = if input_type == "password" {
                             "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}".to_string()
                         } else if placeholder.is_empty() {
@@ -640,6 +649,7 @@ impl ContentExtractor {
                             kind: BlockKind::InputField {
                                 placeholder: ph,
                                 input_type: input_type.to_string(),
+                                input_name: name,
                             },
                             text: placeholder,
                             depth: node.depth,
@@ -649,10 +659,12 @@ impl ContentExtractor {
                         });
                     }
                     _ => {
+                        let name = node.attrs.get("name").cloned().unwrap_or_else(|| placeholder.clone());
                         inputs.push(ContentBlock {
                             kind: BlockKind::InputField {
                                 placeholder: if placeholder.is_empty() { "...".to_string() } else { placeholder.clone() },
                                 input_type: input_type.to_string(),
+                                input_name: name,
                             },
                             text: placeholder,
                             depth: node.depth,
@@ -668,10 +680,12 @@ impl ContentExtractor {
                     .or(node.attrs.get("name"))
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "Enter text...".to_string());
+                let name = node.attrs.get("name").cloned().unwrap_or_else(|| placeholder.clone());
                 inputs.push(ContentBlock {
                     kind: BlockKind::InputField {
                         placeholder: placeholder.clone(),
                         input_type: "textarea".to_string(),
+                        input_name: name,
                     },
                     text: placeholder,
                     depth: node.depth,
@@ -688,6 +702,7 @@ impl ContentExtractor {
                     kind: BlockKind::InputField {
                         placeholder: format!("\u{25BE} {}", name),
                         input_type: "select".to_string(),
+                        input_name: name.clone(),
                     },
                     text: name,
                     depth: node.depth,
@@ -1090,7 +1105,7 @@ impl ContentExtractor {
                 BlockKind::FigCaption => score = 0.7,
                 BlockKind::Details { .. } => score = 0.5,
                 BlockKind::Summary => score = 0.6,
-                BlockKind::Form => score = 0.4,
+                BlockKind::Form { .. } => score = 0.4,
                 BlockKind::Navigation | BlockKind::Boilerplate => score = 0.1,
                 BlockKind::List { .. } => score = 0.6,
                 BlockKind::ListItem => {

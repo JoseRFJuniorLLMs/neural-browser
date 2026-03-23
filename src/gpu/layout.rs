@@ -34,6 +34,7 @@ pub enum LayoutKind {
         color: [f32; 4],    // RGBA
         bold: bool,
         italic: bool,
+        centered: bool,
     },
     /// Image placeholder (text fallback if no pixel data)
     Image { src: String, alt: String },
@@ -51,9 +52,9 @@ pub enum LayoutKind {
     /// Background rect (for code blocks, quotes, etc.)
     Background { color: [f32; 4] },
     /// Visual input box (rounded rectangle with placeholder text)
-    InputBox { placeholder: String, font_size: f32 },
+    InputBox { placeholder: String, font_size: f32, input_name: String, form_action: String },
     /// Visual button (rounded filled rectangle with text)
-    Button { text: String, font_size: f32, bg_color: [f32; 4], text_color: [f32; 4] },
+    Button { text: String, font_size: f32, bg_color: [f32; 4], text_color: [f32; 4], form_action: String },
 }
 
 /// Estimate the number of wrapped lines for a text given a width and font size.
@@ -132,6 +133,24 @@ fn css_italic(block: &ContentBlock, default: bool) -> bool {
     }
 }
 
+/// Check if CSS text-align is center.
+fn css_is_centered(block: &ContentBlock) -> bool {
+    if let Some(ref cs) = block.computed_style {
+        cs.text_align == crate::css::values::CssTextAlign::Center
+    } else {
+        false
+    }
+}
+
+/// Compute the x position for a block, centering it if text-align: center.
+fn block_x(block: &ContentBlock, margin_x: f32, content_width: f32, block_width: f32) -> f32 {
+    if css_is_centered(block) && block_width < content_width {
+        margin_x + (content_width - block_width) / 2.0
+    } else {
+        margin_x
+    }
+}
+
 /// Extract CSS margin-top in px (zoomed).
 fn css_margin_top(block: &ContentBlock, default: f32, zoom: f32) -> f32 {
     if let Some(ref cs) = block.computed_style {
@@ -177,16 +196,22 @@ pub fn compute_layout_zoom(
     theme: &Theme,
     zoom: f32,
     image_dimensions: &HashMap<String, (u32, u32)>,
+    scale_factor: f32,
 ) -> Vec<LayoutBox> {
     let mut layout = Vec::new();
-    let z = zoom.clamp(0.25, 5.0); // safety clamp
+    let sf = scale_factor.max(1.0);
+    // Effective zoom includes HiDPI scale — fonts and spacing scale proportionally
+    let z = zoom.clamp(0.25, 5.0) * sf;
 
-    let margin_x: f32 = 40.0 * z;
-    let content_width: f32 = (viewport_width - margin_x * 2.0).max(200.0).min(900.0 * z);
+    // Use proportional margins (5% each side) and allow content to fill most of the viewport
+    let margin_x: f32 = (viewport_width * 0.05).max(20.0 * z);
+    let max_content: f32 = viewport_width * 0.90; // use 90% of viewport
+    let content_width: f32 = (viewport_width - margin_x * 2.0).max(200.0).min(max_content);
 
-    // Content starts below toolbar — positions are in document space
-    let toolbar_h = super::renderer::TOOLBAR_HEIGHT;
-    let mut cursor_y: f32 = (toolbar_h + 10.0) * z;
+    // Content starts below toolbar — toolbar is already in physical pixels (scaled by sf),
+    // add small gap scaled by zoom only (not double-scaling toolbar)
+    let toolbar_h = super::renderer::TOOLBAR_HEIGHT * sf;
+    let mut cursor_y: f32 = toolbar_h + 10.0 * z;
 
     for block in blocks {
         // Skip low-relevance content
@@ -248,6 +273,7 @@ pub fn compute_layout_zoom(
                         color,
                         bold,
                         italic,
+                        centered: css_is_centered(block),
                     },
                     href: None,
                 });
@@ -290,6 +316,7 @@ pub fn compute_layout_zoom(
                         color,
                         bold,
                         italic,
+                        centered: css_is_centered(block),
                     },
                     href: None,
                 });
@@ -358,6 +385,7 @@ pub fn compute_layout_zoom(
                         color,
                         bold: false,
                         italic,
+                        centered: css_is_centered(block),
                     },
                     href: None,
                 });
@@ -397,6 +425,7 @@ pub fn compute_layout_zoom(
                                 color: theme.text_dim,
                                 bold: false,
                                 italic: true,
+                                centered: false,
                             },
                             href: None,
                         });
@@ -434,6 +463,7 @@ pub fn compute_layout_zoom(
                                 color: theme.text_dim,
                                 bold: false,
                                 italic: true,
+                                centered: false,
                             },
                             href: None,
                         });
@@ -487,6 +517,7 @@ pub fn compute_layout_zoom(
                             color,
                             bold,
                             italic,
+                            centered: css_is_centered(block),
                         },
                         href: None,
                     });
@@ -513,6 +544,7 @@ pub fn compute_layout_zoom(
                                         color: theme.text,
                                         bold: false,
                                         italic: false,
+                                        centered: false,
                                     },
                                     href: None,
                                 });
@@ -540,6 +572,7 @@ pub fn compute_layout_zoom(
                         color: theme.text,
                         bold: false,
                         italic: false,
+                        centered: false,
                     },
                     href: None,
                 });
@@ -567,6 +600,7 @@ pub fn compute_layout_zoom(
                         color,
                         bold,
                         italic,
+                        centered: false,
                     },
                     href: Some(href.clone()),
                 });
@@ -666,6 +700,7 @@ pub fn compute_layout_zoom(
                                     color: theme.heading,
                                     bold: true,
                                     italic: false,
+                                    centered: false,
                                 },
                                 href: None,
                             });
@@ -685,6 +720,7 @@ pub fn compute_layout_zoom(
                                     color: theme.text,
                                     bold: false,
                                     italic: false,
+                                    centered: false,
                                 },
                                 href: None,
                             });
@@ -714,6 +750,7 @@ pub fn compute_layout_zoom(
                                     color: theme.link,
                                     bold: true,
                                     italic: false,
+                                    centered: false,
                                 },
                                 href: None,
                             });
@@ -735,6 +772,7 @@ pub fn compute_layout_zoom(
                                         color: theme.text,
                                         bold: false,
                                         italic: false,
+                                        centered: false,
                                     },
                                     href: None,
                                 });
@@ -745,15 +783,16 @@ pub fn compute_layout_zoom(
                 }
                 cursor_y += 6.0;
             }
-            BlockKind::Form => {
+            BlockKind::Form { action } => {
                 // Render form children (InputFields, ButtonGroups, labels)
+                let current_form_action = action.clone();
                 cursor_y += 8.0 * z;
                 for child in &block.children {
                     if child.relevance < 0.15 || is_css_hidden(child) {
                         continue;
                     }
                     match &child.kind {
-                        BlockKind::InputField { placeholder, input_type } => {
+                        BlockKind::InputField { placeholder, input_type, input_name } => {
                             let font_size = 18.0 * z;
                             // Search/text inputs get a wide visual box
                             let is_text_input = matches!(input_type.as_str(),
@@ -770,6 +809,8 @@ pub fn compute_layout_zoom(
                                     kind: LayoutKind::InputBox {
                                         placeholder: placeholder.clone(),
                                         font_size,
+                                        input_name: input_name.clone(),
+                                        form_action: current_form_action.clone(),
                                     },
                                     href: None,
                                 });
@@ -788,6 +829,7 @@ pub fn compute_layout_zoom(
                                         color: theme.text,
                                         bold: false,
                                         italic: false,
+                                        centered: false,
                                     },
                                     href: None,
                                 });
@@ -823,8 +865,9 @@ pub fn compute_layout_zoom(
                                     kind: LayoutKind::Button {
                                         text: btn_child.text.clone(),
                                         font_size: btn_font_size,
-                                        bg_color: [0.24, 0.24, 0.32, 1.0],
+                                        bg_color: [0.90, 0.90, 0.92, 1.0],
                                         text_color: theme.text,
+                                        form_action: current_form_action.clone(),
                                     },
                                     href: None,
                                 });
@@ -848,6 +891,7 @@ pub fn compute_layout_zoom(
                                         color: theme.text_dim,
                                         bold: false,
                                         italic: false,
+                                        centered: false,
                                     },
                                     href: None,
                                 });
@@ -874,13 +918,14 @@ pub fn compute_layout_zoom(
                             color: theme.text_dim,
                             bold: false,
                             italic: true,
+                            centered: false,
                         },
                         href: None,
                     });
                     cursor_y += lines * font_size * 1.5 + 8.0;
                 }
             }
-            BlockKind::InputField { placeholder, input_type } => {
+            BlockKind::InputField { placeholder, input_type, input_name } => {
                 // Standalone InputField (outside form)
                 let font_size = 18.0 * z;
                 let is_text_input = matches!(input_type.as_str(),
@@ -897,6 +942,8 @@ pub fn compute_layout_zoom(
                         kind: LayoutKind::InputBox {
                             placeholder: placeholder.clone(),
                             font_size,
+                            input_name: input_name.clone(),
+                            form_action: String::new(),
                         },
                         href: None,
                     });
@@ -914,6 +961,7 @@ pub fn compute_layout_zoom(
                             color: theme.text,
                             bold: false,
                             italic: false,
+                            centered: false,
                         },
                         href: None,
                     });
@@ -947,8 +995,9 @@ pub fn compute_layout_zoom(
                         kind: LayoutKind::Button {
                             text: btn_child.text.clone(),
                             font_size: btn_font_size,
-                            bg_color: [0.24, 0.24, 0.32, 1.0],
+                            bg_color: [0.90, 0.90, 0.92, 1.0],
                             text_color: theme.text,
+                            form_action: String::new(),
                         },
                         href: None,
                     });
@@ -995,6 +1044,7 @@ pub fn compute_layout_zoom(
                             color,
                             bold: false,
                             italic: false,
+                            centered: false,
                         },
                         href,
                     });
@@ -1070,6 +1120,7 @@ pub fn compute_layout_zoom(
                                     color: theme.text_dim,
                                     bold: false,
                                     italic: true,
+                                    centered: false,
                                 },
                                 href: None,
                             });
@@ -1110,8 +1161,8 @@ mod tests {
         let blocks = vec![make_paragraph("Hello world")];
         let theme = Theme::default();
 
-        let layout_1x = compute_layout_zoom(&blocks, 0.0, 800.0, &theme, 1.0, &HashMap::new());
-        let layout_2x = compute_layout_zoom(&blocks, 0.0, 800.0, &theme, 2.0, &HashMap::new());
+        let layout_1x = compute_layout_zoom(&blocks, 0.0, 800.0, &theme, 1.0, &HashMap::new(), 1.0);
+        let layout_2x = compute_layout_zoom(&blocks, 0.0, 800.0, &theme, 2.0, &HashMap::new(), 1.0);
 
         // Find the text box in each layout
         let text_1x = layout_1x.iter().find(|b| matches!(&b.kind, LayoutKind::Text { .. }));
@@ -1133,8 +1184,8 @@ mod tests {
         let blocks = vec![make_paragraph("Test text")];
         let theme = Theme::default();
 
-        let layout_default = compute_layout_zoom(&blocks, 0.0, 800.0, &theme, 1.0, &HashMap::new());
-        let layout_zoom1 = compute_layout_zoom(&blocks, 0.0, 800.0, &theme, 1.0, &HashMap::new());
+        let layout_default = compute_layout_zoom(&blocks, 0.0, 800.0, &theme, 1.0, &HashMap::new(), 1.0);
+        let layout_zoom1 = compute_layout_zoom(&blocks, 0.0, 800.0, &theme, 1.0, &HashMap::new(), 1.0);
 
         assert_eq!(layout_default.len(), layout_zoom1.len());
         for (a, b) in layout_default.iter().zip(layout_zoom1.iter()) {
@@ -1150,7 +1201,7 @@ mod tests {
         let theme = Theme::default();
 
         // Very small zoom should clamp to 0.25
-        let layout_tiny = compute_layout_zoom(&blocks, 0.0, 800.0, &theme, 0.01, &HashMap::new());
+        let layout_tiny = compute_layout_zoom(&blocks, 0.0, 800.0, &theme, 0.01, &HashMap::new(), 1.0);
         let text = layout_tiny.iter().find(|b| matches!(&b.kind, LayoutKind::Text { .. }));
         if let Some(LayoutBox { kind: LayoutKind::Text { font_size, .. }, .. }) = text {
             assert!(*font_size >= 16.0 * 0.25 - 0.01, "Min zoom should be 0.25x");

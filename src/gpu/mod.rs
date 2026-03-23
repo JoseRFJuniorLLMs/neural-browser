@@ -30,6 +30,24 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 use std::sync::Arc;
 
+/// State for a focused form input field.
+#[derive(Debug, Clone)]
+struct FocusedInput {
+    /// Bounding box of the input field (for rendering highlight)
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    /// Current typed text
+    text: String,
+    /// Input name (for form submission)
+    input_name: String,
+    /// Form action URL
+    form_action: String,
+    /// Font size for rendering
+    font_size: f32,
+}
+
 /// GPU rendering state.
 struct GpuApp {
     window: Option<Arc<Window>>,
@@ -80,6 +98,8 @@ struct GpuApp {
     img_rx: Receiver<PipelineMsg>,
     // Image URLs that have been requested but not yet received
     pending_image_urls: HashSet<String>,
+    // Currently focused form input field
+    focused_input: Option<FocusedInput>,
 }
 
 impl GpuApp {
@@ -90,7 +110,7 @@ impl GpuApp {
         eva_resp_rx: Receiver<PipelineMsg>,
         img_rx: Receiver<PipelineMsg>,
     ) -> Self {
-        let start_url = "https://example.com".to_string();
+        let start_url = "https://www.google.com/search?udm=14".to_string();
         let mut visited = HashSet::new();
         visited.insert(start_url.clone());
         Self {
@@ -126,6 +146,7 @@ impl GpuApp {
             zoom_level: 1.0,
             img_rx,
             pending_image_urls: HashSet::new(),
+            focused_input: None,
         }
     }
 
@@ -289,22 +310,50 @@ impl GpuApp {
         }
     }
 
-    /// Detect if input is a natural language question (smart search).
+    /// Detect if input is a natural language question or multi-word query (smart search).
+    /// Triggers AI-powered search instead of Google for questions and long queries.
     fn is_natural_question(input: &str) -> bool {
         let lower = input.to_lowercase();
         let question_starters = [
-            "what is", "what are", "who is", "who are", "how to", "how do",
-            "why is", "why do", "when is", "when did", "where is", "where do",
-            "can you", "could you", "explain", "tell me", "define",
+            // English
+            "what is", "what are", "what does", "what's",
+            "who is", "who are", "who was", "who's",
+            "how to", "how do", "how does", "how can", "how much", "how many",
+            "why is", "why do", "why does", "why are",
+            "when is", "when did", "when was", "when does",
+            "where is", "where do", "where can", "where does",
+            "which is", "which are",
+            "can you", "could you", "should i", "is it", "is there", "are there",
+            "explain", "tell me", "define", "describe", "compare",
+            "difference between", "meaning of", "best way to",
             // Portuguese
-            "o que é", "o que são", "quem é", "como fazer", "como funciona",
-            "por que", "porque", "quando", "onde", "explica", "me diz",
-            "qual é", "quais são",
+            "o que é", "o que são", "o que significa",
+            "quem é", "quem foi", "quem são",
+            "como fazer", "como funciona", "como posso", "como é",
+            "por que", "porque", "por quê",
+            "quando é", "quando foi",
+            "onde fica", "onde é", "onde posso",
+            "explica", "me diz", "me fala", "me conta",
+            "qual é", "quais são", "qual a diferença",
             // Spanish
-            "qué es", "cómo", "por qué", "quién es", "dónde",
+            "qué es", "qué son", "qué significa",
+            "cómo", "por qué", "quién es", "dónde",
+            "cuál es", "cuáles son",
         ];
-        question_starters.iter().any(|q| lower.starts_with(q))
-            || (lower.ends_with('?') && lower.contains(' '))
+        // Starts with a question pattern
+        if question_starters.iter().any(|q| lower.starts_with(q)) {
+            return true;
+        }
+        // Ends with ? and has spaces → question
+        if lower.ends_with('?') && lower.contains(' ') {
+            return true;
+        }
+        // 4+ words without dots → likely a search query, not a URL
+        let word_count = lower.split_whitespace().count();
+        if word_count >= 4 && !lower.contains('.') {
+            return true;
+        }
+        false
     }
 
     /// Toggle reading mode (filter to high-relevance content only).
@@ -394,6 +443,7 @@ impl GpuApp {
         self.scroll_y = 0.0; // Reset scroll position for new page
         self.url_bar = url.clone();
         self.url_editing = false;
+        self.focused_input = None;
         self.visited_urls.insert(url.clone());
 
         // Update history: truncate forward entries and push new
@@ -436,12 +486,13 @@ impl GpuApp {
     /// Layout positions are in document-space; scroll is applied at render time.
     fn recompute_layout(&mut self) {
         let sf = self.scale_factor as f32;
+        // Use physical pixel width — the renderer works in physical pixels
         let full_width = self.renderer.as_ref()
-            .map(|r| r.size().0 as f32 / sf)
+            .map(|r| r.size().0 as f32)
             .unwrap_or(1200.0);
         // Shrink content area when EVA panel is visible
         let viewport_width = if self.eva_panel.visible {
-            (full_width - 350.0).max(200.0)
+            (full_width - 350.0 * sf).max(200.0)
         } else {
             full_width
         };
@@ -475,10 +526,11 @@ impl GpuApp {
             &self.theme,
             self.zoom_level,
             &image_dimensions,
+            self.scale_factor as f32,
         );
-        // Clamp scroll to content bounds
+        // Clamp scroll to content bounds (physical pixels)
         let viewport_h = self.renderer.as_ref()
-            .map(|r| r.size().1 as f32 / sf)
+            .map(|r| r.size().1 as f32)
             .unwrap_or(800.0);
         let content_bottom = self.cached_layout.iter()
             .map(|b| b.y + b.height)
@@ -503,14 +555,18 @@ impl GpuApp {
     /// Find which link (if any) is under the given screen coordinates.
     /// Layout is in document-space, so we add scroll_y to screen Y to get document Y.
     fn hit_test_link(&self, x: f32, y: f32) -> Option<String> {
-        let doc_y = y + self.scroll_y; // convert screen Y to document Y
+        // Convert logical mouse coords to physical (layout is in physical pixels)
+        let sf = self.scale_factor.max(1.0) as f32;
+        let phys_x = x * sf;
+        let phys_y = y * sf;
+        let doc_y = phys_y + self.scroll_y; // convert screen Y to document Y
         for lbox in &self.cached_layout {
             if let Some(href) = &lbox.href {
-                if x >= lbox.x
-                    && x <= lbox.x + lbox.width
+                if phys_x >= lbox.x
+                    && phys_x <= lbox.x + lbox.width
                     && doc_y >= lbox.y
                     && doc_y <= lbox.y + lbox.height
-                    && y > renderer::TOOLBAR_HEIGHT // screen-space check for toolbar
+                    && phys_y > renderer::TOOLBAR_HEIGHT * sf // screen-space check for toolbar (physical)
                 {
                     return Some(href.clone());
                 }
@@ -578,7 +634,8 @@ impl ApplicationHandler for GpuApp {
         let attrs = Window::default_attributes()
             .with_title("Neural Browser \u{2014} CPU+NPU+GPU")
             .with_inner_size(winit::dpi::LogicalSize::new(1200u32, 800u32))
-            .with_min_inner_size(winit::dpi::LogicalSize::new(400u32, 200u32));
+            .with_min_inner_size(winit::dpi::LogicalSize::new(400u32, 200u32))
+            .with_maximized(true);
 
         match event_loop.create_window(attrs) {
             Ok(window) => {
@@ -644,6 +701,8 @@ impl ApplicationHandler for GpuApp {
                     url_input: &self.url_input,
                     zoom_level: self.zoom_level,
                     eva_visible: self.eva_panel.visible,
+                    scale_factor: self.scale_factor as f32,
+                    focused_input: self.focused_input.as_ref(),
                 };
                 // Apply scroll offset to get viewport-space positions
                 let scrolled = self.scrolled_layout();
@@ -685,30 +744,35 @@ impl ApplicationHandler for GpuApp {
             WindowEvent::MouseInput { state, button, .. } => {
                 if state == ElementState::Pressed && button == MouseButton::Left {
                     // Toolbar click handling (buttons + URL bar + EVA button)
-                    if self.mouse_y < renderer::TOOLBAR_HEIGHT {
-                        let sf = self.scale_factor as f32;
+                    let sf = self.scale_factor.max(1.0) as f32;
+                    // mouse_x/y are in logical pixels; convert to physical for toolbar hit-test
+                    let phys_mx = self.mouse_x * sf;
+                    let phys_my = self.mouse_y * sf;
+                    let scaled_tb = renderer::TOOLBAR_HEIGHT * sf;
+                    if phys_my < scaled_tb {
                         let wf = self.renderer.as_ref()
-                            .map(|r| r.size().0 as f32 / sf).unwrap_or(1200.0);
-                        let tb = renderer::TOOLBAR_HEIGHT;
-                        let nav_btn_size: f32 = 36.0;
+                            .map(|r| r.size().0 as f32).unwrap_or(1200.0);
+                        let tb = scaled_tb;
+                        let nav_btn_size: f32 = 44.0 * sf;
                         let btn_y = (tb - nav_btn_size) / 2.0;
                         let btn_h = nav_btn_size;
                         let btn_w = nav_btn_size;
-                        let back_x: f32 = 14.0;
-                        let fwd_x = back_x + nav_btn_size + 4.0;
-                        let ref_x = fwd_x + nav_btn_size + 4.0;
-                        let eva_btn_w: f32 = 68.0;
-                        let eva_btn_x = wf - eva_btn_w - 14.0;
+                        let btn_gap: f32 = 6.0 * sf;
+                        let back_x: f32 = 16.0 * sf;
+                        let fwd_x = back_x + nav_btn_size + btn_gap;
+                        let ref_x = fwd_x + nav_btn_size + btn_gap;
+                        let eva_btn_w: f32 = 80.0 * sf;
+                        let eva_btn_x = wf - eva_btn_w - 14.0 * sf;
                         // Pill URL bar — centered between nav buttons and EVA button
-                        let nav_zone_end = ref_x + nav_btn_size + 16.0;
-                        let eva_zone_start = eva_btn_x - 16.0;
+                        let nav_zone_end = ref_x + nav_btn_size + 16.0 * sf;
+                        let eva_zone_start = eva_btn_x - 16.0 * sf;
                         let available = eva_zone_start - nav_zone_end;
-                        let pill_max_w: f32 = 680.0;
-                        let pill_w = available.min(pill_max_w).max(200.0);
+                        let pill_max_w: f32 = 720.0 * sf;
+                        let pill_w = available.min(pill_max_w).max(240.0 * sf);
                         let pill_x = nav_zone_end + (available - pill_w) / 2.0;
                         let _url_x = pill_x;
-                        let mx = self.mouse_x;
-                        let my = self.mouse_y;
+                        let mx = phys_mx;
+                        let my = phys_my;
 
                         if my >= btn_y && my <= btn_y + btn_h {
                             // EVA button (rightmost)
@@ -776,10 +840,44 @@ impl ApplicationHandler for GpuApp {
                                 }
                             }
                         }
-                    } else if self.url_editing {
-                        // Click outside URL bar cancels editing
-                        self.url_editing = false;
-                        self.request_redraw();
+                    } else {
+                        // Hit test input fields (convert logical → physical coords)
+                        let mut found_input = false;
+                        let scrolled = self.scrolled_layout();
+                        let click_x = self.mouse_x * sf;
+                        let click_y = self.mouse_y * sf;
+                        for lbox in &scrolled {
+                            if let layout::LayoutKind::InputBox { placeholder: _, font_size, input_name, form_action } = &lbox.kind {
+                                if click_x >= lbox.x && click_x < lbox.x + lbox.width
+                                    && click_y >= lbox.y && click_y < lbox.y + lbox.height
+                                {
+                                    info!("[UI] Input field clicked: name={input_name}");
+                                    // Store un-scrolled coords for rendering comparison
+                                    self.focused_input = Some(FocusedInput {
+                                        x: lbox.x,
+                                        y: lbox.y + self.scroll_y,
+                                        width: lbox.width,
+                                        height: lbox.height,
+                                        text: String::new(),
+                                        input_name: input_name.clone(),
+                                        form_action: form_action.clone(),
+                                        font_size: *font_size,
+                                    });
+                                    self.url_editing = false;
+                                    found_input = true;
+                                    self.request_redraw();
+                                    break;
+                                }
+                            }
+                        }
+                        if !found_input {
+                            // Click outside any input/URL bar: unfocus
+                            self.focused_input = None;
+                            if self.url_editing {
+                                self.url_editing = false;
+                            }
+                            self.request_redraw();
+                        }
                     }
                 }
             }
@@ -804,9 +902,9 @@ impl ApplicationHandler for GpuApp {
                 if self.eva_panel.visible {
                     let sf = self.scale_factor as f32;
                     let vw = self.renderer.as_ref()
-                        .map(|r| r.size().0 as f32 / sf).unwrap_or(1200.0);
-                    let panel_x = (vw - 350.0).max(0.0);
-                    if self.mouse_x >= panel_x {
+                        .map(|r| r.size().0 as f32).unwrap_or(1200.0);
+                    let panel_x = (vw - 350.0 * sf).max(0.0);
+                    if self.mouse_x * sf >= panel_x {
                         let delta_y = match delta {
                             winit::event::MouseScrollDelta::LineDelta(_, y) => y * 30.0,
                             winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
@@ -819,20 +917,22 @@ impl ApplicationHandler for GpuApp {
                 if !self.url_editing {
                     match delta {
                         winit::event::MouseScrollDelta::LineDelta(_, y) => {
-                            self.scroll_y -= y * 40.0;
+                            let sf = self.scale_factor as f32;
+                            self.scroll_y -= y * 40.0 * sf;
                         }
                         winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                            self.scroll_y -= pos.y as f32;
+                            let sf = self.scale_factor as f32;
+                            self.scroll_y -= pos.y as f32 * sf;
                         }
                     }
                     // Clamp scroll: min 0, max = content height - viewport + margin
                     self.scroll_y = self.scroll_y.max(0.0);
-                    let sf = self.scale_factor as f32;
+                    let _sf = self.scale_factor as f32;
                     let max_y = self.cached_layout.iter()
                         .map(|b| b.y + b.height)
                         .fold(0.0f32, f32::max);
                     let viewport_h = self.renderer.as_ref()
-                        .map(|r| r.size().1 as f32 / sf)
+                        .map(|r| r.size().1 as f32)
                         .unwrap_or(800.0);
                     let max_scroll = (max_y - viewport_h + 100.0).max(0.0);
                     self.scroll_y = self.scroll_y.min(max_scroll);
@@ -927,6 +1027,11 @@ impl ApplicationHandler for GpuApp {
                             self.eva_panel.toggle(); // close panel
                             self.request_redraw();
                         }
+                        // Space = type space in EVA input
+                        Key::Named(NamedKey::Space) => {
+                            self.eva_panel.input_char(' ');
+                            self.request_redraw();
+                        }
                         // Tab = cycle AI provider (EVA → Claude → Gemini → GPT-4)
                         Key::Named(NamedKey::Tab) => {
                             self.eva_panel.cycle_provider();
@@ -974,6 +1079,109 @@ impl ApplicationHandler for GpuApp {
                         _ => {}
                     }
                     return; // AI panel consumes all input when focused
+                }
+
+                // ── Focused form input field handling ──
+                if self.focused_input.is_some() {
+                    match &event.logical_key {
+                        // Space = type space in form input
+                        Key::Named(NamedKey::Space) => {
+                            if let Some(fi) = &mut self.focused_input {
+                                fi.text.push(' ');
+                            }
+                            self.request_redraw();
+                        }
+                        Key::Named(NamedKey::Escape) => {
+                            self.focused_input = None;
+                            self.request_redraw();
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            // Form submission: navigate to form_action?input_name=text
+                            if let Some(fi) = &self.focused_input {
+                                let encoded_text: String = url::form_urlencoded::byte_serialize(fi.text.as_bytes()).collect();
+                                let action = &fi.form_action;
+                                let name = &fi.input_name;
+                                let submit_url = if action.is_empty() {
+                                    // Use current URL with query params
+                                    let base = self.url_bar.clone();
+                                    if let Ok(mut parsed) = url::Url::parse(&base) {
+                                        parsed.set_query(Some(&format!("{}={}", name, encoded_text)));
+                                        parsed.to_string()
+                                    } else {
+                                        format!("{}?{}={}", base, name, encoded_text)
+                                    }
+                                } else if action.starts_with("http://") || action.starts_with("https://") {
+                                    format!("{}?{}={}", action, name, encoded_text)
+                                } else {
+                                    // Relative action: resolve against current URL
+                                    let resolved = self.resolve_href(action);
+                                    if resolved.is_empty() {
+                                        format!("{}?{}={}", self.url_bar, name, encoded_text)
+                                    } else {
+                                        format!("{}?{}={}", resolved, name, encoded_text)
+                                    }
+                                };
+                                // Google search: add &udm=14 for no-JS web results
+                                let submit_url = if submit_url.contains("google.com/search") && !submit_url.contains("&udm=") {
+                                    format!("{}&udm=14", submit_url)
+                                } else {
+                                    submit_url
+                                };
+                                info!("[UI] Form submit: {submit_url}");
+                                let url = submit_url.clone();
+                                self.focused_input = None;
+                                self.navigate(&url);
+                            }
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            if let Some(fi) = &mut self.focused_input {
+                                if ctrl {
+                                    // Ctrl+Backspace: delete last word
+                                    let trimmed = fi.text.trim_end().to_string();
+                                    if let Some(pos) = trimmed.rfind([' ', '/', '.']) {
+                                        fi.text.truncate(pos);
+                                    } else {
+                                        fi.text.clear();
+                                    }
+                                } else {
+                                    fi.text.pop();
+                                }
+                                self.request_redraw();
+                            }
+                        }
+                        Key::Character(ch) => {
+                            if ctrl && ch.as_str() == "v" {
+                                // Ctrl+V = paste
+                                if let Ok(mut clip) = arboard::Clipboard::new() {
+                                    if let Ok(text) = clip.get_text() {
+                                        if let Some(fi) = &mut self.focused_input {
+                                            let sanitized = text.replace(['\n', '\r', '\t'], "");
+                                            fi.text.push_str(&sanitized);
+                                        }
+                                        self.request_redraw();
+                                    }
+                                }
+                            } else if ctrl && ch.as_str() == "a" {
+                                // Ctrl+A = select all (clear text)
+                                if let Some(fi) = &mut self.focused_input {
+                                    fi.text.clear();
+                                }
+                                self.request_redraw();
+                            } else if !ctrl {
+                                if let Some(fi) = &mut self.focused_input {
+                                    fi.text.push_str(ch.as_str());
+                                }
+                                self.request_redraw();
+                            }
+                        }
+                        // Tab = unfocus input (allow other keys to pass through)
+                        Key::Named(NamedKey::Tab) => {
+                            self.focused_input = None;
+                            self.request_redraw();
+                        }
+                        _ => {}
+                    }
+                    return; // Focused input consumes all input
                 }
 
                 // ── Normal browser keyboard handling ──
@@ -1102,17 +1310,19 @@ impl ApplicationHandler for GpuApp {
                     }
                     // Page Up / Page Down — clamp to content bounds
                     Key::Named(NamedKey::PageDown) => {
-                        self.scroll_y += 600.0;
                         let sf = self.scale_factor as f32;
+                        self.scroll_y += 600.0 * sf;
+                        let _sf = self.scale_factor as f32;
                         let max_y = self.cached_layout.iter()
                             .map(|b| b.y + b.height).fold(0.0f32, f32::max);
                         let viewport_h = self.renderer.as_ref()
-                            .map(|r| r.size().1 as f32 / sf).unwrap_or(800.0);
+                            .map(|r| r.size().1 as f32).unwrap_or(800.0);
                         self.scroll_y = self.scroll_y.min((max_y - viewport_h + 70.0).max(0.0));
                         self.request_redraw();
                     }
                     Key::Named(NamedKey::PageUp) => {
-                        self.scroll_y = (self.scroll_y - 600.0).max(0.0);
+                        let sf = self.scale_factor as f32;
+                        self.scroll_y = (self.scroll_y - 600.0 * sf).max(0.0);
                         self.request_redraw();
                     }
                     Key::Named(NamedKey::Home) => {
@@ -1121,12 +1331,12 @@ impl ApplicationHandler for GpuApp {
                     }
                     Key::Named(NamedKey::End) => {
                         // Use actual layout height instead of heuristic
-                        let sf = self.scale_factor as f32;
+                        let _sf = self.scale_factor as f32;
                         let max_y = self.cached_layout.iter()
                             .map(|b| b.y + b.height)
                             .fold(0.0f32, f32::max);
                         let viewport_h = self.renderer.as_ref()
-                            .map(|r| r.size().1 as f32 / sf)
+                            .map(|r| r.size().1 as f32)
                             .unwrap_or(800.0);
                         self.scroll_y = (max_y - viewport_h + 60.0).max(0.0);
                         self.request_redraw();
@@ -1143,33 +1353,41 @@ impl ApplicationHandler for GpuApp {
                     }
                     // Arrow key scrolling (when not editing URL and not Alt)
                     Key::Named(NamedKey::ArrowDown) if !alt && !self.url_editing => {
-                        self.scroll_y += 40.0;
-                        // Clamp to content bounds
                         let sf = self.scale_factor as f32;
+                        self.scroll_y += 40.0 * sf;
+                        // Clamp to content bounds
+                        let _sf = self.scale_factor as f32;
                         let max_y = self.cached_layout.iter()
                             .map(|b| b.y + b.height).fold(0.0f32, f32::max);
                         let viewport_h = self.renderer.as_ref()
-                            .map(|r| r.size().1 as f32 / sf).unwrap_or(800.0);
+                            .map(|r| r.size().1 as f32).unwrap_or(800.0);
                         self.scroll_y = self.scroll_y.min((max_y - viewport_h + 70.0).max(0.0));
                         self.request_redraw();
                     }
                     Key::Named(NamedKey::ArrowUp) if !alt && !self.url_editing => {
-                        self.scroll_y = (self.scroll_y - 40.0).max(0.0);
+                        let sf = self.scale_factor as f32;
+                        self.scroll_y = (self.scroll_y - 40.0 * sf).max(0.0);
+                        self.request_redraw();
+                    }
+                    // Space in URL bar = type space
+                    Key::Named(NamedKey::Space) if self.url_editing => {
+                        self.url_input.push(' ');
                         self.request_redraw();
                     }
                     // Space = scroll down by viewport, Shift+Space = scroll up
-                    Key::Named(NamedKey::Space) if !self.url_editing => {
+                    Key::Named(NamedKey::Space) if !self.url_editing && self.focused_input.is_none() => {
                         let shift = self.modifiers.shift_key();
+                        let sf = self.scale_factor as f32;
                         if shift {
-                            self.scroll_y = (self.scroll_y - 500.0).max(0.0);
+                            self.scroll_y = (self.scroll_y - 500.0 * sf).max(0.0);
                         } else {
-                            self.scroll_y += 500.0;
+                            self.scroll_y += 500.0 * sf;
                             // Clamp
-                            let sf = self.scale_factor as f32;
+                            let _sf = self.scale_factor as f32;
                             let max_y = self.cached_layout.iter()
                                 .map(|b| b.y + b.height).fold(0.0f32, f32::max);
                             let vh = self.renderer.as_ref()
-                                .map(|r| r.size().1 as f32 / sf).unwrap_or(800.0);
+                                .map(|r| r.size().1 as f32).unwrap_or(800.0);
                             self.scroll_y = self.scroll_y.min((max_y - vh + 70.0).max(0.0));
                         }
                         self.request_redraw();
@@ -1239,9 +1457,10 @@ fn normalize_url_input(input: &str) -> String {
     }
 
     // Has spaces → definitely a search query
+    // Use DuckDuckGo HTML (no-JS engine) — Google requires JavaScript
     if trimmed.contains(' ') {
         return format!(
-            "https://www.google.com/search?q={}",
+            "https://html.duckduckgo.com/html/?q={}",
             urlencoding_simple(trimmed)
         );
     }
@@ -1269,8 +1488,9 @@ fn normalize_url_input(input: &str) -> String {
     }
 
     // Single word without dot → search (like Chrome)
+    // Use DuckDuckGo HTML — works without JavaScript
     format!(
-        "https://www.google.com/search?q={}",
+        "https://html.duckduckgo.com/html/?q={}",
         urlencoding_simple(trimmed)
     )
 }

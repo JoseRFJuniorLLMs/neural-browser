@@ -32,6 +32,11 @@ pub struct RenderContext<'a> {
     pub url_input: &'a str,
     pub zoom_level: f32,
     pub eva_visible: bool,
+    /// HiDPI scale factor (1.0 on standard displays, 1.25/1.5/2.0 on HiDPI).
+    /// All toolbar UI elements are multiplied by this factor.
+    pub scale_factor: f32,
+    /// Currently focused form input (if any)
+    pub focused_input: Option<&'a super::FocusedInput>,
 }
 
 /// Vertex for image quad rendering.
@@ -62,6 +67,18 @@ struct RoundedRectVertex {
     radius: f32,            // Corner radius in pixels
 }
 
+/// Vertex for rounded image rendering (textured quad with SDF pill masking).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct RoundedImageVertex {
+    ndc_pos: [f32; 2],      // Clip-space position
+    uv: [f32; 2],           // Texture UV coordinates
+    pixel_pos: [f32; 2],    // Pixel-space position (for SDF)
+    rect_center: [f32; 2],  // Center of rect in pixels
+    rect_half: [f32; 2],    // Half-size of rect in pixels
+    radius: f32,            // Corner radius in pixels
+}
+
 /// A cached GPU texture with its bind group and dimensions.
 struct CachedTexture {
     bind_group: wgpu::BindGroup,
@@ -72,7 +89,7 @@ struct CachedTexture {
 }
 
 /// Toolbar height in pixels (navbar with buttons + URL bar).
-pub const TOOLBAR_HEIGHT: f32 = 72.0;
+pub const TOOLBAR_HEIGHT: f32 = 90.0;
 
 /// Status bar height in pixels.
 pub const STATUS_BAR_HEIGHT: f32 = 28.0;
@@ -97,6 +114,8 @@ pub struct WgpuRenderer {
     rect_pipeline: wgpu::RenderPipeline,
     // Rounded rectangle pipeline (pill-shaped URL bar, rounded buttons)
     rounded_rect_pipeline: wgpu::RenderPipeline,
+    // Rounded image pipeline (textured quad with SDF pill masking)
+    rounded_image_pipeline: wgpu::RenderPipeline,
     // Texture cache: URL -> CachedTexture (avoids re-uploading every frame)
     texture_cache: HashMap<String, CachedTexture>,
 }
@@ -374,6 +393,60 @@ impl WgpuRenderer {
                 cache: None,
             });
 
+        // ── Rounded image pipeline (textured quad + SDF pill masking) ──
+        let rounded_image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rounded_image_shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("rounded_image_shader.wgsl").into(),
+            ),
+        });
+        let rounded_image_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("rounded_image_pipeline_layout"),
+                bind_group_layouts: &[&image_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let rounded_image_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("rounded_image_pipeline"),
+                layout: Some(&rounded_image_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &rounded_image_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<RoundedImageVertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },   // ndc_pos
+                            wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32x2 },   // uv
+                            wgpu::VertexAttribute { offset: 16, shader_location: 2, format: wgpu::VertexFormat::Float32x2 },  // pixel_pos
+                            wgpu::VertexAttribute { offset: 24, shader_location: 3, format: wgpu::VertexFormat::Float32x2 },  // rect_center
+                            wgpu::VertexAttribute { offset: 32, shader_location: 4, format: wgpu::VertexFormat::Float32x2 },  // rect_half
+                            wgpu::VertexAttribute { offset: 40, shader_location: 5, format: wgpu::VertexFormat::Float32 },    // radius
+                        ],
+                    }],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &rounded_image_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
         let image_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("image_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -381,6 +454,43 @@ impl WgpuRenderer {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
+        });
+
+        // ── Pre-generate toolbar gradient texture ──
+        let grad_w: u32 = 720;
+        let grad_h: u32 = 54;
+        let grad_rgba = Self::generate_toolbar_gradient(grad_w, grad_h);
+        let grad_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("toolbar_gradient_texture"),
+            size: wgpu::Extent3d { width: grad_w, height: grad_h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &grad_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &grad_rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * grad_w), rows_per_image: Some(grad_h) },
+            wgpu::Extent3d { width: grad_w, height: grad_h, depth_or_array_layers: 1 },
+        );
+        let grad_view = grad_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let grad_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("toolbar_gradient_bind_group"),
+            layout: &image_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&grad_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&image_sampler) },
+            ],
+        });
+        let mut texture_cache = HashMap::new();
+        texture_cache.insert("__toolbar_bg".to_string(), CachedTexture {
+            bind_group: grad_bind_group,
+            width: grad_w,
+            height: grad_h,
+            texture: grad_texture,
         });
 
         Ok(Self {
@@ -399,7 +509,8 @@ impl WgpuRenderer {
             image_sampler,
             rect_pipeline,
             rounded_rect_pipeline,
-            texture_cache: HashMap::new(),
+            rounded_image_pipeline,
+            texture_cache,
         })
     }
 
@@ -580,6 +691,43 @@ impl WgpuRenderer {
         ]
     }
 
+    /// Build 6 vertices for a rounded image quad (textured + SDF pill masking).
+    fn build_rounded_image_quad(&self, x: f32, y: f32, w: f32, h: f32, radius: f32) -> [RoundedImageVertex; 6] {
+        let tl_ndc = self.pixel_to_ndc(x, y);
+        let tr_ndc = self.pixel_to_ndc(x + w, y);
+        let bl_ndc = self.pixel_to_ndc(x, y + h);
+        let br_ndc = self.pixel_to_ndc(x + w, y + h);
+        let center = [x + w / 2.0, y + h / 2.0];
+        let half = [w / 2.0, h / 2.0];
+        [
+            RoundedImageVertex { ndc_pos: tl_ndc, uv: [0.0, 0.0], pixel_pos: [x, y], rect_center: center, rect_half: half, radius },
+            RoundedImageVertex { ndc_pos: bl_ndc, uv: [0.0, 1.0], pixel_pos: [x, y + h], rect_center: center, rect_half: half, radius },
+            RoundedImageVertex { ndc_pos: tr_ndc, uv: [1.0, 0.0], pixel_pos: [x + w, y], rect_center: center, rect_half: half, radius },
+            RoundedImageVertex { ndc_pos: tr_ndc, uv: [1.0, 0.0], pixel_pos: [x + w, y], rect_center: center, rect_half: half, radius },
+            RoundedImageVertex { ndc_pos: bl_ndc, uv: [0.0, 1.0], pixel_pos: [x, y + h], rect_center: center, rect_half: half, radius },
+            RoundedImageVertex { ndc_pos: br_ndc, uv: [1.0, 1.0], pixel_pos: [x + w, y + h], rect_center: center, rect_half: half, radius },
+        ]
+    }
+
+    /// Generate a warm golden/orange gradient for the toolbar pill background.
+    /// Returns RGBA bytes for a texture of the given dimensions.
+    fn generate_toolbar_gradient(width: u32, height: u32) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            let vy = y as f32 / height as f32;
+            for x in 0..width {
+                let vx = x as f32 / width as f32;
+                // Horizontal gradient: edges lighter, center deeper orange
+                let cx = (vx - 0.5).abs() * 2.0; // 0 at center, 1 at edges
+                let r = (255.0 - 30.0 * (1.0 - cx) + 10.0 * vy).clamp(0.0, 255.0) as u8;
+                let g = (185.0 - 40.0 * (1.0 - cx) - 15.0 * vy).clamp(0.0, 255.0) as u8;
+                let b = (120.0 - 50.0 * (1.0 - cx) - 20.0 * vy).clamp(0.0, 255.0) as u8;
+                rgba.extend_from_slice(&[r, g, b, 255]);
+            }
+        }
+        rgba
+    }
+
     /// Determine the color for a link box, considering hover and visited state.
     fn link_color(
         &self,
@@ -642,7 +790,12 @@ impl WgpuRenderer {
 
     /// Clear all cached textures (e.g. on page navigation).
     pub fn clear_texture_cache(&mut self) {
+        // Preserve internal textures (toolbar gradient) across page navigations
+        let toolbar_bg = self.texture_cache.remove("__toolbar_bg");
         self.texture_cache.clear();
+        if let Some(bg) = toolbar_bg {
+            self.texture_cache.insert("__toolbar_bg".to_string(), bg);
+        }
     }
 
     pub fn render(&mut self, layout: &[LayoutBox], ctx: &RenderContext<'_>) -> Result<()> {
@@ -691,8 +844,9 @@ impl WgpuRenderer {
 
         let wf = w as f32;
         let hf = h as f32;
-        let tb = TOOLBAR_HEIGHT;
-        let sb = STATUS_BAR_HEIGHT;
+        let sf = ctx.scale_factor.max(1.0); // HiDPI scale factor
+        let tb = TOOLBAR_HEIGHT * sf;
+        let sb = STATUS_BAR_HEIGHT * sf;
 
         // When EVA panel is visible, compute panel geometry and content clip edge.
         // Otherwise content extends to the full window width.
@@ -711,14 +865,16 @@ impl WgpuRenderer {
         // ── Airbnb-style toolbar ──
         rect_vertices.extend_from_slice(&self.build_rect(0.0, 0.0, wf, tb, ctx.theme.toolbar_bg));
         let mut rounded_vertices: Vec<RoundedRectVertex> = Vec::new();
+        let mut rounded_image_vertices: Vec<RoundedImageVertex> = Vec::new();
 
-        // Layout constants
-        let nav_btn_size: f32 = 36.0;
+        // Layout constants (scaled for HiDPI)
+        let nav_btn_size: f32 = 44.0 * sf;
         let nav_btn_y: f32 = (tb - nav_btn_size) / 2.0;
-        let margin_left: f32 = 14.0;
+        let margin_left: f32 = 16.0 * sf;
+        let btn_gap: f32 = 6.0 * sf;
         let back_x = margin_left;
-        let fwd_x = back_x + nav_btn_size + 4.0;
-        let ref_x = fwd_x + nav_btn_size + 4.0;
+        let fwd_x = back_x + nav_btn_size + btn_gap;
+        let ref_x = fwd_x + nav_btn_size + btn_gap;
 
         // Small circular nav buttons (rounded)
         let nav_radius = nav_btn_size / 2.0;
@@ -726,27 +882,27 @@ impl WgpuRenderer {
             rounded_vertices.extend(self.build_rounded_rect(bx, nav_btn_y, nav_btn_size, nav_btn_size, ctx.theme.button_bg, nav_radius));
         }
 
-        // Nav button labels (compact)
+        // Nav button labels (compact, scaled)
         for (label, bx) in [("\u{25C0}", back_x), ("\u{25B6}", fwd_x), ("\u{21BB}", ref_x)] {
-            let mut btn_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(20.0, 24.0));
+            let mut btn_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(24.0 * sf, 28.0 * sf));
             btn_buf.set_size(&mut self.font_system, Some(nav_btn_size), Some(nav_btn_size));
             btn_buf.set_text(&mut self.font_system, label,
                 Attrs::new().family(Family::SansSerif).weight(Weight::NORMAL), Shaping::Advanced);
             btn_buf.shape_until_scroll(&mut self.font_system, false);
             let tc = ctx.theme.button_text;
-            buffers.push((btn_buf, bx + 10.0, nav_btn_y + 8.0,
+            buffers.push((btn_buf, bx + 12.0 * sf, nav_btn_y + 10.0 * sf,
                 TextBounds { left: bx as i32, top: nav_btn_y as i32, right: (bx + nav_btn_size) as i32, bottom: (nav_btn_y + nav_btn_size) as i32 },
                 GlyphonColor::rgb((tc[0]*255.0).clamp(0.0, 255.0) as u8, (tc[1]*255.0).clamp(0.0, 255.0) as u8, (tc[2]*255.0).clamp(0.0, 255.0) as u8)));
         }
 
-        // EVA button (right side, rounded pill)
-        let eva_btn_w: f32 = 68.0;
-        let eva_btn_h: f32 = 38.0;
+        // EVA button (right side, rounded pill, scaled)
+        let eva_btn_w: f32 = 80.0 * sf;
+        let eva_btn_h: f32 = 46.0 * sf;
         let eva_btn_y = (tb - eva_btn_h) / 2.0;
         let eva_btn_x = if eva_panel.is_some() {
             (panel_x - eva_btn_w - 10.0).max(0.0)
         } else {
-            wf - eva_btn_w - 14.0
+            wf - eva_btn_w - 14.0 * sf
         };
         let eva_bg = if eva_panel.is_some() || ctx.eva_visible {
             [0.20, 0.60, 0.50, 1.0]
@@ -755,8 +911,8 @@ impl WgpuRenderer {
         };
         rounded_vertices.extend(self.build_rounded_rect(eva_btn_x, eva_btn_y, eva_btn_w, eva_btn_h, eva_bg, eva_btn_h / 2.0));
 
-        let mut eva_btn_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(16.0, 20.0));
-        eva_btn_buf.set_size(&mut self.font_system, Some(eva_btn_w - 8.0), Some(eva_btn_h));
+        let mut eva_btn_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(18.0 * sf, 22.0 * sf));
+        eva_btn_buf.set_size(&mut self.font_system, Some(eva_btn_w - 8.0 * sf), Some(eva_btn_h));
         let eva_label = if eva_panel.is_some() || ctx.eva_visible { "EVA \u{2715}" } else { "\u{2726} EVA" };
         eva_btn_buf.set_text(&mut self.font_system, eva_label,
             Attrs::new().family(Family::SansSerif).weight(Weight::BOLD), Shaping::Advanced);
@@ -767,57 +923,84 @@ impl WgpuRenderer {
             let tc = ctx.theme.button_text;
             GlyphonColor::rgb((tc[0]*255.0).clamp(0.0, 255.0) as u8, (tc[1]*255.0).clamp(0.0, 255.0) as u8, (tc[2]*255.0).clamp(0.0, 255.0) as u8)
         };
-        buffers.push((eva_btn_buf, eva_btn_x + 10.0, eva_btn_y + 10.0,
+        buffers.push((eva_btn_buf, eva_btn_x + 12.0 * sf, eva_btn_y + 13.0 * sf,
             TextBounds { left: eva_btn_x as i32, top: eva_btn_y as i32,
                 right: (eva_btn_x + eva_btn_w) as i32, bottom: (eva_btn_y + eva_btn_h) as i32 },
             eva_text_color));
 
-        // ═══ CENTERED PILL URL BAR (Airbnb-style) ═══
-        let nav_zone_end = ref_x + nav_btn_size + 16.0;
-        let eva_zone_start = eva_btn_x - 16.0;
+        // ═══ CENTERED PILL URL BAR (Airbnb-style, scaled) ═══
+        let nav_zone_end = ref_x + nav_btn_size + 16.0 * sf;
+        let eva_zone_start = eva_btn_x - 16.0 * sf;
         let available = eva_zone_start - nav_zone_end;
-        let pill_max_w: f32 = 680.0;
-        let pill_w = available.min(pill_max_w).max(200.0);
-        let pill_h: f32 = 46.0;
+        let pill_max_w: f32 = 720.0 * sf;
+        let pill_w = available.min(pill_max_w).max(240.0 * sf);
+        let pill_h: f32 = 54.0 * sf;
         let pill_x = nav_zone_end + (available - pill_w) / 2.0;
         let pill_y = (tb - pill_h) / 2.0;
         let pill_radius = pill_h / 2.0; // Fully rounded ends (pill shape)
 
-        // Pill background — lighter than toolbar, with subtle border effect
-        let pill_bg = if ctx.url_editing {
-            [0.22, 0.22, 0.28, 1.0] // slightly brighter when editing
+        // Pill background — gradient image with SDF pill masking (Google-style)
+        if ctx.url_editing {
+            // When editing: fallback to solid bright background (text needs contrast)
+            rounded_vertices.extend(self.build_rounded_rect(pill_x, pill_y, pill_w, pill_h, [0.95, 0.95, 0.97, 1.0], pill_radius));
         } else {
-            [0.18, 0.18, 0.24, 1.0] // subtle light background
-        };
-        rounded_vertices.extend(self.build_rounded_rect(pill_x, pill_y, pill_w, pill_h, pill_bg, pill_radius));
+            // Normal: golden gradient image clipped to pill shape
+            rounded_image_vertices.extend(self.build_rounded_image_quad(pill_x, pill_y, pill_w, pill_h, pill_radius));
+        }
 
-        // Pill border ring (1px lighter outline)
+        // Pill border ring (scaled outline)
+        let border_w = 1.5 * sf;
         let border_color = if ctx.url_editing {
             [0.35, 0.55, 0.80, 0.6] // blue glow when editing
         } else {
-            [0.30, 0.30, 0.38, 0.5] // subtle border
+            [0.85, 0.75, 0.55, 0.4] // warm golden border to match gradient
         };
-        rounded_vertices.extend(self.build_rounded_rect(pill_x - 1.5, pill_y - 1.5, pill_w + 3.0, pill_h + 3.0, border_color, pill_radius + 1.5));
+        rounded_vertices.extend(self.build_rounded_rect(pill_x - border_w, pill_y - border_w, pill_w + border_w * 2.0, pill_h + border_w * 2.0, border_color, pill_radius + border_w));
 
         // Toolbar subtle bottom shadow
         rect_vertices.extend_from_slice(&self.build_rect(0.0, tb - 1.0, wf, 1.0, [0.0, 0.0, 0.0, 0.15]));
 
-        // URL text inside the pill
+        // Icons zone on the right side of the pill (mic, camera, EVA sparkle)
+        let icons_w = 90.0 * sf; // space reserved for 3 icons
+        let icons_text = "\u{1F3A4}  \u{1F4F7}  \u{2726}"; // 🎤 📷 ✦
+        let mut icons_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(18.0 * sf, 24.0 * sf));
+        icons_buf.set_size(&mut self.font_system, Some(icons_w), Some(pill_h));
+        icons_buf.set_text(
+            &mut self.font_system, icons_text,
+            Attrs::new().family(Family::SansSerif).weight(Weight::NORMAL),
+            Shaping::Advanced,
+        );
+        icons_buf.shape_until_scroll(&mut self.font_system, false);
+        let icons_color = if ctx.url_editing {
+            GlyphonColor::rgb(100, 100, 120)
+        } else {
+            GlyphonColor::rgb(80, 50, 20) // dark brown for contrast on golden gradient
+        };
+        buffers.push((
+            icons_buf, pill_x + pill_w - icons_w - 10.0 * sf, pill_y + 16.0 * sf,
+            TextBounds {
+                left: (pill_x + pill_w - icons_w - 15.0 * sf) as i32, top: pill_y as i32,
+                right: (pill_x + pill_w) as i32, bottom: (pill_y + pill_h) as i32,
+            },
+            icons_color,
+        ));
+
+        // URL text inside the pill (adjusted width to leave space for icons)
         let (url_display, url_color) = if ctx.url_editing {
             if ctx.url_input.is_empty() {
-                ("\u{1F50D}  Search or enter URL...".to_string(), GlyphonColor::rgb(130, 130, 155))
+                ("\u{1F50D}  Search or enter URL...".to_string(), GlyphonColor::rgb(100, 100, 120))
             } else {
-                (format!("{}\u{2588}", ctx.url_input), GlyphonColor::rgb(235, 235, 245))
+                (format!("{}\u{2588}", ctx.url_input), GlyphonColor::rgb(40, 40, 50))
             }
         } else if ctx.loading {
-            (format!("\u{23F3}  {}", ctx.url), GlyphonColor::rgb(160, 190, 255))
+            (format!("\u{23F3}  {}", ctx.url), GlyphonColor::rgb(60, 40, 10))
         } else {
-            (format!("\u{1F512}  {}", ctx.url), GlyphonColor::rgb(200, 210, 235))
+            (format!("\u{1F50D}  {}", ctx.url), GlyphonColor::rgb(60, 40, 10)) // dark text on golden bg
         };
 
-        let url_text_x = pill_x + 20.0;
-        let url_text_w = pill_w - 40.0;
-        let mut url_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(18.0, 24.0));
+        let url_text_x = pill_x + 20.0 * sf;
+        let url_text_w = pill_w - icons_w - 50.0 * sf; // leave space for icons
+        let mut url_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(20.0 * sf, 26.0 * sf));
         url_buf.set_size(&mut self.font_system, Some(url_text_w), Some(pill_h));
         url_buf.set_text(
             &mut self.font_system, &url_display,
@@ -826,18 +1009,18 @@ impl WgpuRenderer {
         );
         url_buf.shape_until_scroll(&mut self.font_system, false);
         buffers.push((
-            url_buf, url_text_x, pill_y + 12.0,
+            url_buf, url_text_x, pill_y + 15.0 * sf,
             TextBounds {
                 left: pill_x as i32, top: pill_y as i32,
-                right: (pill_x + pill_w) as i32, bottom: (pill_y + pill_h) as i32,
+                right: (pill_x + pill_w - icons_w) as i32, bottom: (pill_y + pill_h) as i32,
             },
             url_color,
         ));
 
-        // Loading indicator
+        // Loading indicator (scaled)
         if ctx.loading {
-            let mut load_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(22.0, 28.0));
-            load_buf.set_size(&mut self.font_system, Some(content_right - 40.0), Some(36.0));
+            let mut load_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(22.0 * sf, 28.0 * sf));
+            load_buf.set_size(&mut self.font_system, Some(content_right - 40.0 * sf), Some(36.0 * sf));
             let dots = match (ctx.loading_ticks / 15) % 4 {
                 0 => "Loading", 1 => "Loading.", 2 => "Loading..", _ => "Loading...",
             };
@@ -852,9 +1035,9 @@ impl WgpuRenderer {
             ));
         }
 
-        // Status bar text
-        let mut status_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(14.0, 18.0));
-        status_buf.set_size(&mut self.font_system, Some(wf), Some(if eva_panel.is_some() { 20.0 } else { sb }));
+        // Status bar text (scaled)
+        let mut status_buf = GlyphonBuffer::new(&mut self.font_system, Metrics::new(14.0 * sf, 18.0 * sf));
+        status_buf.set_size(&mut self.font_system, Some(wf), Some(if eva_panel.is_some() { 20.0 * sf } else { sb }));
         let n_blocks = layout.len();
 
         // Show hovered link URL in status bar, or default status
@@ -884,10 +1067,10 @@ impl WgpuRenderer {
         buffers.push((
             status_buf,
             0.0,
-            hf - STATUS_BAR_HEIGHT,
+            hf - sb,
             TextBounds {
                 left: 0,
-                top: h as i32 - STATUS_BAR_HEIGHT as i32,
+                top: (hf - sb) as i32,
                 right: w as i32,
                 bottom: h as i32,
             },
@@ -904,7 +1087,7 @@ impl WgpuRenderer {
                     let top = lbox.y;
                     let bottom = lbox.y + lbox.height;
                     // Skip backgrounds outside visible area
-                    if bottom < TOOLBAR_HEIGHT || top > hf - STATUS_BAR_HEIGHT {
+                    if bottom < tb || top > hf - sb {
                         continue;
                     }
                     let verts = self.build_rect(
@@ -918,6 +1101,7 @@ impl WgpuRenderer {
                     color,
                     bold,
                     italic,
+                    centered,
                 } => {
                     if text.is_empty() {
                         continue;
@@ -961,6 +1145,11 @@ impl WgpuRenderer {
                         Attrs::new().family(Family::SansSerif).weight(weight).style(style),
                         Shaping::Advanced,
                     );
+                    if *centered {
+                        for line in buf.lines.iter_mut() {
+                            line.set_align(Some(glyphon::cosmic_text::Align::Center));
+                        }
+                    }
                     buf.shape_until_scroll(&mut self.font_system, false);
 
                     // Determine final color (hover/visited override for links)
@@ -976,9 +1165,9 @@ impl WgpuRenderer {
                         lbox.y,
                         TextBounds {
                             left: lbox.x as i32,
-                            top: top.max(TOOLBAR_HEIGHT as i32),
+                            top: top.max(tb as i32),
                             right: if eva_panel.is_some() { content_right as i32 } else { (lbox.x + lbox.width) as i32 },
-                            bottom: bottom.min(h as i32 - STATUS_BAR_HEIGHT as i32),
+                            bottom: bottom.min(h as i32 - sb as i32),
                         },
                         GlyphonColor::rgba(r, g, b_ch, a),
                     ));
@@ -1010,7 +1199,7 @@ impl WgpuRenderer {
                         ul_buf.shape_until_scroll(&mut self.font_system, false);
 
                         let ul_top = underline_y as i32;
-                        if ul_top > TOOLBAR_HEIGHT as i32 && ul_top < h as i32 - STATUS_BAR_HEIGHT as i32 {
+                        if ul_top > tb as i32 && ul_top < h as i32 - sb as i32 {
                             buffers.push((
                                 ul_buf,
                                 lbox.x,
@@ -1019,7 +1208,7 @@ impl WgpuRenderer {
                                     left: lbox.x as i32,
                                     top: ul_top,
                                     right: (lbox.x + lbox.width) as i32,
-                                    bottom: (ul_top + 4).min(h as i32 - STATUS_BAR_HEIGHT as i32),
+                                    bottom: (ul_top + 4).min(h as i32 - sb as i32),
                                 },
                                 GlyphonColor::rgba(r, g, b_ch, a),
                             ));
@@ -1071,9 +1260,9 @@ impl WgpuRenderer {
                         lbox.y,
                         TextBounds {
                             left: lbox.x as i32,
-                            top: top.max(TOOLBAR_HEIGHT as i32),
+                            top: top.max(tb as i32),
                             right: if eva_panel.is_some() { content_right as i32 } else { (lbox.x + lbox.width) as i32 },
-                            bottom: bottom.min(h as i32 - STATUS_BAR_HEIGHT as i32),
+                            bottom: bottom.min(h as i32 - sb as i32),
                         },
                         GlyphonColor::rgb(200, 220, 170),
                     ));
@@ -1116,9 +1305,9 @@ impl WgpuRenderer {
                                 lbox.y,
                                 TextBounds {
                                     left: lbox.x as i32,
-                                    top: top.max(TOOLBAR_HEIGHT as i32),
+                                    top: top.max(tb as i32),
                                     right: (lbox.x + lbox.width) as i32,
-                                    bottom: (top + 30).min(h as i32 - STATUS_BAR_HEIGHT as i32),
+                                    bottom: (top + 30).min(h as i32 - sb as i32),
                                 },
                                 GlyphonColor::rgb(120, 120, 140),
                             ));
@@ -1131,36 +1320,59 @@ impl WgpuRenderer {
                 LayoutKind::Separator => {
                     // Thin horizontal line
                     let top = lbox.y as i32;
-                    if top > TOOLBAR_HEIGHT as i32 && top < h as i32 - STATUS_BAR_HEIGHT as i32 {
-                        let sep_color = [0.35, 0.35, 0.42, 0.6];
+                    if top > tb as i32 && top < h as i32 - sb as i32 {
+                        let sep_color = [0.82, 0.82, 0.85, 0.6];
                         content_bg_rects.extend(self.build_rect(
                             lbox.x, lbox.y, lbox.width, 1.0, sep_color,
                         ));
                     }
                 }
-                LayoutKind::InputBox { placeholder, font_size } => {
+                LayoutKind::InputBox { placeholder, font_size, input_name, .. } => {
                     let top = lbox.y as i32;
                     let bottom = (lbox.y + lbox.height) as i32;
-                    if bottom < TOOLBAR_HEIGHT as i32 || top > h as i32 - STATUS_BAR_HEIGHT as i32 {
+                    if bottom < tb as i32 || top > h as i32 - sb as i32 {
                         continue;
                     }
-                    // Input border (rounded rectangle outline)
-                    let border_color = [0.35, 0.38, 0.48, 0.8];
+                    // Check if this input is focused (compare by input_name and un-scrolled y)
+                    let is_focused = ctx.focused_input.map_or(false, |fi| {
+                        fi.input_name == *input_name
+                            && (fi.x - lbox.x).abs() < 2.0
+                    });
+                    // Input border
+                    let border_color = if is_focused {
+                        [0.2, 0.5, 1.0, 1.0]  // blue border when focused
+                    } else {
+                        [0.75, 0.75, 0.78, 0.8]
+                    };
+                    let border_width = if is_focused { 2.5 } else { 1.5 };
                     let radius = lbox.height / 2.0;
                     rounded_vertices.extend(self.build_rounded_rect(
-                        lbox.x - 1.5, lbox.y - 1.5,
-                        lbox.width + 3.0, lbox.height + 3.0,
-                        border_color, radius + 1.5,
+                        lbox.x - border_width, lbox.y - border_width,
+                        lbox.width + border_width * 2.0, lbox.height + border_width * 2.0,
+                        border_color, radius + border_width,
                     ));
                     // Input background
-                    let input_bg = [0.14, 0.14, 0.18, 1.0];
+                    let input_bg = if is_focused {
+                        [1.0, 1.0, 1.0, 1.0]  // white when focused
+                    } else {
+                        [0.95, 0.95, 0.96, 1.0]
+                    };
                     rounded_vertices.extend(self.build_rounded_rect(
                         lbox.x, lbox.y,
                         lbox.width, lbox.height,
                         input_bg, radius,
                     ));
-                    // Search icon + placeholder text
-                    let display = format!("\u{1F50D}  {}", placeholder);
+                    // Display text: typed text (if focused) or placeholder
+                    let (display, text_color) = if is_focused {
+                        let typed = ctx.focused_input.map(|fi| fi.text.as_str()).unwrap_or("");
+                        if typed.is_empty() {
+                            (format!("\u{2758}"), GlyphonColor::rgb(30, 30, 30))
+                        } else {
+                            (format!("{}\u{2758}", typed), GlyphonColor::rgb(30, 30, 30))
+                        }
+                    } else {
+                        (format!("\u{1F50D}  {}", placeholder), GlyphonColor::rgb(100, 100, 110))
+                    };
                     let mut buf = GlyphonBuffer::new(
                         &mut self.font_system,
                         Metrics::new(*font_size, font_size * 1.4),
@@ -1179,17 +1391,17 @@ impl WgpuRenderer {
                         lbox.y + (lbox.height - font_size * 1.4) / 2.0,
                         TextBounds {
                             left: lbox.x as i32,
-                            top: top.max(TOOLBAR_HEIGHT as i32),
+                            top: top.max(tb as i32),
                             right: (lbox.x + lbox.width) as i32,
-                            bottom: bottom.min(h as i32 - STATUS_BAR_HEIGHT as i32),
+                            bottom: bottom.min(h as i32 - sb as i32),
                         },
-                        GlyphonColor::rgb(140, 145, 165),
+                        text_color,
                     ));
                 }
-                LayoutKind::Button { text, font_size, bg_color, text_color } => {
+                LayoutKind::Button { text, font_size, bg_color, text_color, .. } => {
                     let top = lbox.y as i32;
                     let bottom = (lbox.y + lbox.height) as i32;
-                    if bottom < TOOLBAR_HEIGHT as i32 || top > h as i32 - STATUS_BAR_HEIGHT as i32 {
+                    if bottom < tb as i32 || top > h as i32 - sb as i32 {
                         continue;
                     }
                     // Button background (rounded rectangle)
@@ -1226,9 +1438,9 @@ impl WgpuRenderer {
                         lbox.y + (lbox.height - font_size * 1.4) / 2.0,
                         TextBounds {
                             left: lbox.x as i32,
-                            top: top.max(TOOLBAR_HEIGHT as i32),
+                            top: top.max(tb as i32),
                             right: (lbox.x + lbox.width) as i32,
-                            bottom: bottom.min(h as i32 - STATUS_BAR_HEIGHT as i32),
+                            bottom: bottom.min(h as i32 - sb as i32),
                         },
                         GlyphonColor::rgb((tc[0]*255.0).clamp(0.0, 255.0) as u8, (tc[1]*255.0).clamp(0.0, 255.0) as u8, (tc[2]*255.0).clamp(0.0, 255.0) as u8),
                     ));
@@ -1239,7 +1451,7 @@ impl WgpuRenderer {
 
         // ── EVA panel UI (only when panel is visible) ──
         if let Some(panel) = eva_panel {
-            self.build_eva_panel_ui(panel, panel_x, panel_width, w, h, &mut buffers);
+            self.build_eva_panel_ui(panel, panel_x, panel_width, w, h, &mut buffers, ctx.scale_factor);
         }
 
         // ── Build TextArea refs ──
@@ -1344,6 +1556,21 @@ impl WgpuRenderer {
                 pass.set_pipeline(&self.rounded_rect_pipeline);
                 pass.set_vertex_buffer(0, rounded_buffer.slice(..));
                 pass.draw(0..rounded_vertices.len() as u32, 0..1);
+            }
+
+            // Rounded images (textured quads with SDF pill masking — toolbar gradient)
+            if !rounded_image_vertices.is_empty() {
+                if let Some(bg_tex) = self.texture_cache.get("__toolbar_bg") {
+                    let ri_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("rounded_image_vertex_buffer"),
+                        contents: bytemuck::cast_slice(&rounded_image_vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                    pass.set_pipeline(&self.rounded_image_pipeline);
+                    pass.set_bind_group(0, &bg_tex.bind_group, &[]);
+                    pass.set_vertex_buffer(0, ri_buffer.slice(..));
+                    pass.draw(0..rounded_image_vertices.len() as u32, 0..1);
+                }
             }
         }
 
@@ -1497,7 +1724,10 @@ impl WgpuRenderer {
         w: u32,
         h: u32,
         buffers: &mut Vec<(GlyphonBuffer, f32, f32, TextBounds, GlyphonColor)>,
+        scale_factor: f32,
     ) {
+        let sf = scale_factor.max(1.0);
+        let tb = TOOLBAR_HEIGHT * sf;
         // ── AI panel header — shows current provider ──
         let provider_name = eva_panel.provider.name();
         let header_text = format!("  {}  [Tab: switch] [Esc: close]", provider_name);
@@ -1507,7 +1737,7 @@ impl WgpuRenderer {
             Attrs::new().family(Family::SansSerif).weight(Weight::BOLD), Shaping::Advanced);
         header_buf.shape_until_scroll(&mut self.font_system, false);
         buffers.push((header_buf, panel_x + 10.0, 8.0,
-            TextBounds { left: panel_x as i32, top: 0, right: w as i32, bottom: TOOLBAR_HEIGHT as i32 },
+            TextBounds { left: panel_x as i32, top: 0, right: w as i32, bottom: tb as i32 },
             GlyphonColor::rgb(100, 200, 255),
         ));
 

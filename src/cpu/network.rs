@@ -146,6 +146,18 @@ impl NetworkEngine {
 
         let body = decode_body(&raw_bytes, header_charset.as_deref());
 
+        // Detect Google "enable JavaScript" redirect page — retry with DuckDuckGo
+        if body.contains("enablejs") || body.contains("Ative o JavaScript") || body.contains("Enable JavaScript") {
+            if let Some(query) = extract_google_query(url) {
+                let ddg_url = format!(
+                    "https://html.duckduckgo.com/html/?q={}",
+                    query
+                );
+                info!("[CPU:NET] Google requires JavaScript, falling back to DuckDuckGo: {ddg_url}");
+                return self.fetch(&ddg_url);
+            }
+        }
+
         Ok(body)
     }
 
@@ -256,6 +268,28 @@ impl NetworkEngine {
 
         Ok(bytes)
     }
+}
+
+/// Extract the search query from a Google URL (q= parameter).
+/// Returns the raw (still URL-encoded) query string if found.
+fn extract_google_query(url: &str) -> Option<String> {
+    if let Ok(parsed) = url::Url::parse(url) {
+        for (key, value) in parsed.query_pairs() {
+            if key == "q" {
+                return Some(value.into_owned());
+            }
+        }
+    }
+    // Also try extracting from enablejs redirect URLs
+    if let Some(pos) = url.find("q=") {
+        let rest = &url[pos + 2..];
+        let end = rest.find('&').unwrap_or(rest.len());
+        let query = &rest[..end];
+        if !query.is_empty() {
+            return Some(query.to_string());
+        }
+    }
+    None
 }
 
 /// Convert ureq errors into user-friendly messages.

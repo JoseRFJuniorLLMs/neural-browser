@@ -29,15 +29,15 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            bg: [0.06, 0.06, 0.08, 1.0],
-            text: [0.85, 0.85, 0.88, 1.0],
-            text_dim: [0.5, 0.5, 0.55, 1.0],
-            heading: [0.95, 0.95, 0.97, 1.0],
-            link: [0.4, 0.6, 1.0, 1.0],
-            link_hover: [0.55, 0.75, 1.0, 1.0],
-            link_visited: [0.6, 0.4, 0.85, 1.0],
-            code_bg: [0.1, 0.1, 0.12, 1.0],
-            quote_bg: [0.12, 0.12, 0.15, 1.0],
+            bg: [0.98, 0.98, 0.98, 1.0],         // white page background
+            text: [0.13, 0.13, 0.13, 1.0],        // near-black text
+            text_dim: [0.45, 0.45, 0.47, 1.0],    // dimmed text (gray)
+            heading: [0.08, 0.08, 0.10, 1.0],     // black headings
+            link: [0.10, 0.33, 0.72, 1.0],        // Google-blue links
+            link_hover: [0.15, 0.40, 0.85, 1.0],  // brighter blue on hover
+            link_visited: [0.40, 0.15, 0.55, 1.0],// purple visited
+            code_bg: [0.94, 0.94, 0.96, 1.0],     // light gray code bg
+            quote_bg: [0.93, 0.93, 0.95, 1.0],    // light gray quote bg
             url_bar_bg: [0.15, 0.15, 0.18, 1.0],
             url_bar_border: [0.3, 0.3, 0.35, 1.0],
             separator: [0.25, 0.25, 0.28, 1.0],

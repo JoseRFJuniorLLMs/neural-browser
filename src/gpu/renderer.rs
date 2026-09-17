@@ -37,6 +37,10 @@ pub struct RenderContext<'a> {
     pub scale_factor: f32,
     /// Currently focused form input (if any)
     pub focused_input: Option<&'a super::FocusedInput>,
+    /// URL-bar autocomplete rows, drawn below the toolbar while editing.
+    pub url_suggestions: &'a [super::UrlSuggestion],
+    /// Index of the highlighted suggestion, if any.
+    pub suggestion_idx: Option<usize>,
 }
 
 /// Vertex for image quad rendering.
@@ -90,6 +94,30 @@ struct CachedTexture {
 
 /// Toolbar height in pixels (navbar with buttons + URL bar).
 pub const TOOLBAR_HEIGHT: f32 = 90.0;
+
+/// Height of one URL-bar suggestion row, in unscaled pixels.
+pub const SUGGESTION_ROW_HEIGHT: f32 = 38.0;
+
+/// Horizontal extent of the suggestion list: (x, width) in physical pixels.
+///
+/// Shared by the renderer and the click handler so the drawn rows and the
+/// clickable rows cannot drift apart. Mirrors the pill URL bar's geometry.
+pub fn suggestion_list_bounds(window_width: f32, sf: f32) -> (f32, f32) {
+    let nav_btn_size: f32 = 44.0 * sf;
+    let btn_gap: f32 = 6.0 * sf;
+    let back_x: f32 = 16.0 * sf;
+    let fwd_x = back_x + nav_btn_size + btn_gap;
+    let ref_x = fwd_x + nav_btn_size + btn_gap;
+    let eva_btn_w: f32 = 80.0 * sf;
+    let eva_btn_x = window_width - eva_btn_w - 14.0 * sf;
+    let nav_zone_end = ref_x + nav_btn_size + 16.0 * sf;
+    let eva_zone_start = eva_btn_x - 16.0 * sf;
+    let available = eva_zone_start - nav_zone_end;
+    let pill_max_w: f32 = 720.0 * sf;
+    let pill_w = available.min(pill_max_w).max(240.0 * sf);
+    let pill_x = nav_zone_end + (available - pill_w) / 2.0;
+    (pill_x, pill_w)
+}
 
 /// Status bar height in pixels.
 pub const STATUS_BAR_HEIGHT: f32 = 28.0;
@@ -1016,6 +1044,72 @@ impl WgpuRenderer {
             },
             url_color,
         ));
+
+        // ═══ URL-BAR SUGGESTION LIST ═══
+        // Drawn below the toolbar while the URL bar is being edited. Geometry
+        // comes from `suggestion_list_bounds` so the rows drawn here are exactly
+        // the rows the click handler tests against.
+        if ctx.url_editing && !ctx.url_suggestions.is_empty() {
+            let (list_x, list_w) = suggestion_list_bounds(wf, sf);
+            let row_h = SUGGESTION_ROW_HEIGHT * sf;
+            let list_h = row_h * ctx.url_suggestions.len() as f32;
+            let list_y = tb;
+
+            // Panel background and a soft drop shadow beneath it.
+            rect_vertices.extend_from_slice(&self.build_rect(
+                list_x, list_y, list_w, list_h, [0.97, 0.97, 0.98, 1.0],
+            ));
+            rect_vertices.extend_from_slice(&self.build_rect(
+                list_x, list_y + list_h, list_w, 3.0 * sf, [0.0, 0.0, 0.0, 0.18],
+            ));
+
+            for (i, suggestion) in ctx.url_suggestions.iter().enumerate() {
+                let row_y = list_y + row_h * i as f32;
+
+                if ctx.suggestion_idx == Some(i) {
+                    rect_vertices.extend_from_slice(&self.build_rect(
+                        list_x, row_y, list_w, row_h, [0.84, 0.89, 0.97, 1.0],
+                    ));
+                } else if i > 0 {
+                    // Hairline separator between rows.
+                    rect_vertices.extend_from_slice(&self.build_rect(
+                        list_x + 12.0 * sf, row_y, list_w - 24.0 * sf, 1.0, [0.0, 0.0, 0.0, 0.07],
+                    ));
+                }
+
+                // A clock marks rows recalled from the history database; a
+                // magnifier marks URLs visited in this session.
+                let icon = if suggestion.semantic { "\u{1F550}" } else { "\u{1F50D}" };
+                let label = if suggestion.title.is_empty() {
+                    format!("{}  {}", icon, suggestion.url)
+                } else {
+                    format!("{}  {}  —  {}", icon, suggestion.title, suggestion.url)
+                };
+
+                let mut row_buf = GlyphonBuffer::new(
+                    &mut self.font_system,
+                    Metrics::new(16.0 * sf, 20.0 * sf),
+                );
+                row_buf.set_size(&mut self.font_system, Some(list_w - 28.0 * sf), Some(row_h));
+                row_buf.set_text(
+                    &mut self.font_system, &label,
+                    Attrs::new().family(Family::SansSerif).weight(Weight::NORMAL),
+                    Shaping::Advanced,
+                );
+                row_buf.shape_until_scroll(&mut self.font_system, false);
+                buffers.push((
+                    row_buf, list_x + 14.0 * sf, row_y + 9.0 * sf,
+                    TextBounds {
+                        left: list_x as i32,
+                        top: row_y as i32,
+                        right: (list_x + list_w) as i32,
+                        bottom: (row_y + row_h) as i32,
+                    },
+                    GlyphonColor::rgb(45, 45, 58),
+                ));
+            }
+        }
+
 
         // Loading indicator (scaled)
         if ctx.loading {

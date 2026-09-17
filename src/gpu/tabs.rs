@@ -9,6 +9,10 @@ use crate::npu::ContentBlock;
 pub type TabId = u32;
 
 /// A single browser tab.
+///
+/// A tab owns its navigation history as well as its view state, so
+/// switching tabs restores exactly where that tab was — including what
+/// Back and Forward mean there.
 #[derive(Debug)]
 pub struct Tab {
     pub id: TabId,
@@ -17,6 +21,12 @@ pub struct Tab {
     pub content: Vec<ContentBlock>,
     pub scroll_y: f32,
     pub loading: bool,
+    /// Every URL this tab has shown, oldest first.
+    pub history: Vec<String>,
+    /// Index into `history` of the page currently shown.
+    pub history_idx: usize,
+    /// Flattened page text kept for the AI panel's context.
+    pub page_text: String,
 }
 
 impl Tab {
@@ -28,6 +38,57 @@ impl Tab {
             content: Vec::new(),
             scroll_y: 0.0,
             loading: false,
+            history: Vec::new(),
+            history_idx: 0,
+            page_text: String::new(),
+        }
+    }
+
+    /// Record a newly opened URL, discarding any forward entries.
+    pub fn push_history(&mut self, url: &str) {
+        if !self.history.is_empty() && self.history_idx + 1 < self.history.len() {
+            self.history.truncate(self.history_idx + 1);
+        }
+        self.history.push(url.to_string());
+        self.history_idx = self.history.len() - 1;
+    }
+
+    /// Whether Back has somewhere to go.
+    pub fn can_go_back(&self) -> bool {
+        self.history_idx > 0
+    }
+
+    /// Whether Forward has somewhere to go.
+    pub fn can_go_forward(&self) -> bool {
+        self.history_idx + 1 < self.history.len()
+    }
+
+    /// Step back one entry and return the URL to load.
+    pub fn go_back(&mut self) -> Option<String> {
+        if !self.can_go_back() {
+            return None;
+        }
+        self.history_idx -= 1;
+        self.history.get(self.history_idx).cloned()
+    }
+
+    /// Step forward one entry and return the URL to load.
+    pub fn go_forward(&mut self) -> Option<String> {
+        if !self.can_go_forward() {
+            return None;
+        }
+        self.history_idx += 1;
+        self.history.get(self.history_idx).cloned()
+    }
+
+    /// Short label for the tab strip.
+    pub fn display_title(&self) -> &str {
+        if !self.title.is_empty() && self.title != "New Tab" {
+            &self.title
+        } else if !self.url.is_empty() {
+            &self.url
+        } else {
+            "New Tab"
         }
     }
 }
@@ -133,6 +194,21 @@ impl TabManager {
     /// Iterator over all tabs.
     pub fn tabs(&self) -> &[Tab] {
         &self.tabs
+    }
+
+    /// Index of the active tab.
+    pub fn active_index(&self) -> usize {
+        self.active_index
+    }
+
+    /// Switch to the tab at `index`, if it exists.
+    pub fn switch_to_index(&mut self, index: usize) -> bool {
+        if index < self.tabs.len() {
+            self.active_index = index;
+            true
+        } else {
+            false
+        }
     }
 }
 

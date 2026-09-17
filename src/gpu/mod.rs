@@ -21,8 +21,8 @@ use crate::ui::Theme;
 use crate::PipelineMsg;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
-use log::{info, error};
-use std::collections::{HashMap, HashSet};
+use log::{info, error, warn};
+use std::collections::{HashMap, HashSet, VecDeque};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -100,7 +100,40 @@ struct GpuApp {
     pending_image_urls: HashSet<String>,
     // Currently focused form input field
     focused_input: Option<FocusedInput>,
+    // Open tabs. The fields above (content, scroll_y, history, url_bar…)
+    // hold the ACTIVE tab's live state; the others are parked in here and
+    // swapped in and out on every tab switch.
+    tabs: tabs::TabManager,
+    // URL-bar autocomplete: local history matches, then semantic matches
+    // from the history database as they arrive.
+    url_suggestions: Vec<UrlSuggestion>,
+    // Index of the highlighted suggestion, if the user has arrowed into the list.
+    suggestion_idx: Option<usize>,
+    // Last query sent to the history database, to avoid re-asking per keystroke.
+    last_history_query: String,
+    // Outbound messages to the CPU thread, drained without ever blocking.
+    // The GPU runs on the main thread: a blocking send here freezes the window.
+    outbox_ui: VecDeque<PipelineMsg>,
+    outbox_eva: VecDeque<PipelineMsg>,
 }
+
+/// One row in the URL-bar autocomplete list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UrlSuggestion {
+    pub url: String,
+    /// Page title when known, empty for a plain history URL.
+    pub title: String,
+    /// True when this came from the semantic history database rather than
+    /// from URLs visited in this session.
+    pub semantic: bool,
+}
+
+/// Most suggestions shown at once.
+const MAX_SUGGESTIONS: usize = 6;
+
+/// Shortest input that triggers a history-database lookup. Below this the
+/// query matches almost everything and is not worth a round trip.
+const MIN_SEMANTIC_QUERY: usize = 3;
 
 impl GpuApp {
     fn new(
@@ -110,7 +143,10 @@ impl GpuApp {
         eva_resp_rx: Receiver<PipelineMsg>,
         img_rx: Receiver<PipelineMsg>,
     ) -> Self {
-        let start_url = "https://www.google.com/search?udm=14".to_string();
+        // Must match what the CPU thread actually loads first, or the URL bar
+        // and the back stack start out describing a page that was never opened.
+        let start_url = std::env::args().nth(1)
+            .unwrap_or_else(|| crate::cpu::start_page::START_PAGE_URL.to_string());
         let mut visited = HashSet::new();
         visited.insert(start_url.clone());
         Self {
@@ -147,6 +183,282 @@ impl GpuApp {
             img_rx,
             pending_image_urls: HashSet::new(),
             focused_input: None,
+            tabs: tabs::TabManager::new(),
+            url_suggestions: Vec::new(),
+            suggestion_idx: None,
+            last_history_query: String::new(),
+            outbox_ui: VecDeque::new(),
+            outbox_eva: VecDeque::new(),
+        }
+    }
+
+    /// Maximum queued outbound messages before the oldest are dropped.
+    /// Guards against unbounded growth if the CPU thread stalls for a long time.
+    const MAX_OUTBOX: usize = 256;
+
+    /// Queue a message for the CPU thread and try to flush immediately.
+    ///
+    /// Never blocks: the GPU owns the main thread, so a blocking `send` on a
+    /// full channel freezes the window (no repaint, no input) until the CPU
+    /// thread catches up — and can deadlock outright, because the CPU thread
+    /// may itself be blocked sending into the NPU->GPU leg of the pipeline.
+    fn queue_to_cpu(&mut self, msg: PipelineMsg) {
+        if self.outbox_ui.len() >= Self::MAX_OUTBOX {
+            self.outbox_ui.pop_front();
+            warn!("[GPU] Outbox full, dropping oldest request");
+        }
+        self.outbox_ui.push_back(msg);
+        self.flush_outbox();
+    }
+
+    /// Queue a message for the AI channel and try to flush immediately.
+    fn queue_to_eva(&mut self, msg: PipelineMsg) {
+        if self.outbox_eva.len() >= Self::MAX_OUTBOX {
+            self.outbox_eva.pop_front();
+            warn!("[GPU] AI outbox full, dropping oldest request");
+        }
+        self.outbox_eva.push_back(msg);
+        self.flush_outbox();
+    }
+
+    /// Copy the live view state into the active tab's slot.
+    /// Called before the active tab changes, so nothing is lost on a switch.
+    fn save_active_tab(&mut self) {
+        let url_bar = self.url_bar.clone();
+        let page_text = self.page_text_cache.clone();
+        let content = std::mem::take(&mut self.content);
+        let history = std::mem::take(&mut self.history);
+        let title = self.window.as_ref()
+            .and_then(|w| w.title().split(" — Neural Browser").next().map(|s| s.to_string()))
+            .unwrap_or_else(|| url_bar.clone());
+        let (scroll_y, history_idx, loading) = (self.scroll_y, self.history_idx, self.loading);
+
+        let tab = self.tabs.active_tab_mut();
+        tab.url = url_bar;
+        tab.title = title;
+        tab.content = content;
+        tab.scroll_y = scroll_y;
+        tab.loading = loading;
+        tab.history = history;
+        tab.history_idx = history_idx;
+        tab.page_text = page_text;
+    }
+
+    /// Load the active tab's stored state into the live view fields.
+    fn load_active_tab(&mut self) {
+        let (url, content, scroll_y, loading, history, history_idx, page_text, title) = {
+            let tab = self.tabs.active_tab();
+            (
+                tab.url.clone(),
+                tab.content.clone(),
+                tab.scroll_y,
+                tab.loading,
+                tab.history.clone(),
+                tab.history_idx,
+                tab.page_text.clone(),
+                tab.display_title().to_string(),
+            )
+        };
+        self.url_bar = url;
+        self.content = content;
+        self.scroll_y = scroll_y;
+        self.loading = loading;
+        self.history = history;
+        self.history_idx = history_idx;
+        self.page_text_cache = page_text;
+        self.close_url_editing();
+        self.focused_input = None;
+        self.layout_dirty = true;
+        self.pending_image_urls.clear();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.clear_texture_cache();
+        }
+        if let Some(window) = &self.window {
+            window.set_title(&format!("{title} — Neural Browser"));
+        }
+        self.request_redraw();
+    }
+
+    /// Open a new tab showing the start page.
+    fn new_tab(&mut self) {
+        self.save_active_tab();
+        let id = self.tabs.new_tab();
+        info!("[UI] New tab {id}");
+        self.load_active_tab();
+        let start = crate::cpu::start_page::START_PAGE_URL.to_string();
+        self.navigate(&start);
+    }
+
+    /// Close the active tab. Returns false when it was the only one left,
+    /// which the caller treats as "close the window" like other browsers do.
+    fn close_active_tab(&mut self) -> bool {
+        if self.tabs.tab_count() <= 1 {
+            return false;
+        }
+        // The outgoing tab is discarded, so its live state needs no saving.
+        self.tabs.close_active();
+        info!("[UI] Tab closed, {} left", self.tabs.tab_count());
+        self.load_active_tab();
+        true
+    }
+
+    /// Switch to another tab by index, saving the current one first.
+    fn switch_tab(&mut self, index: usize) {
+        if index == self.tabs.active_index() || index >= self.tabs.tab_count() {
+            return;
+        }
+        self.save_active_tab();
+        self.tabs.switch_to_index(index);
+        info!("[UI] Switched to tab {}", index + 1);
+        self.load_active_tab();
+    }
+
+    /// Switch to the next (`delta` = 1) or previous (`delta` = -1) tab.
+    fn cycle_tab(&mut self, delta: i32) {
+        let count = self.tabs.tab_count();
+        if count <= 1 {
+            return;
+        }
+        let current = self.tabs.active_index() as i32;
+        let next = (current + delta).rem_euclid(count as i32) as usize;
+        self.switch_tab(next);
+    }
+
+    /// Rebuild the URL-bar suggestion list from what the user has typed.
+    ///
+    /// Local matches (URLs visited in this session) are computed instantly and
+    /// shown right away; a semantic lookup against the history database is sent
+    /// off in parallel and merged in when it answers.
+    fn update_suggestions(&mut self) {
+        let query = self.url_input.trim().to_lowercase();
+        self.suggestion_idx = None;
+
+        if query.is_empty() {
+            self.url_suggestions.clear();
+            self.last_history_query.clear();
+            return;
+        }
+
+        // Keep any semantic rows already received for this same query so the
+        // list does not flicker while the user keeps typing.
+        let kept: Vec<UrlSuggestion> = if self.last_history_query == query {
+            self.url_suggestions.iter().filter(|s| s.semantic).cloned().collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut out: Vec<UrlSuggestion> = Vec::new();
+
+        // Session history, most recent first.
+        for url in self.history.iter().rev() {
+            if out.len() >= MAX_SUGGESTIONS {
+                break;
+            }
+            if url.to_lowercase().contains(&query) && !out.iter().any(|s| s.url == *url) {
+                out.push(UrlSuggestion { url: url.clone(), title: String::new(), semantic: false });
+            }
+        }
+
+        // Everything else visited this session.
+        for url in &self.visited_urls {
+            if out.len() >= MAX_SUGGESTIONS {
+                break;
+            }
+            if url.to_lowercase().contains(&query) && !out.iter().any(|s| s.url == *url) {
+                out.push(UrlSuggestion { url: url.clone(), title: String::new(), semantic: false });
+            }
+        }
+
+        for s in kept {
+            if out.len() >= MAX_SUGGESTIONS {
+                break;
+            }
+            if !out.iter().any(|e| e.url == s.url) {
+                out.push(s);
+            }
+        }
+
+        self.url_suggestions = out;
+
+        // Ask the history database once per distinct query.
+        if query.chars().count() >= MIN_SEMANTIC_QUERY && self.last_history_query != query {
+            self.last_history_query = query.clone();
+            self.queue_to_cpu(PipelineMsg::HistoryQuery { query });
+        }
+    }
+
+    /// Merge semantic history matches into the suggestion list.
+    /// Results for a query the user has already moved on from are discarded.
+    fn apply_history_results(&mut self, query: &str, items: Vec<(String, String)>) {
+        if !self.url_editing || self.last_history_query != query {
+            return;
+        }
+        for (url, title) in items {
+            if self.url_suggestions.len() >= MAX_SUGGESTIONS {
+                break;
+            }
+            if url.is_empty() || self.url_suggestions.iter().any(|s| s.url == url) {
+                continue;
+            }
+            self.url_suggestions.push(UrlSuggestion { url, title, semantic: true });
+        }
+    }
+
+    /// Leave URL editing and drop the suggestion list.
+    fn close_url_editing(&mut self) {
+        self.url_editing = false;
+        self.url_suggestions.clear();
+        self.suggestion_idx = None;
+        self.last_history_query.clear();
+    }
+
+    /// Move the suggestion highlight. `delta` is +1 for down, -1 for up.
+    /// Stepping past either end returns to the typed text.
+    fn move_suggestion(&mut self, delta: i32) {
+        let len = self.url_suggestions.len();
+        if len == 0 {
+            return;
+        }
+        self.suggestion_idx = match self.suggestion_idx {
+            None if delta > 0 => Some(0),
+            None => Some(len - 1),
+            Some(i) => {
+                let next = i as i32 + delta;
+                if next < 0 || next >= len as i32 { None } else { Some(next as usize) }
+            }
+        };
+    }
+
+    /// The URL to open on Enter: the highlighted suggestion, else what was typed.
+    fn chosen_url(&self) -> String {
+        match self.suggestion_idx.and_then(|i| self.url_suggestions.get(i)) {
+            Some(s) => s.url.clone(),
+            None => self.url_input.clone(),
+        }
+    }
+
+    /// Drain both outboxes with non-blocking sends, stopping at the first
+    /// full channel so message order is preserved for the next attempt.
+    fn flush_outbox(&mut self) {
+        while let Some(msg) = self.outbox_ui.front() {
+            match self.ui_tx.try_send(msg.clone()) {
+                Ok(()) => { self.outbox_ui.pop_front(); }
+                Err(crossbeam_channel::TrySendError::Full(_)) => break,
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    self.outbox_ui.clear();
+                    break;
+                }
+            }
+        }
+        while let Some(msg) = self.outbox_eva.front() {
+            match self.eva_tx.try_send(msg.clone()) {
+                Ok(()) => { self.outbox_eva.pop_front(); }
+                Err(crossbeam_channel::TrySendError::Full(_)) => break,
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    self.outbox_eva.clear();
+                    break;
+                }
+            }
         }
     }
 
@@ -236,7 +548,7 @@ impl GpuApp {
                 if block.image_data.is_none() && !self.pending_image_urls.contains(src)
                     && !src.is_empty() && (src.starts_with("http://") || src.starts_with("https://")) {
                         self.pending_image_urls.insert(src.clone());
-                        let _ = self.ui_tx.send(PipelineMsg::FetchImage { url: src.clone() });
+                        self.queue_to_cpu(PipelineMsg::FetchImage { url: src.clone() });
                         info!("[GPU] Requested image fetch: {src}");
                     }
             }
@@ -246,7 +558,7 @@ impl GpuApp {
                     if child.image_data.is_none() && !self.pending_image_urls.contains(src)
                         && !src.is_empty() && (src.starts_with("http://") || src.starts_with("https://")) {
                             self.pending_image_urls.insert(src.clone());
-                            let _ = self.ui_tx.send(PipelineMsg::FetchImage { url: src.clone() });
+                            self.queue_to_cpu(PipelineMsg::FetchImage { url: src.clone() });
                             info!("[GPU] Requested image fetch: {src}");
                         }
                 }
@@ -258,6 +570,12 @@ impl GpuApp {
     fn check_image_messages(&mut self) -> bool {
         let mut got_image = false;
         while let Ok(msg) = self.img_rx.try_recv() {
+            if let PipelineMsg::HistoryResults { query, items } = msg {
+                info!("[GPU] {} history matches for '{}'", items.len(), query);
+                self.apply_history_results(&query, items);
+                got_image = true;
+                continue;
+            }
             if let PipelineMsg::ImageData { url, data } = msg {
                 info!("[GPU] Received image data: {} ({} bytes)", url, data.len());
                 self.pending_image_urls.remove(&url);
@@ -277,7 +595,7 @@ impl GpuApp {
         self.eva_panel.add_user_message(message.clone());
         self.eva_panel.set_loading(true);
         let context = format!("URL: {}\n\n{}", self.url_bar, self.page_text_cache);
-        let _ = self.eva_tx.send(PipelineMsg::EvaQuery {
+        self.queue_to_eva(PipelineMsg::EvaQuery {
             message,
             page_context: context,
             provider,
@@ -293,7 +611,7 @@ impl GpuApp {
         self.eva_panel.visible = true;
         self.eva_panel.add_user_message(format!("Summarize this page [{}]", provider.name()));
         self.eva_panel.set_loading(true);
-        let _ = self.eva_tx.send(PipelineMsg::EvaSummarize {
+        self.queue_to_eva(PipelineMsg::EvaSummarize {
             content: self.page_text_cache.clone(),
             provider,
         });
@@ -306,7 +624,7 @@ impl GpuApp {
             .find(|m| m.role == crate::eva::panel::Role::Ai)
             .map(|m| m.text.clone());
         if let Some(text) = last_text {
-            let _ = self.eva_tx.send(PipelineMsg::EvaVoice { text });
+            self.queue_to_eva(PipelineMsg::EvaVoice { text });
         }
     }
 
@@ -389,7 +707,7 @@ impl GpuApp {
         self.eva_panel.visible = true;
         self.eva_panel.add_user_message(format!("Translate page to {target_lang}"));
         self.eva_panel.set_loading(true);
-        let _ = self.eva_tx.send(PipelineMsg::TranslatePage {
+        self.queue_to_eva(PipelineMsg::TranslatePage {
             content: self.page_text_cache.clone(),
             target_lang: target_lang.to_string(),
             provider,
@@ -407,7 +725,7 @@ impl GpuApp {
         }
         self.insights_sent_for_url = Some(self.url_bar.clone());
         let provider = self.eva_panel.provider;
-        let _ = self.eva_tx.send(PipelineMsg::ProactiveInsights {
+        self.queue_to_eva(PipelineMsg::ProactiveInsights {
             content: self.page_text_cache.clone(),
             provider,
         });
@@ -427,7 +745,7 @@ impl GpuApp {
             self.eva_panel.visible = true;
             self.eva_panel.add_user_message(format!("🔍 {input}"));
             self.eva_panel.set_loading(true);
-            let _ = self.eva_tx.send(PipelineMsg::SmartSearch {
+            self.queue_to_eva(PipelineMsg::SmartSearch {
                 query: input.to_string(),
                 provider,
             });
@@ -442,7 +760,7 @@ impl GpuApp {
         self.loading_ticks = 0;
         self.scroll_y = 0.0; // Reset scroll position for new page
         self.url_bar = url.clone();
-        self.url_editing = false;
+        self.close_url_editing();
         self.focused_input = None;
         self.visited_urls.insert(url.clone());
 
@@ -454,26 +772,55 @@ impl GpuApp {
         self.history_idx = self.history.len() - 1;
 
         self.layout_dirty = true;
-        let _ = self.ui_tx.send(PipelineMsg::Navigate(url));
+        self.queue_to_cpu(PipelineMsg::Navigate(url));
         self.request_redraw();
     }
 
+    /// Load a URL without touching history — used by Back and Forward,
+    /// which move within the existing history rather than extending it.
+    fn load_without_history(&mut self, url: &str) {
+        self.loading = true;
+        self.loading_ticks = 0;
+        self.scroll_y = 0.0;
+        self.url_bar = url.to_string();
+        self.close_url_editing();
+        self.focused_input = None;
+        self.layout_dirty = true;
+        self.queue_to_cpu(PipelineMsg::Navigate(url.to_string()));
+        self.request_redraw();
+    }
+
+    /// Go back in THIS tab's history.
+    ///
+    /// History lives here rather than on the CPU thread: with several tabs
+    /// open, a single shared back stack would mix their journeys together.
     fn go_back(&mut self) {
-        info!("[UI] Requesting back navigation");
-        self.loading = true;
-        self.loading_ticks = 0;
-        self.layout_dirty = true;
-        let _ = self.ui_tx.send(PipelineMsg::Back);
-        self.request_redraw();
+        if self.history_idx == 0 {
+            info!("[UI] No back history in this tab");
+            return;
+        }
+        self.history_idx -= 1;
+        let url = match self.history.get(self.history_idx) {
+            Some(u) => u.clone(),
+            None => return,
+        };
+        info!("[UI] Back to: {url}");
+        self.load_without_history(&url);
     }
 
+    /// Go forward in THIS tab's history.
     fn go_forward(&mut self) {
-        info!("[UI] Requesting forward navigation");
-        self.loading = true;
-        self.loading_ticks = 0;
-        self.layout_dirty = true;
-        let _ = self.ui_tx.send(PipelineMsg::Forward);
-        self.request_redraw();
+        if self.history_idx + 1 >= self.history.len() {
+            info!("[UI] No forward history in this tab");
+            return;
+        }
+        self.history_idx += 1;
+        let url = match self.history.get(self.history_idx) {
+            Some(u) => u.clone(),
+            None => return,
+        };
+        info!("[UI] Forward to: {url}");
+        self.load_without_history(&url);
     }
 
     fn request_redraw(&self) {
@@ -703,6 +1050,8 @@ impl ApplicationHandler for GpuApp {
                     eva_visible: self.eva_panel.visible,
                     scale_factor: self.scale_factor as f32,
                     focused_input: self.focused_input.as_ref(),
+                    url_suggestions: &self.url_suggestions,
+                    suggestion_idx: self.suggestion_idx,
                 };
                 // Apply scroll offset to get viewport-space positions
                 let scrolled = self.scrolled_layout();
@@ -749,6 +1098,29 @@ impl ApplicationHandler for GpuApp {
                     let phys_mx = self.mouse_x * sf;
                     let phys_my = self.mouse_y * sf;
                     let scaled_tb = renderer::TOOLBAR_HEIGHT * sf;
+                    // A click on an open suggestion row opens that page. The list
+                    // hangs below the toolbar, so this is tested before both the
+                    // toolbar buttons and the page hit test.
+                    if self.url_editing && !self.url_suggestions.is_empty() {
+                        let wf = self.renderer.as_ref()
+                            .map(|r| r.size().0 as f32).unwrap_or(1200.0);
+                        let (list_x, list_w) = renderer::suggestion_list_bounds(wf, sf);
+                        let row_h = renderer::SUGGESTION_ROW_HEIGHT * sf;
+                        let list_top = scaled_tb;
+                        let rows = self.url_suggestions.len() as f32;
+                        if phys_mx >= list_x && phys_mx < list_x + list_w
+                            && phys_my >= list_top && phys_my < list_top + rows * row_h
+                        {
+                            let idx = ((phys_my - list_top) / row_h) as usize;
+                            if let Some(s) = self.url_suggestions.get(idx) {
+                                let url = s.url.clone();
+                                info!("[UI] Suggestion clicked: {url}");
+                                self.navigate(&url);
+                            }
+                            self.request_redraw();
+                            return;
+                        }
+                    }
                     if phys_my < scaled_tb {
                         let wf = self.renderer.as_ref()
                             .map(|r| r.size().0 as f32).unwrap_or(1200.0);
@@ -783,22 +1155,18 @@ impl ApplicationHandler for GpuApp {
                                 return;
                             }
                             if mx >= back_x && mx < back_x + btn_w {
-                                let _ = self.ui_tx.send(PipelineMsg::Back);
-                                self.loading = true;
-                                self.request_redraw();
+                                self.go_back();
                                 return;
                             }
                             if mx >= fwd_x && mx < fwd_x + btn_w {
-                                let _ = self.ui_tx.send(PipelineMsg::Forward);
-                                self.loading = true;
-                                self.request_redraw();
+                                self.go_forward();
                                 return;
                             }
                             if mx >= ref_x && mx < ref_x + btn_w {
                                 // Refresh: use current URL bar (not history.last())
                                 let url = self.url_bar.clone();
                                 if !url.is_empty() {
-                                    let _ = self.ui_tx.send(PipelineMsg::Navigate(url));
+                                    self.queue_to_cpu(PipelineMsg::Navigate(url));
                                     self.loading = true;
                                 }
                                 self.request_redraw();
@@ -810,6 +1178,7 @@ impl ApplicationHandler for GpuApp {
                             self.url_editing = true;
                             // Pre-fill with current URL so user can edit in-place
                             self.url_input = self.url_bar.clone();
+                            self.update_suggestions();
                         }
                         self.request_redraw();
                         return;
@@ -1195,6 +1564,7 @@ impl ApplicationHandler for GpuApp {
                     Key::Named(NamedKey::F6) => {
                         self.url_editing = true;
                         self.url_input.clear();
+                        self.update_suggestions();
                         self.request_redraw();
                     }
                     // Alt+Left = Back
@@ -1205,17 +1575,21 @@ impl ApplicationHandler for GpuApp {
                     Key::Named(NamedKey::ArrowRight) if alt => {
                         self.go_forward();
                     }
-                    // Escape = cancel URL editing
+                    // Escape = drop the suggestion highlight, then cancel editing
                     Key::Named(NamedKey::Escape) => {
                         if self.url_editing {
-                            self.url_editing = false;
+                            if self.suggestion_idx.is_some() {
+                                self.suggestion_idx = None;
+                            } else {
+                                self.close_url_editing();
+                            }
                             self.request_redraw();
                         }
                     }
-                    // Enter = navigate to typed URL
+                    // Enter = open the highlighted suggestion, or the typed URL
                     Key::Named(NamedKey::Enter) => {
                         if self.url_editing {
-                            let url = self.url_input.clone();
+                            let url = self.chosen_url();
                             self.navigate(&url);
                         }
                     }
@@ -1233,6 +1607,7 @@ impl ApplicationHandler for GpuApp {
                             } else {
                                 self.url_input.pop();
                             }
+                            self.update_suggestions();
                             self.request_redraw();
                         }
                     }
@@ -1242,6 +1617,7 @@ impl ApplicationHandler for GpuApp {
                         if ctrl && ch.as_str() == "l" {
                             self.url_editing = true;
                             self.url_input.clear();
+                            self.update_suggestions();
                             self.request_redraw();
                             return;
                         }
@@ -1271,6 +1647,7 @@ impl ApplicationHandler for GpuApp {
                                         // Sanitize: strip newlines/tabs from pasted URLs
                                         let sanitized = text.replace(['\n', '\r', '\t'], "");
                                         self.url_input.push_str(&sanitized);
+                                        self.update_suggestions();
                                         self.request_redraw();
                                     }
                                 }
@@ -1305,6 +1682,7 @@ impl ApplicationHandler for GpuApp {
 
                         if self.url_editing && !ctrl {
                             self.url_input.push_str(ch.as_str());
+                            self.update_suggestions();
                             self.request_redraw();
                         }
                     }
@@ -1350,6 +1728,15 @@ impl ApplicationHandler for GpuApp {
                                 Some(winit::window::Fullscreen::Borderless(None))
                             });
                         }
+                    }
+                    // Arrow keys walk the URL-bar suggestions while editing
+                    Key::Named(NamedKey::ArrowDown) if self.url_editing => {
+                        self.move_suggestion(1);
+                        self.request_redraw();
+                    }
+                    Key::Named(NamedKey::ArrowUp) if self.url_editing => {
+                        self.move_suggestion(-1);
+                        self.request_redraw();
                     }
                     // Arrow key scrolling (when not editing URL and not Alt)
                     Key::Named(NamedKey::ArrowDown) if !alt && !self.url_editing => {
@@ -1401,6 +1788,11 @@ impl ApplicationHandler for GpuApp {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         let mut needs_redraw = false;
+        // Retry anything the CPU channels were too full to accept earlier.
+        self.flush_outbox();
+        if !self.outbox_ui.is_empty() || !self.outbox_eva.is_empty() {
+            needs_redraw = true;
+        }
         if self.check_npu_messages() {
             needs_redraw = true;
         }
@@ -1561,8 +1953,13 @@ mod tests {
 
     #[test]
     fn test_search_query_with_spaces() {
+        // Searches go to DuckDuckGo's HTML endpoint, which renders without
+        // JavaScript; Google's results page does not.
         let result = normalize_url_input("rust web browser");
-        assert!(result.starts_with("https://www.google.com/search?q=rust"));
+        assert!(
+            result.starts_with("https://html.duckduckgo.com/html/?q=rust"),
+            "got: {result}"
+        );
         assert!(result.contains("web"));
     }
 
@@ -1592,7 +1989,10 @@ mod tests {
     #[test]
     fn test_single_word_searches() {
         let result = normalize_url_input("rust");
-        assert!(result.starts_with("https://www.google.com/search?q=rust"));
+        assert!(
+            result.starts_with("https://html.duckduckgo.com/html/?q=rust"),
+            "got: {result}"
+        );
     }
 
     #[test]

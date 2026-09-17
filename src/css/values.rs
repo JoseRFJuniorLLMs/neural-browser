@@ -47,6 +47,12 @@ impl CssColor {
     /// Parse a hex color: #RGB, #RRGGBB, #RGBA, #RRGGBBAA
     pub fn from_hex(hex: &str) -> Option<Self> {
         let hex = hex.trim_start_matches('#');
+        // The arms below slice by byte offset, which panics mid-codepoint on
+        // multi-byte input. Any site can ship `color: #çãé`, so reject
+        // non-ASCII before slicing rather than crashing the browser on it.
+        if !hex.is_ascii() {
+            return None;
+        }
         match hex.len() {
             3 => {
                 let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
@@ -805,5 +811,22 @@ mod tests {
         let c = CssColor::from_hex("#ff000080").unwrap();
         assert_eq!(c.r, 1.0);
         assert!((c.a - 128.0/255.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn non_ascii_hex_color_is_rejected_not_panicking() {
+        // Byte-offset slicing used to panic mid-codepoint on input like this.
+        assert!(CssColor::from_hex("#ção").is_none());
+        assert!(CssColor::from_hex("#çã").is_none());
+        assert!(CssColor::from_hex("#ãbcdef").is_none());
+        assert!(CssColor::from_hex("#日本語").is_none());
+    }
+
+    #[test]
+    fn valid_hex_colors_still_parse() {
+        let c = CssColor::from_hex("#ff0000").unwrap();
+        assert!((c.r - 1.0).abs() < 1e-6 && c.g == 0.0 && c.b == 0.0);
+        let s = CssColor::from_hex("#f00").unwrap();
+        assert!((s.r - 1.0).abs() < 1e-6);
     }
 }

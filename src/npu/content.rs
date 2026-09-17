@@ -80,7 +80,11 @@ pub struct ContentBlock {
     /// Children blocks (for nested structures like lists).
     pub children: Vec<ContentBlock>,
     /// Decoded image data: (width, height, RGBA bytes). Populated by NPU image fetcher.
-    pub image_data: Option<(u32, u32, Vec<u8>)>,
+    ///
+    /// Behind an `Arc` because `ContentBlock` is cloned on every layout pass
+    /// (resize, zoom, reading-mode toggle) and a full-page image is several
+    /// megabytes of pixels per copy.
+    pub image_data: Option<(u32, u32, std::sync::Arc<Vec<u8>>)>,
     /// DOM node ID this block was extracted from (for CSS style mapping).
     pub node_id: Option<usize>,
     /// CSS computed style from the cascade engine (attached by NPU).

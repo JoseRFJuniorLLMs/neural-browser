@@ -230,7 +230,7 @@ impl NpuEngine {
         &self,
         src: &str,
         base_url: &Option<url::Url>,
-    ) -> Option<(u32, u32, Vec<u8>)> {
+    ) -> Option<(u32, u32, std::sync::Arc<Vec<u8>>)> {
         // Skip data URIs and empty sources
         if src.is_empty() || src.starts_with("data:") {
             return None;
@@ -263,7 +263,7 @@ impl NpuEngine {
                 let rgba = img.to_rgba8();
                 let (w, h) = (rgba.width(), rgba.height());
                 info!("[NPU] Decoded image {w}x{h} from {resolved}");
-                Some((w, h, rgba.into_raw()))
+                Some((w, h, std::sync::Arc::new(rgba.into_raw())))
             }
             Err(e) => {
                 warn!("[NPU] Image decode failed for {resolved}: {e}");

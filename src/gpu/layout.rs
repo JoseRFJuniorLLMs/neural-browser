@@ -38,11 +38,15 @@ pub enum LayoutKind {
     },
     /// Image placeholder (text fallback if no pixel data)
     Image { src: String, alt: String },
-    /// Decoded image with RGBA pixel data ready for GPU texture upload
+    /// Decoded image with RGBA pixel data ready for GPU texture upload.
+    ///
+    /// `Arc` rather than `Vec`: layout is recomputed on every resize, zoom
+    /// and content change, and each rebuild used to deep-copy every image's
+    /// pixel buffer into the new boxes.
     DecodedImage {
         width: u32,
         height: u32,
-        rgba: Vec<u8>,
+        rgba: std::sync::Arc<Vec<u8>>,
         alt: String,
     },
     /// Horizontal separator line
@@ -178,6 +182,141 @@ fn css_line_height(block: &ContentBlock, font_size: f32, default_factor: f32) ->
     } else {
         font_size * default_factor
     }
+}
+
+/// Indent applied per list nesting level, in unzoomed pixels.
+const LIST_INDENT: f32 = 24.0;
+
+/// Hard cap on nesting depth, so a pathological document cannot recurse without bound.
+const MAX_LIST_DEPTH: usize = 32;
+
+/// Bullet markers, cycling by depth the way browsers do: disc, circle, square.
+const LIST_MARKERS: [&str; 3] = ["\u{2022}", "\u{25E6}", "\u{25AA}"];
+
+/// Lay out a list and every list nested inside it.
+///
+/// Each level is indented one step further and gets its own marker (or its own
+/// restarting counter, for ordered lists). A nested list attached to an item is
+/// laid out immediately under that item.
+#[allow(clippy::too_many_arguments)]
+fn layout_list(
+    list: &ContentBlock,
+    ordered: bool,
+    depth: usize,
+    cursor_y: &mut f32,
+    layout: &mut Vec<LayoutBox>,
+    margin_x: f32,
+    content_width: f32,
+    theme: &Theme,
+    z: f32,
+) {
+    if depth >= MAX_LIST_DEPTH {
+        return;
+    }
+
+    let indent = LIST_INDENT * z * (depth as f32 + 1.0);
+    let item_x = margin_x + indent;
+    let item_width = (content_width - indent).max(60.0);
+    let mut number = 1usize;
+
+    for child in &list.children {
+        if child.relevance < 0.15 || is_css_hidden(child) {
+            continue;
+        }
+
+        // A list nested directly under the list (rather than under an item):
+        // malformed markup, but common enough that browsers render it.
+        if let BlockKind::List { ordered: nested_ordered } = &child.kind {
+            layout_list(
+                child,
+                *nested_ordered,
+                depth + 1,
+                cursor_y,
+                layout,
+                margin_x,
+                content_width,
+                theme,
+                z,
+            );
+            continue;
+        }
+
+        let font_size = css_font_size(child, 19.0, z);
+        let color = css_color(child, theme.text);
+        let bold = css_bold(child, false);
+        let italic = css_italic(child, false);
+        let line_height = css_line_height(child, font_size, 1.5);
+
+        // An item with no text of its own (a bare wrapper around a nested list)
+        // should not draw an empty bullet.
+        if !child.text.trim().is_empty() {
+            let marker = if ordered {
+                format!("{}. ", number)
+            } else {
+                format!("{}  ", LIST_MARKERS[depth % LIST_MARKERS.len()])
+            };
+            number += 1;
+
+            let text = format!("{marker}{}", child.text);
+            let lines = estimate_lines(&text, item_width, font_size);
+
+            layout.push(LayoutBox {
+                x: item_x,
+                y: *cursor_y,
+                width: item_width,
+                height: lines * line_height,
+                kind: LayoutKind::Text {
+                    text,
+                    font_size,
+                    color,
+                    bold,
+                    italic,
+                    centered: false,
+                },
+                // Keep the link target when the item is a single link, so nested
+                // list entries stay clickable.
+                href: list_item_href(child),
+            });
+            *cursor_y += lines * line_height + 4.0;
+        }
+
+        // Recurse into any lists hanging off this item.
+        for grandchild in &child.children {
+            if let BlockKind::List { ordered: nested_ordered } = &grandchild.kind {
+                layout_list(
+                    grandchild,
+                    *nested_ordered,
+                    depth + 1,
+                    cursor_y,
+                    layout,
+                    margin_x,
+                    content_width,
+                    theme,
+                    z,
+                );
+            }
+        }
+    }
+}
+
+/// The href of a list item that is (or directly wraps) a single link.
+fn list_item_href(item: &ContentBlock) -> Option<String> {
+    if let BlockKind::Link { href } = &item.kind {
+        if !href.is_empty() {
+            return Some(href.clone());
+        }
+    }
+    let links: Vec<&ContentBlock> = item.children.iter()
+        .filter(|c| matches!(c.kind, BlockKind::Link { .. }))
+        .collect();
+    if links.len() == 1 {
+        if let BlockKind::Link { href } = &links[0].kind {
+            if !href.is_empty() {
+                return Some(href.clone());
+            }
+        }
+    }
+    None
 }
 
 /// Compute layout for all content blocks.
@@ -489,70 +628,20 @@ pub fn compute_layout_zoom(
                 }
             }
             BlockKind::List { ordered } => {
-                // Render children (ListItems) with proper numbering
-                for (idx, child) in block.children.iter().enumerate() {
-                    if child.relevance < 0.15 || is_css_hidden(child) {
-                        continue;
-                    }
-                    let font_size = css_font_size(child, 19.0, z);
-                    let color = css_color(child, theme.text);
-                    let bold = css_bold(child, false);
-                    let italic = css_italic(child, false);
-                    let prefix = if *ordered {
-                        format!("{}. {}", idx + 1, child.text)
-                    } else {
-                        format!("\u{2022}  {}", child.text)
-                    };
-                    let lines = estimate_lines(&prefix, content_width - 24.0, font_size);
-                    let line_height = css_line_height(child, font_size, 1.5);
-
-                    layout.push(LayoutBox {
-                        x: margin_x + 24.0,
-                        y: cursor_y,
-                        width: content_width - 24.0,
-                        height: lines * line_height,
-                        kind: LayoutKind::Text {
-                            text: prefix,
-                            font_size,
-                            color,
-                            bold,
-                            italic,
-                            centered: css_is_centered(block),
-                        },
-                        href: None,
-                    });
-                    cursor_y += lines * line_height + 4.0;
-
-                    // Render nested lists
-                    for nested in &child.children {
-                        if let BlockKind::List { ordered: nested_ord } = &nested.kind {
-                            for (ni, nc) in nested.children.iter().enumerate() {
-                                let np = if *nested_ord {
-                                    format!("  {}. {}", ni + 1, nc.text)
-                                } else {
-                                    format!("  \u{25E6}  {}", nc.text)
-                                };
-                                let nl = estimate_lines(&np, content_width - 48.0, font_size);
-                                layout.push(LayoutBox {
-                                    x: margin_x + 48.0,
-                                    y: cursor_y,
-                                    width: content_width - 48.0,
-                                    height: nl * font_size * 1.5,
-                                    kind: LayoutKind::Text {
-                                        text: np,
-                                        font_size,
-                                        color: theme.text,
-                                        bold: false,
-                                        italic: false,
-                                        centered: false,
-                                    },
-                                    href: None,
-                                });
-                                cursor_y += nl * font_size * 1.5 + 3.0;
-                            }
-                        }
-                    }
-                }
+                // Arbitrary nesting depth — deeply nested lists are the norm in
+                // technical documentation, and the previous one-level special
+                // case dropped everything below the second level entirely.
+                layout_list(
+                    block,
+                    *ordered,
+                    0,
+                    &mut cursor_y,
+                    &mut layout,
+                    margin_x,
+                    content_width,
+                    theme,
+                    z,
+                );
                 cursor_y += 6.0;
             }
             BlockKind::ListItem => {

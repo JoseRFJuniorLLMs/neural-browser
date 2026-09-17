@@ -106,6 +106,13 @@ pub enum PipelineMsg {
 
     // CPU -> GPU: fetched image bytes
     ImageData { url: String, data: Vec<u8> },
+
+    // GPU -> CPU: look up past visits matching what is typed in the URL bar
+    HistoryQuery { query: String },
+
+    // CPU -> GPU: semantic history matches, as (url, title) pairs.
+    // `query` echoes the request so the UI can discard stale answers.
+    HistoryResults { query: String, items: Vec<(String, String)> },
 }
 
 fn main() -> Result<()> {
@@ -150,10 +157,17 @@ fn main() -> Result<()> {
                     match engine.process_page(&url, &html, &dom) {
                         Ok(result) => {
                             // Send prefetch suggestions to CPU thread
+                            // NOTE: try_send, never send. The NPU->CPU prefetch channel
+                            // closes a cycle with the CPU->NPU content channel; a blocking
+                            // send here deadlocks the whole pipeline when both fill up.
+                            // Prefetch is best-effort, so dropping a hint is harmless.
                             for prefetch_url in &result.prefetch_urls {
-                                let _ = npu_prefetch_tx.send(
-                                    PipelineMsg::Prefetch(prefetch_url.clone())
-                                );
+                                if npu_prefetch_tx
+                                    .try_send(PipelineMsg::Prefetch(prefetch_url.clone()))
+                                    .is_err()
+                                {
+                                    warn!("[NPU] Prefetch queue full, dropping hint");
+                                }
                             }
                             if !result.prefetch_urls.is_empty() {
                                 info!("[NPU] Sent {} prefetch suggestions", result.prefetch_urls.len());
@@ -202,7 +216,9 @@ fn main() -> Result<()> {
             let ai_client = std::sync::Arc::new(eva::AiClient::new());
 
             // ── Semantic history (NietzscheDB) ──
-            let semantic_memory = memory::SemanticMemory::new();
+            // Arc: URL-bar lookups run on their own threads so a slow or
+            // unreachable database never stalls navigation.
+            let semantic_memory = std::sync::Arc::new(memory::SemanticMemory::new());
 
             // ── Browser history stacks ──
             const MAX_HISTORY: usize = 500;
@@ -214,7 +230,7 @@ fn main() -> Result<()> {
             let mut current_url: Option<String> = match std::env::args().nth(1) {
                 Some(url) => {
                     visited_urls.push(url.clone());
-                    process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls, &mut js_engine, Some(&semantic_memory));
+                    process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls, &mut js_engine, Some(semantic_memory.as_ref()));
                     Some(url)
                 }
                 None => {
@@ -248,7 +264,7 @@ fn main() -> Result<()> {
                                 }
                                 forward_stack.clear();
                                 current_url = Some(url.clone());
-                                process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls, &mut js_engine, Some(&semantic_memory));
+                                process_url_or_internal(&net, &url, &cpu_to_npu_tx, &visited_urls, &mut js_engine, Some(semantic_memory.as_ref()));
                             }
                             PipelineMsg::Back => {
                                 if let Some(prev_url) = back_stack.pop() {
@@ -264,7 +280,7 @@ fn main() -> Result<()> {
                                         visited_urls.drain(..visited_urls.len() - MAX_HISTORY);
                                     }
                                     current_url = Some(prev_url.clone());
-                                    process_url_or_internal(&net, &prev_url, &cpu_to_npu_tx, &visited_urls, &mut js_engine, Some(&semantic_memory));
+                                    process_url_or_internal(&net, &prev_url, &cpu_to_npu_tx, &visited_urls, &mut js_engine, Some(semantic_memory.as_ref()));
                                 } else {
                                     warn!("[CPU] No back history available");
                                 }
@@ -283,7 +299,7 @@ fn main() -> Result<()> {
                                         visited_urls.drain(..visited_urls.len() - MAX_HISTORY);
                                     }
                                     current_url = Some(next_url.clone());
-                                    process_url_or_internal(&net, &next_url, &cpu_to_npu_tx, &visited_urls, &mut js_engine, Some(&semantic_memory));
+                                    process_url_or_internal(&net, &next_url, &cpu_to_npu_tx, &visited_urls, &mut js_engine, Some(semantic_memory.as_ref()));
                                 } else {
                                     warn!("[CPU] No forward history available");
                                 }
@@ -291,6 +307,19 @@ fn main() -> Result<()> {
                             PipelineMsg::Prefetch(url) => {
                                 info!("[CPU] Prefetching: {url}");
                                 let _ = net.prefetch(&url);
+                            }
+                            PipelineMsg::HistoryQuery { query } => {
+                                let mem = semantic_memory.clone();
+                                let tx = cpu_img_tx.clone();
+                                std::thread::spawn(move || {
+                                    let items = mem.search_semantic(&query, 5)
+                                        .into_iter()
+                                        .map(|p| (p.url, p.title))
+                                        .collect::<Vec<_>>();
+                                    if !items.is_empty() {
+                                        let _ = tx.send(PipelineMsg::HistoryResults { query, items });
+                                    }
+                                });
                             }
                             PipelineMsg::FetchImage { url } => {
                                 info!("[CPU] Fetching image: {url}");
@@ -527,7 +556,8 @@ fn process_url(
             .take(20)
             .collect::<Vec<_>>()
             .join(" ");
-        let content_trunc = if content.len() > 500 { &content[..500] } else { &content };
+        // UTF-8 safe truncation — slicing at a raw byte offset panics mid-codepoint.
+        let content_trunc = memory::truncate(&content, 500);
         mem.store_page(url, &title, "", content_trunc);
     }
 

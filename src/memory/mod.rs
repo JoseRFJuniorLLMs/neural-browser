@@ -150,15 +150,30 @@ impl SemanticMemory {
             return;
         }
 
-        // Generate unique ID: combine epoch seconds (upper bits) with monotonic counter (lower bits).
-        // This avoids collisions across restarts and concurrent instances.
+        // Generate a unique u32 ID for this visit.
+        //
+        // The previous scheme packed `epoch_secs << 16 | seq`, which threw away
+        // all but the low 16 bits of the timestamp — those wrap every 65536
+        // seconds, so IDs collided (and silently overwrote history) roughly
+        // every 18 hours of use.
+        //
+        // Instead: hash the URL together with the full-resolution timestamp and
+        // a per-process counter. Every component contributes to all 32 bits, so
+        // the only collisions left are ordinary birthday collisions rather than
+        // a guaranteed clash on a fixed cycle.
         let seq = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let epoch_secs = std::time::SystemTime::now()
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as u32;
-        // Use lower 16 bits of epoch + lower 16 bits of seq to fit in u32
-        let id = (epoch_secs << 16) | (seq & 0xFFFF);
+            .as_nanos() as u64;
+        let mut hasher_input = Vec::with_capacity(url.len() + 16);
+        hasher_input.extend_from_slice(url.as_bytes());
+        hasher_input.extend_from_slice(&nanos.to_le_bytes());
+        hasher_input.extend_from_slice(&seq.to_le_bytes());
+        // Fold the 64-bit hash into 32 bits; avoid 0, which the server treats
+        // as "unset" in some code paths.
+        let h = fnv1a(&hasher_input);
+        let id = (((h >> 32) as u32) ^ (h as u32)).max(1);
         let visited_at = timestamp_now();
 
         // Build semantic vector from page content (n-gram hashing into Poincaré ball)
@@ -382,36 +397,175 @@ fn extract_json_u32(json: &str, field: &str) -> Option<u32> {
     rest[..end].parse().ok()
 }
 
-/// Extract a string field value from a JSON object (simple parser).
+/// Extract a string field value from a JSON object.
+///
+/// Scans the object structurally (rather than searching for `"field"` anywhere
+/// in the text) so a key name appearing inside some other string value cannot
+/// be mistaken for the field itself.
 fn extract_json_string(json: &str, field: &str) -> Option<String> {
-    let pattern = format!("\"{}\"", field);
-    let pos = json.find(&pattern)?;
-    let rest = &json[pos + pattern.len()..];
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix(':')?;
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix('"')?;
-
-    let mut result = String::new();
-    let mut chars = rest.chars();
+    let bytes = json.as_bytes();
+    let mut i = skip_ws(bytes, 0);
+    if bytes.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
     loop {
-        match chars.next() {
-            None => break,
-            Some('\\') => match chars.next() {
-                Some('n') => result.push('\n'),
-                Some('r') => result.push('\r'),
-                Some('t') => result.push('\t'),
-                Some('"') => result.push('"'),
-                Some('\\') => result.push('\\'),
-                Some(c) => { result.push('\\'); result.push(c); }
-                None => break,
-            },
-            Some('"') => break,
-            Some(c) => result.push(c),
+        i = skip_ws(bytes, i);
+        match bytes.get(i) {
+            Some(b'}') | None => return None,
+            Some(b',') => { i += 1; continue; }
+            Some(b'"') => {}
+            _ => return None,
+        }
+        let (key, next) = scan_json_string(bytes, i)?;
+        i = skip_ws(bytes, next);
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        i = skip_ws(bytes, i + 1);
+        if key == field {
+            // Only string values are returned; a non-string field yields None.
+            if bytes.get(i) == Some(&b'"') {
+                return scan_json_string(bytes, i).map(|(v, _)| v);
+            }
+            return None;
+        }
+        i = skip_json_value(bytes, i)?;
+    }
+}
+
+/// Skip ASCII whitespace starting at `i`.
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Read a JSON string starting at the opening quote.
+/// Returns the decoded value and the index just past the closing quote.
+fn scan_json_string(bytes: &[u8], start: usize) -> Option<(String, usize)> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return Some((out, i + 1)),
+            b'\\' => {
+                i += 1;
+                match bytes.get(i)? {
+                    b'n' => { out.push('\n'); i += 1; }
+                    b'r' => { out.push('\r'); i += 1; }
+                    b't' => { out.push('\t'); i += 1; }
+                    b'b' => { out.push('\u{0008}'); i += 1; }
+                    b'f' => { out.push('\u{000C}'); i += 1; }
+                    b'"' => { out.push('"'); i += 1; }
+                    b'\\' => { out.push('\\'); i += 1; }
+                    b'/' => { out.push('/'); i += 1; }
+                    b'u' => {
+                        // \uXXXX, including surrogate pairs for astral chars.
+                        let hi = parse_hex4(bytes, i + 1)?;
+                        i += 5;
+                        let ch = if (0xD800..0xDC00).contains(&hi) {
+                            // High surrogate: a matching low surrogate must follow.
+                            if bytes.get(i) == Some(&b'\\') && bytes.get(i + 1) == Some(&b'u') {
+                                let lo = parse_hex4(bytes, i + 2)?;
+                                if (0xDC00..0xE000).contains(&lo) {
+                                    i += 6;
+                                    let cp = 0x10000
+                                        + (((hi as u32) - 0xD800) << 10)
+                                        + ((lo as u32) - 0xDC00);
+                                    char::from_u32(cp).unwrap_or('\u{FFFD}')
+                                } else {
+                                    '\u{FFFD}'
+                                }
+                            } else {
+                                '\u{FFFD}'
+                            }
+                        } else if (0xDC00..0xE000).contains(&hi) {
+                            // Unpaired low surrogate.
+                            '\u{FFFD}'
+                        } else {
+                            char::from_u32(hi as u32).unwrap_or('\u{FFFD}')
+                        };
+                        out.push(ch);
+                    }
+                    other => { out.push(*other as char); i += 1; }
+                }
+            }
+            _ => {
+                // Copy one whole UTF-8 sequence so multi-byte characters survive.
+                let len = utf8_len(bytes[i]);
+                let end = (i + len).min(bytes.len());
+                out.push_str(&String::from_utf8_lossy(&bytes[i..end]));
+                i = end;
+            }
         }
     }
+    None
+}
 
-    Some(result)
+/// Byte length of the UTF-8 sequence that starts with `b`.
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
+}
+
+/// Parse exactly four hex digits at `i`.
+fn parse_hex4(bytes: &[u8], i: usize) -> Option<u16> {
+    let slice = bytes.get(i..i + 4)?;
+    let text = std::str::from_utf8(slice).ok()?;
+    u16::from_str_radix(text, 16).ok()
+}
+
+/// Skip one complete JSON value (object, array, string, number, literal),
+/// returning the index just past it. Nested structures are matched properly,
+/// and braces inside strings do not end an object.
+fn skip_json_value(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = skip_ws(bytes, start);
+    match *bytes.get(i)? {
+        b'"' => scan_json_string(bytes, i).map(|(_, next)| next),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'"' => {
+                        let (_, next) = scan_json_string(bytes, i)?;
+                        i = next;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            None
+        }
+        _ => {
+            // Number, true, false or null: read until a structural character.
+            while i < bytes.len() && !matches!(bytes[i], b',' | b'}' | b']') {
+                i += 1;
+            }
+            Some(i)
+        }
+    }
 }
 
 /// Parse search results: [{"id": N, "distance": D, "metadata": {"url": "...", ...}}, ...]
@@ -426,47 +580,48 @@ fn parse_peek_results(json: &str) -> Vec<PageMemory> {
 
 /// Parse an array of objects that contain metadata with url/title/summary/visited_at.
 /// Works for both search and peek responses.
+///
+/// Each `"metadata"` object is delimited by real brace matching, so nested
+/// objects and values containing `}` no longer truncate the entry.
 fn parse_items(json: &str) -> Vec<PageMemory> {
+    let bytes = json.as_bytes();
     let mut results = Vec::new();
+    let mut i = 0usize;
 
-    // Find each "metadata" block and extract fields from it
-    let mut search_from = 0;
-    while let Some(meta_pos) = json[search_from..].find("\"metadata\"") {
-        let abs_pos = search_from + meta_pos;
-        // Find the opening brace of the metadata object
-        let after_key = &json[abs_pos + 10..]; // skip "metadata"
-        if let Some(brace_pos) = after_key.find('{') {
-            let meta_start = abs_pos + 10 + brace_pos;
-            // Find the matching closing brace (simple: first '}' after opening)
-            if let Some(brace_end) = json[meta_start..].find('}') {
-                let meta_json = &json[meta_start..meta_start + brace_end + 1];
-
-                let url = extract_json_string(meta_json, "url")
-                    .unwrap_or_default();
-                let title = extract_json_string(meta_json, "title")
-                    .unwrap_or_default();
-                let summary = extract_json_string(meta_json, "summary")
-                    .unwrap_or_default();
-                let visited_at = extract_json_string(meta_json, "visited_at")
-                    .unwrap_or_default();
-
-                // Only include entries that look like page visits (have a URL)
-                if !url.is_empty() {
-                    results.push(PageMemory {
-                        url,
-                        title,
-                        summary,
-                        visited_at,
-                    });
+    while i < bytes.len() {
+        // Find the next `"metadata"` key. Strings are scanned through, so a
+        // literal "metadata" inside some other value is skipped.
+        if bytes[i] == b'"' {
+            let (key, next) = match scan_json_string(bytes, i) {
+                Some(v) => v,
+                None => break,
+            };
+            if key == "metadata" {
+                let after = skip_ws(bytes, next);
+                if bytes.get(after) == Some(&b':') {
+                    let val_start = skip_ws(bytes, after + 1);
+                    if bytes.get(val_start) == Some(&b'{') {
+                        if let Some(val_end) = skip_json_value(bytes, val_start) {
+                            let meta = &json[val_start..val_end];
+                            let url = extract_json_string(meta, "url").unwrap_or_default();
+                            if !url.is_empty() {
+                                results.push(PageMemory {
+                                    url,
+                                    title: extract_json_string(meta, "title").unwrap_or_default(),
+                                    summary: extract_json_string(meta, "summary").unwrap_or_default(),
+                                    visited_at: extract_json_string(meta, "visited_at").unwrap_or_default(),
+                                });
+                            }
+                            i = val_end;
+                            continue;
+                        }
+                    }
                 }
-
-                search_from = meta_start + brace_end + 1;
-            } else {
-                break;
             }
-        } else {
-            break;
+            i = next;
+            continue;
         }
+        i += 1;
     }
 
     results
@@ -509,7 +664,7 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 }
 
 /// Truncate a string for display (UTF-8 safe).
-fn truncate(s: &str, max: usize) -> &str {
+pub(crate) fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
@@ -634,5 +789,75 @@ mod tests {
     fn test_fnv1a_deterministic() {
         assert_eq!(fnv1a(b"hello"), fnv1a(b"hello"));
         assert_ne!(fnv1a(b"hello"), fnv1a(b"world"));
+    }
+
+    #[test]
+    fn json_string_handles_unicode_escapes() {
+        let json = r#"{"title":"café — done"}"#;
+        assert_eq!(extract_json_string(json, "title").as_deref(), Some("café — done"));
+    }
+
+    #[test]
+    fn json_string_handles_surrogate_pairs() {
+        // U+1F600 GRINNING FACE, encoded as a surrogate pair.
+        let json = r#"{"title":"hi 😀"}"#;
+        assert_eq!(extract_json_string(json, "title").as_deref(), Some("hi \u{1F600}"));
+    }
+
+    #[test]
+    fn json_string_handles_escaped_quotes_and_slashes() {
+        let json = r#"{"title":"a \"quoted\" \/ path\\end"}"#;
+        assert_eq!(
+            extract_json_string(json, "title").as_deref(),
+            Some("a \"quoted\" / path\\end")
+        );
+    }
+
+    #[test]
+    fn json_key_inside_a_value_is_not_mistaken_for_the_field() {
+        // The literal "url" appears inside the title's value first.
+        let json = r#"{"title":"how to \"url\" things","url":"https://real.example"}"#;
+        assert_eq!(
+            extract_json_string(json, "url").as_deref(),
+            Some("https://real.example")
+        );
+    }
+
+    #[test]
+    fn metadata_with_nested_objects_is_not_truncated() {
+        let json = r#"[{"id":1,"metadata":{"url":"https://a.test","extra":{"depth":2},"title":"A","summary":"s","visited_at":"2026-01-01T00:00:00Z"}}]"#;
+        let items = parse_items(json);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].url, "https://a.test");
+        // Fields after the nested object used to be lost entirely.
+        assert_eq!(items[0].title, "A");
+        assert_eq!(items[0].visited_at, "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn brace_inside_a_value_does_not_end_the_object() {
+        let json = r#"[{"metadata":{"url":"https://a.test/?q={x}","title":"} not the end","summary":"","visited_at":""}}]"#;
+        let items = parse_items(json);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].url, "https://a.test/?q={x}");
+        assert_eq!(items[0].title, "} not the end");
+    }
+
+    #[test]
+    fn multiple_results_are_all_parsed() {
+        let json = r#"[
+            {"id":1,"distance":0.1,"metadata":{"url":"https://a.test","title":"A","summary":"","visited_at":""}},
+            {"id":2,"distance":0.2,"metadata":{"url":"https://b.test","title":"B","summary":"","visited_at":""}}
+        ]"#;
+        let items = parse_items(json);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].url, "https://b.test");
+    }
+
+    #[test]
+    fn json_escapes_survive_a_round_trip() {
+        let original = "line1\nline2 \"quoted\" \\ backslash";
+        let json = format!(r#"{{"title":"{}"}}"#, escape_json(original));
+        assert_eq!(extract_json_string(&json, "title").as_deref(), Some(original));
     }
 }

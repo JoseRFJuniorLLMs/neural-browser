@@ -11,6 +11,7 @@
 //! - Script/style content skipping
 //! - Whitespace collapsing in text nodes
 
+use log::warn;
 use std::collections::HashMap;
 
 /// Lightweight DOM node -- just enough for NPU analysis.
@@ -123,17 +124,30 @@ impl DomTree {
             return String::new();
         }
         let mut out = String::with_capacity(4096);
+        let mut visited = std::collections::HashSet::with_capacity(self.nodes.len());
         // Find root nodes (no parent)
         for (i, node) in self.nodes.iter().enumerate() {
             if node.parent.is_none() {
-                self.reconstruct_node(i, &mut out);
+                self.reconstruct_node(i, &mut out, 0, &mut visited);
             }
         }
         out
     }
 
     /// Reconstruct a single node and its children as HTML.
-    fn reconstruct_node(&self, node_id: usize, out: &mut String) {
+    ///
+    /// `depth` bounds the walk and `visited` breaks cycles, so a script-built
+    /// tree can never overflow the stack or loop forever here.
+    fn reconstruct_node(
+        &self,
+        node_id: usize,
+        out: &mut String,
+        depth: usize,
+        visited: &mut std::collections::HashSet<usize>,
+    ) {
+        if depth > MAX_NESTING_DEPTH || !visited.insert(node_id) {
+            return;
+        }
         let node = match self.nodes.get(node_id) {
             Some(n) => n,
             None => return,
@@ -141,7 +155,11 @@ impl DomTree {
 
         // Text-only node (no tag)
         if node.tag.is_empty() || node.tag == "#text" {
-            out.push_str(&node.text);
+            // SECURITY: escape, never emit raw. Text set through textContent or
+            // a JS string can contain markup ("</div><script>..."); emitting it
+            // verbatim would let it re-parse as real elements when this HTML is
+            // handed back to the parser and the NPU.
+            push_escaped_text(&node.text, out);
             return;
         }
 
@@ -172,14 +190,21 @@ impl DomTree {
             return;
         }
 
-        // Text content
+        // Text content. Raw-text elements (script/style and friends) keep their
+        // content verbatim — escaping there would corrupt the code they hold —
+        // and they cannot be escaped out of, since the parser only ends them at
+        // their own closing tag.
         if !node.text.is_empty() {
-            out.push_str(&node.text);
+            if is_raw_text_tag(&node.tag) {
+                out.push_str(&node.text);
+            } else {
+                push_escaped_text(&node.text, out);
+            }
         }
 
         // Children
         for &child_id in &node.children {
-            self.reconstruct_node(child_id, out);
+            self.reconstruct_node(child_id, out, depth + 1, visited);
         }
 
         // Closing tag
@@ -261,15 +286,24 @@ impl DomTree {
         }
     }
 
-    /// Recursively detach a node and all its descendants (set parent=None, depth=0).
+    /// Detach a node and all its descendants (set parent=None, depth=0).
     /// This ensures removed subtrees don't appear in queries.
+    ///
+    /// Iterative on purpose: scripts can build trees far deeper than the
+    /// parser's own nesting limit (repeated `innerHTML` on the deepest node),
+    /// so a recursive walk here is a reachable stack overflow. The visited set
+    /// also makes the walk safe against cycles.
     fn detach_subtree(&mut self, node_id: usize) {
         if node_id >= self.nodes.len() { return; }
-        self.nodes[node_id].parent = None;
-        self.nodes[node_id].depth = 0;
-        let children: Vec<usize> = self.nodes[node_id].children.clone();
-        for child in children {
-            self.detach_subtree(child);
+        let mut stack = vec![node_id];
+        let mut visited = std::collections::HashSet::new();
+        while let Some(id) = stack.pop() {
+            if id >= self.nodes.len() || !visited.insert(id) {
+                continue;
+            }
+            self.nodes[id].parent = None;
+            self.nodes[id].depth = 0;
+            stack.extend(self.nodes[id].children.iter().copied());
         }
     }
 
@@ -322,8 +356,25 @@ impl DomTree {
         let base_id = self.nodes.len();
         let parent_depth = self.nodes[node_id].depth;
 
+        // MEMORY: `parse_html` enforces MAX_DOM_NODES on a whole document, but
+        // nothing stopped a script from calling innerHTML in a loop and growing
+        // this tree without bound. Enforce the same global budget here.
+        let budget = MAX_DOM_NODES.saturating_sub(self.nodes.len());
+        if budget == 0 {
+            warn!("[DOM] innerHTML rejected: node limit ({MAX_DOM_NODES}) reached");
+            return false;
+        }
+        let accepted = fragment.nodes.len().min(budget);
+        if accepted < fragment.nodes.len() {
+            warn!(
+                "[DOM] innerHTML truncated: {} of {} nodes (limit {MAX_DOM_NODES})",
+                accepted,
+                fragment.nodes.len(),
+            );
+        }
+
         // Copy fragment nodes, remapping IDs
-        for frag_node in &fragment.nodes {
+        for frag_node in fragment.nodes.iter().take(accepted) {
             let new_id = base_id + frag_node.id;
             let new_parent = match frag_node.parent {
                 Some(p) => Some(base_id + p),
@@ -335,13 +386,18 @@ impl DomTree {
                 attrs: frag_node.attrs.clone(),
                 text: frag_node.text.clone(),
                 parent: new_parent,
-                children: frag_node.children.iter().map(|c| base_id + c).collect(),
+                // Drop child references past the budget so no node points at an
+                // index that was never copied.
+                children: frag_node.children.iter()
+                    .filter(|&&c| c < accepted)
+                    .map(|c| base_id + c)
+                    .collect(),
                 depth: parent_depth + 1 + frag_node.depth,
             });
         }
 
         // Attach top-level fragment nodes as children
-        for frag_node in &fragment.nodes {
+        for frag_node in fragment.nodes.iter().take(accepted) {
             if frag_node.parent.is_none() {
                 self.nodes[node_id].children.push(base_id + frag_node.id);
             }
@@ -380,15 +436,43 @@ impl DomTree {
         }).collect()
     }
 
-    /// Recursively update depth of a node and its children.
+    /// Update the depth of a node and all its descendants.
+    ///
+    /// Iterative for the same reason as `detach_subtree`: script-built trees
+    /// can be deeper than the parser's nesting limit, and a cycle introduced by
+    /// a buggy `appendChild` would otherwise never terminate.
     fn update_depth(&mut self, node_id: usize, new_depth: usize) {
         if node_id >= self.nodes.len() {
             return;
         }
-        self.nodes[node_id].depth = new_depth;
-        let children: Vec<usize> = self.nodes[node_id].children.clone();
-        for child in children {
-            self.update_depth(child, new_depth + 1);
+        let mut stack = vec![(node_id, new_depth)];
+        let mut visited = std::collections::HashSet::new();
+        while let Some((id, depth)) = stack.pop() {
+            if id >= self.nodes.len() || !visited.insert(id) {
+                continue;
+            }
+            self.nodes[id].depth = depth;
+            let next = depth.saturating_add(1);
+            stack.extend(self.nodes[id].children.iter().map(|&c| (c, next)));
+        }
+    }
+}
+
+/// Tags whose content the HTML parser treats as raw text rather than markup.
+/// Their text must NOT be entity-escaped on serialization.
+fn is_raw_text_tag(tag: &str) -> bool {
+    matches!(tag, "script" | "style" | "xmp" | "iframe" | "noembed" | "noframes" | "plaintext")
+}
+
+/// Append text as HTML character data, escaping anything that could start a tag
+/// or an entity.
+fn push_escaped_text(text: &str, out: &mut String) {
+    for c in text.chars() {
+        match c {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            _ => out.push(c),
         }
     }
 }
@@ -1425,5 +1509,76 @@ mod tests {
         let box_id = dom.get_element_by_id("box").unwrap();
         dom.set_inner_html(box_id, "<p>New content</p><span>More</span>");
         assert!(dom.nodes[box_id].children.len() >= 2);
+    }
+
+    #[test]
+    fn reconstruct_escapes_text_so_markup_cannot_be_injected() {
+        let mut tree = parse_html("<div id=\"x\">safe</div>");
+        let target = tree.get_element_by_id("x").unwrap();
+        // A script setting textContent to markup must not produce real elements.
+        tree.set_text_content(target, "</div><script>alert(1)</script>");
+        let html = tree.reconstruct_html();
+        assert!(!html.contains("<script>"), "script tag leaked: {html}");
+        assert!(html.contains("&lt;script&gt;"), "not escaped: {html}");
+    }
+
+    #[test]
+    fn reconstruct_keeps_script_bodies_verbatim() {
+        // Escaping inside <script> would corrupt the code it holds.
+        let tree = parse_html("<script>if (a < b && c > d) { x(); }</script>");
+        let html = tree.reconstruct_html();
+        assert!(html.contains("a < b && c > d"), "script body mangled: {html}");
+    }
+
+    #[test]
+    fn deeply_nested_tree_does_not_overflow_the_stack() {
+        // Build a chain far deeper than the parser's own nesting limit by
+        // repeatedly appending to the deepest node, then force the recursive
+        // paths (depth update, detach, serialization) to walk all of it.
+        let mut tree = parse_html("<div id=\"root\"></div>");
+        let root = tree.get_element_by_id("root").unwrap();
+        let mut deepest = root;
+        for _ in 0..5_000 {
+            let child = tree.create_element("div");
+            tree.append_child(deepest, child);
+            deepest = child;
+        }
+        let _ = tree.reconstruct_html();
+        assert!(tree.remove_child(root, tree.nodes[root].children[0]));
+    }
+
+    #[test]
+    fn inner_html_respects_the_global_node_budget() {
+        let mut tree = parse_html("<div id=\"x\"></div>");
+        let target = tree.get_element_by_id("x").unwrap();
+        // Repeatedly stuff nodes in; the tree must stop growing at the cap
+        // rather than consuming memory without bound.
+        let fragment = "<p>a</p>".repeat(500);
+        for _ in 0..500 {
+            let sibling = tree.create_element("div");
+            tree.append_child(target, sibling);
+            tree.set_inner_html(sibling, &fragment);
+            if tree.nodes.len() >= MAX_DOM_NODES {
+                break;
+            }
+        }
+        assert!(
+            tree.nodes.len() <= MAX_DOM_NODES,
+            "node budget exceeded: {}",
+            tree.nodes.len()
+        );
+    }
+
+    #[test]
+    fn inner_html_children_stay_in_range() {
+        let mut tree = parse_html("<div id=\"x\"></div>");
+        let target = tree.get_element_by_id("x").unwrap();
+        tree.set_inner_html(target, "<ul><li>a</li><li>b</li></ul>");
+        let count = tree.nodes.len();
+        for node in &tree.nodes {
+            for &c in &node.children {
+                assert!(c < count, "child index {c} out of range ({count} nodes)");
+            }
+        }
     }
 }
